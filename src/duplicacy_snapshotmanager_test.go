@@ -241,6 +241,56 @@ func checkTestSnapshots(manager *SnapshotManager, expectedSnapshots int, expecte
 	}
 }
 
+// The snapshot cache is only useful for storages that need one; for a local file storage the cached snapshot files
+// are never read back, so downloading a snapshot must not write them.
+func TestDownloadSnapshotCache(t *testing.T) {
+
+	setTestingT(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+	storage := snapshotManager.storage.(*FileStorage)
+
+	chunkHash := uploadRandomChunk(snapshotManager, 1024)
+	if chunkHash == "" {
+		t.Errorf("Failed to upload a chunk")
+		return
+	}
+
+	now := time.Now().Unix()
+	createTestSnapshot(snapshotManager, "vm1@host1", 1, now-3600, now, []string{chunkHash}, "tag")
+
+	cachedSnapshotPath := path.Join(snapshotManager.snapshotCache.storageDir, "snapshots", "vm1@host1", "1")
+
+	if _, err := os.Stat(cachedSnapshotPath); !os.IsNotExist(err) {
+		t.Errorf("The snapshot file should not be added to the cache when the storage doesn't need a cache")
+	}
+
+	snapshot := snapshotManager.DownloadSnapshot("vm1@host1", 1)
+	if snapshot == nil || snapshot.ID != "vm1@host1" || snapshot.Revision != 1 {
+		t.Errorf("Failed to download the snapshot vm1@host1 at revision 1")
+		return
+	}
+
+	if _, err := os.Stat(cachedSnapshotPath); !os.IsNotExist(err) {
+		t.Errorf("Downloading a snapshot should not add it to the cache when the storage doesn't need a cache")
+	}
+
+	// A storage that needs a cache must still get a copy of every downloaded snapshot file.
+	storage.isCacheNeeded = true
+
+	snapshot = snapshotManager.DownloadSnapshot("vm1@host1", 1)
+	if snapshot == nil || snapshot.ID != "vm1@host1" || snapshot.Revision != 1 {
+		t.Errorf("Failed to download the snapshot vm1@host1 at revision 1")
+		return
+	}
+
+	if _, err := os.Stat(cachedSnapshotPath); err != nil {
+		t.Errorf("The snapshot file should be added to the cache when the storage needs a cache: %v", err)
+	}
+}
+
 func TestPruneSingleRepository(t *testing.T) {
 
 	setTestingT(t)

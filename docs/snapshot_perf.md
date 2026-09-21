@@ -1,7 +1,8 @@
 # Why listing snapshot revisions is slow
 
-Investigation into the performance of `duplicacy list`. No source changes were
-made — this document records findings and candidate fixes only.
+Investigation into the performance of `duplicacy list`. This document records
+the findings and the candidate fixes; candidate fix #1 below has since been
+implemented in `src/duplicacy_snapshotmanager.go`.
 
 ## Summary
 
@@ -252,7 +253,9 @@ Ordered roughly by expected benefit for local storage.
 - **Do not write the snapshot cache when `IsCacheNeeded()` is false.** Mirror the
   read-side guard at `src/duplicacy_snapshotmanager.go:2669`. This removes the
   `fsync`/`renameat` pair and the cache `mkdirat`/`newfstatat` traffic per
-  revision, which is the majority of the slow-mount cost.
+  revision, which is the majority of the slow-mount cost. **Implemented**: the
+  cache write in `DownloadFile` is now guarded by `IsCacheNeeded()`, matching the
+  cache read and `UploadFile`.
 - **Skip the redundant `CreateDirectory` on storage and cache** in
   `DownloadSnapshot` (`:213-214`) and `ListSnapshotRevisions` (`:494-499`) when
   the directory is known to exist; each is an `EEXIST` `mkdirat` or a `Stat`

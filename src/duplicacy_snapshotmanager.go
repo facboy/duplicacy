@@ -2666,9 +2666,11 @@ func (manager *SnapshotManager) DownloadFile(path string, derivationKey string) 
 		manager.config.PutChunk(newChunk)
 	}
 
-	err = manager.snapshotCache.UploadFile(0, path, manager.fileChunk.GetBytes())
-	if err != nil {
-		LOG_WARN("DOWNLOAD_FILE_CACHE", "Failed to add the file %s to the snapshot cache: %v", path, err)
+	if manager.storage.IsCacheNeeded() {
+		err = manager.snapshotCache.UploadFile(0, path, manager.fileChunk.GetBytes())
+		if err != nil {
+			LOG_WARN("DOWNLOAD_FILE_CACHE", "Failed to add the file %s to the snapshot cache: %v", path, err)
+		}
 	}
 
 	LOG_DEBUG("DOWNLOAD_FILE", "Downloaded file %s", path)

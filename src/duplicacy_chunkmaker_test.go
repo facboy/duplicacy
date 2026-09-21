@@ -62,7 +62,7 @@ func splitIntoChunks(content []byte, n, averageChunkSize, maxChunkSize, minChunk
 	}
 
 	for _, buffer := range buffers {
-		fileSize, _ := maker.AddData(buffer, chunkFunc)
+		fileSize, _, _ := maker.AddData(buffer, chunkFunc)
 		totalFileSize += fileSize
 	}
 	maker.AddData(nil, chunkFunc)

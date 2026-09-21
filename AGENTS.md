@@ -86,11 +86,23 @@ everything under `$HOME/DUPLICACY_TEST_ZONE` (deleted/recreated by the
 There is no CI (`.github/` only contains the issue template), so tests have to
 be run manually before submitting changes.
 
-Known issue at the time of writing: `go test ./src/` does **not** compile at
-HEAD — `src/duplicacy_chunkmaker_test.go:65` still expects `ChunkMaker.AddData`
-to return 2 values while the function now returns 3 (changed in the OneDrive
-cloud-file workaround commit). Fix that call site before relying on the unit
-test suite, and do not "fix" it by weakening the test.
+`src/duplicacy_chunkmaker_test.go:65` used to expect `ChunkMaker.AddData` to
+return 2 values while the function now returns 3 (changed in the OneDrive
+cloud-file workaround commit), which made `go test ./src/` fail to compile. The
+call site has since been updated to discard the extra value; keep it that way
+rather than weakening the test.
+
+Two unit tests also fail on an unmodified checkout, for reasons unrelated to the
+library code: `TestEntryExcludeByAttribute` expects macOS `com.apple.metadata`
+extended attributes, and `TestPersistRestore` aborts because the hard-coded
+chunk path it wants to corrupt (`unenc_storage/chunks/4d/538e...`) does not
+exist in the repository it builds. Confirm they fail the same way on a pristine
+checkout before blaming your own change.
+
+Note also that `go vet` (which `go test` runs by default) reports pre-existing
+problems in `src/` — for example a non-constant format string in
+`duplicacy_backupmanager.go` and `duplicacy_snapshotmanager.go` — so
+`go test ./src/` needs `-vet=off` to reach the test binaries.
 
 ## Code Conventions
 
