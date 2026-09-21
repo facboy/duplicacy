@@ -173,7 +173,6 @@ func createTestSnapshot(manager *SnapshotManager, snapshotID string, revision in
 
 	description, _ := snapshot.MarshalJSON()
 	path := fmt.Sprintf("snapshots/%s/%d", snapshotID, snapshot.Revision)
-	manager.storage.CreateDirectory(0, "snapshots/"+snapshotID)
 	manager.UploadFile(path, path, description)
 }
 
@@ -288,6 +287,64 @@ func TestDownloadSnapshotCache(t *testing.T) {
 
 	if _, err := os.Stat(cachedSnapshotPath); err != nil {
 		t.Errorf("The snapshot file should be added to the cache when the storage needs a cache: %v", err)
+	}
+}
+
+// Reading snapshots must never create directories.  The snapshot directory is created by the code that uploads a
+// snapshot, so read-only commands (list, check, cat, ...) leave the storage and the snapshot cache untouched.
+func TestReadSnapshotsDoesNotCreateDirectories(t *testing.T) {
+
+	setTestingT(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+	storageDir := snapshotManager.storage.(*FileStorage).storageDir
+	cacheDir := snapshotManager.snapshotCache.storageDir
+
+	nonexistentStorageDir := path.Join(storageDir, "snapshots", "vm1@host1")
+	nonexistentCacheDir := path.Join(cacheDir, "snapshots", "vm1@host1")
+
+	// Listing the revisions of a snapshot id that has never been backed up reports no revisions, and must not
+	// create the snapshot directory on the storage or in the snapshot cache.
+	revisions, err := snapshotManager.ListSnapshotRevisions("vm1@host1")
+	if err != nil {
+		t.Errorf("Failed to list the revisions of a nonexistent snapshot: %v", err)
+		return
+	}
+	if len(revisions) != 0 {
+		t.Errorf("Expecting no revisions for a nonexistent snapshot, got %d", len(revisions))
+	}
+	if _, err := os.Stat(nonexistentStorageDir); !os.IsNotExist(err) {
+		t.Errorf("Listing the revisions should not create the snapshot directory in the storage")
+	}
+	if _, err := os.Stat(nonexistentCacheDir); !os.IsNotExist(err) {
+		t.Errorf("Listing the revisions should not create the snapshot directory in the snapshot cache")
+	}
+
+	// Uploading a snapshot is what creates the snapshot directory.
+	chunkHash := uploadRandomChunk(snapshotManager, 1024)
+	if chunkHash == "" {
+		t.Errorf("Failed to upload a chunk")
+		return
+	}
+
+	now := time.Now().Unix()
+	createTestSnapshot(snapshotManager, "vm1@host1", 1, now-3600, now, []string{chunkHash}, "tag")
+
+	if _, err := os.Stat(nonexistentStorageDir); err != nil {
+		t.Errorf("Uploading a snapshot should create the snapshot directory: %v", err)
+	}
+
+	// Downloading it back must again not touch the snapshot cache, since a file storage doesn't need a cache.
+	snapshot := snapshotManager.DownloadSnapshot("vm1@host1", 1)
+	if snapshot == nil || snapshot.ID != "vm1@host1" || snapshot.Revision != 1 {
+		t.Errorf("Failed to download the snapshot vm1@host1 at revision 1")
+		return
+	}
+
+	if _, err := os.Stat(nonexistentCacheDir); !os.IsNotExist(err) {
+		t.Errorf("Downloading a snapshot should not create the snapshot directory in the snapshot cache")
 	}
 }
 

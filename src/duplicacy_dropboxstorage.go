@@ -76,6 +76,11 @@ func (storage *DropboxStorage) ListFiles(threadIndex int, dir string) (files []s
 	for {
 
 		if err != nil {
+			if e, ok := err.(*dropbox.Error); ok && strings.HasPrefix(e.Summary, "path/not_found/") {
+				// The directory does not exist; this is the same as an empty directory.  It happens when the
+				// snapshot id has never been backed up.
+				return nil, nil, nil
+			}
 			return nil, nil, err
 		}
 

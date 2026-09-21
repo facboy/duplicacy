@@ -520,7 +520,9 @@ func (storage *GCDStorage) ListFiles(threadIndex int, dir string) ([]string, []i
 			return nil, nil, err
 		}
 		if pathID == "" {
-			return nil, nil, fmt.Errorf("Path '%s' does not exist", dir)
+			// The directory does not exist; this is the same as an empty directory.  It happens when the
+			// snapshot id has never been backed up.
+			return nil, nil, nil
 		}
 
 		entries, err := storage.listFiles(threadIndex, pathID, true, false)

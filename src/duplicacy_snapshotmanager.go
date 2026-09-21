@@ -209,10 +209,6 @@ func CreateSnapshotManager(config *Config, storage Storage) *SnapshotManager {
 // DownloadSnapshot downloads the specified snapshot.
 func (manager *SnapshotManager) DownloadSnapshot(snapshotID string, revision int) *Snapshot {
 
-	snapshotDir := fmt.Sprintf("snapshots/%s", snapshotID)
-	manager.storage.CreateDirectory(0, snapshotDir)
-	manager.snapshotCache.CreateDirectory(0, snapshotDir)
-
 	snapshotPath := fmt.Sprintf("snapshots/%s/%d", snapshotID, revision)
 
 	// We must check if the snapshot file exists in the storage, because the snapshot cache may store a copy of the
@@ -490,16 +486,6 @@ func (manager *SnapshotManager) ListSnapshotRevisions(snapshotID string) (revisi
 	LOG_TRACE("SNAPSHOT_LIST_REVISIONS", "Listing revisions for snapshot %s", snapshotID)
 
 	snapshotDir := fmt.Sprintf("snapshots/%s/", snapshotID)
-
-	err = manager.storage.CreateDirectory(0, snapshotDir)
-	if err != nil {
-		return nil, err
-	}
-
-	err = manager.snapshotCache.CreateDirectory(0, snapshotDir)
-	if err != nil {
-		LOG_WARN("SNAPSHOT_CACHE_DIR", "Failed to create the snapshot cache directory %s: %v", snapshotDir, err)
-	}
 
 	files, _, err := manager.storage.ListFiles(0, snapshotDir)
 	if err != nil {
@@ -2680,6 +2666,19 @@ func (manager *SnapshotManager) DownloadFile(path string, derivationKey string) 
 
 // UploadFile uploads a non-chunk file from the storage.
 func (manager *SnapshotManager) UploadFile(path string, derivationKey string, content []byte) bool {
+
+	// The containing directory is created here because this is the only place that needs it: read-only commands
+	// (list, check, cat, ...) must not modify the storage, and some storages (Dropbox, for instance) can't upload
+	// a file into a directory that doesn't exist yet.
+	if index := strings.LastIndex(path, "/"); index > 0 {
+		dir := path[:index]
+		err := manager.storage.CreateDirectory(0, dir)
+		if err != nil {
+			LOG_ERROR("UPLOAD_FILE", "Failed to create the directory %s: %v", dir, err)
+			return false
+		}
+	}
+
 	manager.fileChunk.Reset(false)
 	manager.fileChunk.Write(content)
 

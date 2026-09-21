@@ -283,6 +283,11 @@ func (storage *WebDAVStorage) ListFiles(threadIndex int, dir string) (files []st
 	}
 	properties, err := storage.getProperties(dir, 1, "getcontentlength", "resourcetype")
 	if err != nil {
+		if err == errWebDAVNotExist {
+			// The directory does not exist; this is the same as an empty directory.  It happens when the
+			// snapshot id has never been backed up.
+			return nil, nil, nil
+		}
 		return nil, nil, err
 	}
 

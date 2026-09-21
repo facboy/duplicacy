@@ -101,6 +101,11 @@ func (storage *OneDriveStorage) ListFiles(threadIndex int, dir string) ([]string
 	} else if strings.HasPrefix(dir, "snapshots/") || strings.HasPrefix(dir, "benchmark") {
 		entries, err := storage.client.ListEntries(storage.storageDir + "/" + dir)
 		if err != nil {
+			if e, ok := err.(OneDriveError); ok && e.Status == 404 {
+				// The directory does not exist; this is the same as an empty directory.  It happens when the
+				// snapshot id has never been backed up.
+				return nil, nil, nil
+			}
 			return nil, nil, err
 		}
 

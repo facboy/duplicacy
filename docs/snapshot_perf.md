@@ -1,18 +1,18 @@
 # Why listing snapshot revisions is slow
 
 Investigation into the performance of `duplicacy list`. This document records
-the findings and the candidate fixes; candidate fix #1 below has since been
-implemented in `src/duplicacy_snapshotmanager.go`.
+the findings and the candidate fixes; candidate fixes #1 and #2 below have since
+been implemented in `src/duplicacy_snapshotmanager.go`.
 
 ## Summary
 
 `duplicacy list` is a serial, one-operation-at-a-time loop. For every revision of
-every snapshot id it performs a directory create, an existence check and a file
-download, with a chunk operator hard-coded to a single thread and a snapshot
-cache that is written but never read.
+every snapshot id it performs an existence check and a file download, with a
+chunk operator hard-coded to a single thread and a snapshot cache that is
+written but never read.
 
 Against cloud storage each of those operations is a network round trip, so the
-cost grows linearly at roughly three round trips per revision. Against local
+cost grows linearly at roughly two round trips per revision. Against local
 storage the same code runs, but each hop is a syscall instead of a round trip:
 it is usually fine on a fast native filesystem (~3 ms per revision) and painful
 on a slow local mount.
@@ -22,7 +22,7 @@ on a slow local mount.
 `listSnapshots` (`duplicacy/duplicacy_main.go:899-950`) creates the storage,
 calls `CreateBackupManager` (which downloads the config), calls
 `SetupSnapshotCache`, and then hands off to `SnapshotManager.ListSnapshots`
-(`src/duplicacy_snapshotmanager.go:670-779`).
+(`src/duplicacy_snapshotmanager.go:657-765`).
 
 `ListSnapshots` is a plain nested loop with no concurrency:
 
@@ -39,36 +39,38 @@ for _, snapshotID = range snapshotIDs {
 ```
 
 `revisionsToList` is empty unless `-r` was passed, so `ListSnapshotRevisions`
-(`src/duplicacy_snapshotmanager.go:487-521`) always runs and always hits the
+(`src/duplicacy_snapshotmanager.go:484-507`) always runs and always hits the
 remote storage. The local snapshot cache is never consulted for the revision
 list.
 
 ## Cost per revision
 
-`DownloadSnapshot` (`src/duplicacy_snapshotmanager.go:209-246`) does three
+`DownloadSnapshot` (`src/duplicacy_snapshotmanager.go:209-242`) does two
 operations for every revision, including revisions already present in the local
 cache:
 
-1. `manager.storage.CreateDirectory(0, snapshotDir)` — a real network call on
-   SFTP, WebDAV, Hubic, GCD and OneDrive (a no-op only on S3, B2, Azure, GCS and
-   Swift). On SFTP this is a `Stat` round trip
-   (`src/duplicacy_sftpstorage.go:228-240`).
-2. `manager.storage.GetFileInfo(0, snapshotPath)` — an unconditional existence
-   check. The comment at `:218` explains this is deliberate, because the cache
+1. `manager.storage.GetFileInfo(0, snapshotPath)` — an unconditional existence
+   check. The comment at `:214` explains this is deliberate, because the cache
    may hold a stale copy, but it costs a round trip per revision even when the
    file is already cached (`src/duplicacy_sftpstorage.go:242-263`,
    `src/duplicacy_b2storage.go:177-202`,
    `src/duplicacy_gcdstorage.go:741-772`).
-3. `manager.DownloadFile(snapshotPath, snapshotPath)` — a cache lookup that
+2. `manager.DownloadFile(snapshotPath, snapshotPath)` — a cache lookup that
    misses on the first run, then the actual download
-   (`src/duplicacy_snapshotmanager.go:2622-2677`).
+   (`src/duplicacy_snapshotmanager.go:2610-2665`).
 
 So the default `list` is approximately:
 
 ```
 1 x ListFiles("snapshots/<id>/")
-+ for each revision: (CreateDirectory + GetFileInfo + DownloadFile)
++ for each revision: (GetFileInfo + DownloadFile)
 ```
+
+Until fix #2 was implemented there was also a
+`manager.storage.CreateDirectory(0, snapshotDir)` (plus the equivalent call on
+the snapshot cache) at the top of `DownloadSnapshot`, and the same pair at the
+top of `ListSnapshotRevisions`. Both are gone now; see the candidate fixes below
+for why that was also a correctness fix and not only a performance one.
 
 At 50-100 ms RTT and a few hundred revisions this is tens of seconds. With
 `-all` it repeats for every snapshot id after a single `snapshots/` listing.
@@ -175,10 +177,11 @@ identical on ext4 — only the per-call latency differs, which is why the same
 code is roughly 13 times slower on drvfs. `fsync` alone is more than a third of
 the total.
 
-Per revision the loop emits: 4 `newfstatat`, 2 `openat`, 2 `mkdirat`, 1 `fsync`,
-1 `renameat` and 1 `write`.
+Per revision the loop emits: 4 `newfstatat`, 2 `openat` and, before fixes #1
+and #2, 2 `mkdirat`, 1 `fsync` and 1 `renameat`.
 
-The per-revision cost breaks down as:
+The per-revision cost broke down as (line numbers as of the original
+investigation, before fix #1 and fix #2):
 
 ```
 DownloadSnapshot:
@@ -190,16 +193,30 @@ DownloadSnapshot:
     snapshotCache.UploadFile -> openat + write + fsync + renameat  :2669
 ```
 
+After fix #1 removed the cache write and fix #2 removed the `CreateDirectory`
+calls, only `GetFileInfo` and the download remain:
+
+```
+DownloadSnapshot:
+  storage.GetFileInfo      -> newfstatat                           :216
+  DownloadFile:
+    cache read (SKIPPED, IsCacheNeeded() == false)                 :2612
+    storage.DownloadFile   -> openat + read                        :2622
+```
+
+Measured on the same 20-revision repository: `mkdirat` went from 44 to 2 calls
+per `list`, and the cached snapshot files written went from 20 to 0.
+
 ## `list -files` and `list -chunks`
 
-With `showFiles` (`src/duplicacy_snapshotmanager.go:727-765`) each revision gets:
+With `showFiles` (`src/duplicacy_snapshotmanager.go:713-751`) each revision gets:
 
 - `DownloadSnapshotSequences` -> `DownloadSequence` -> `chunkOperator.Download`
-  per metadata chunk (`src/duplicacy_snapshotmanager.go:292-349`). The operator
+  per metadata chunk (`src/duplicacy_snapshotmanager.go:339-345`). The operator
   has one worker, and every chunk download is a `FindChunk` followed by a
   `DownloadFile` (`src/duplicacy_chunkoperator.go:284-490`) — two serial
   operations per metadata chunk, per revision.
-- `snapshot.ListRemoteFiles(...)` called twice (`:741` and `:756`), each
+- `snapshot.ListRemoteFiles(...)` called twice (`:727` and `:742`), each
   re-iterating and re-decoding the whole file sequence
   (`src/duplicacy_snapshot.go:107-207`). The second pass is served from the
   cache, but the first is still fully remote.
@@ -215,10 +232,10 @@ strictly additive.
   wrapped in `retry()` which can reconnect and back off (`:135-165`). Worst
   ratio of round trips to payload.
 - **GCD** (`src/duplicacy_gcdstorage.go`): path-to-id resolution uses
-  `listByName` name queries. `CreateDirectory` -> `GetFileInfo` ->
+  `listByName` name queries. Before fix #2, `CreateDirectory` -> `GetFileInfo` ->
   `getIDFromPath`/`listByName`, and `ListFiles("snapshots/<id>/")` ->
-  `getIDFromPath` again, turning the three operations above into several Drive
-  API queries per revision, plus Drive quota.
+  `getIDFromPath` again, turned the operations above into several Drive API
+  queries per revision, plus Drive quota.
 - **B2** (`src/duplicacy_b2storage.go:41-92` and
   `src/duplicacy_b2client.go:397-539`): the `snapshots` listing is a flat prefix
   scan with `maxFileCount = 1000` that pages through every snapshot file of
@@ -257,9 +274,19 @@ Ordered roughly by expected benefit for local storage.
   cache write in `DownloadFile` is now guarded by `IsCacheNeeded()`, matching the
   cache read and `UploadFile`.
 - **Skip the redundant `CreateDirectory` on storage and cache** in
-  `DownloadSnapshot` (`:213-214`) and `ListSnapshotRevisions` (`:494-499`) when
-  the directory is known to exist; each is an `EEXIST` `mkdirat` or a `Stat`
-  round trip.
+  `DownloadSnapshot` (`:213-214`) and `ListSnapshotRevisions` (`:494-499`). Each
+  is an `EEXIST` `mkdirat` or a `Stat` round trip, and on a directory-based
+  backend it has a visible side effect: listing a snapshot id that does not
+  exist *creates* `snapshots/<id>`, which then shows up as a repository in
+  `duplicacy info`, in `check -all` output and in `prune`. It also makes read
+  commands fail on read-only storage, because `ListSnapshotRevisions` treats a
+  failed `CreateDirectory` as fatal. **Implemented**: both calls are gone. The
+  directory is created by `SnapshotManager.UploadFile` instead, which is the
+  only place that needs it (Dropbox and similar backends cannot upload a file
+  into a directory that does not exist). A missing snapshot directory now reads
+  as an empty one: `FileStorage`, `SambaStorage` and `ACDStorage` already
+  behaved that way, and `SFTPStorage`, `GCDStorage`, `DropboxStorage`,
+  `WebDAVStorage`, `OneDriveStorage` and `HubicStorage` were changed to match.
 - **Skip the `GetFileInfo` existence check** when the snapshot body is already
   cached, or fold it into the directory listing that `ListSnapshotRevisions`
   just performed.
