@@ -290,6 +290,117 @@ func TestDownloadSnapshotCache(t *testing.T) {
 	}
 }
 
+// countingStorage counts the GetFileInfo calls made through the Storage interface.  Methods not overridden here are
+// promoted from the embedded FileStorage, so the storage behaves exactly like the real one.
+type countingStorage struct {
+	*FileStorage
+	getFileInfoCalls int
+}
+
+func (storage *countingStorage) GetFileInfo(threadIndex int, filePath string) (exist bool, isDir bool, size int64, err error) {
+	storage.getFileInfoCalls++
+	return storage.FileStorage.GetFileInfo(threadIndex, filePath)
+}
+
+// Listing snapshots obtains the revisions from ListSnapshotRevisions, which already enumerated the snapshot
+// directory of the storage, so checking the existence of every revision again before downloading it only repeats an
+// operation that was just performed (and costs a round trip per revision on cloud storages).  The existence check
+// must still be performed for revisions that were specified by the user instead of being listed.
+func TestDownloadSnapshotSkipsExistenceCheck(t *testing.T) {
+
+	setTestingT(t)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%v", r)
+		}
+	}()
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+	storage := &countingStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
+	snapshotManager.storage = storage
+
+	chunkHash := uploadRandomChunk(snapshotManager, 1024)
+	if chunkHash == "" {
+		t.Errorf("Failed to upload a chunk")
+		return
+	}
+
+	now := time.Now().Unix()
+	createTestSnapshot(snapshotManager, "vm1@host1", 1, now-7200, now-3600, []string{chunkHash}, "tag")
+	createTestSnapshot(snapshotManager, "vm1@host1", 2, now-3600, now, []string{chunkHash}, "tag")
+
+	// Listing the revisions of a snapshot id and downloading them must not check their existence individually.
+	storage.getFileInfoCalls = 0
+
+	numberOfSnapshots := snapshotManager.ListSnapshots("vm1@host1", []int{}, "", false, false)
+	if numberOfSnapshots != 2 {
+		t.Errorf("Expecting 2 snapshots, got %d instead", numberOfSnapshots)
+	}
+	if storage.getFileInfoCalls != 0 {
+		t.Errorf("Listing the revisions should not check the existence of each snapshot, but %d checks were made",
+			storage.getFileInfoCalls)
+	}
+
+	// A revision given by the user wasn't listed, so it is still checked against the storage before the download.
+	storage.getFileInfoCalls = 0
+
+	numberOfSnapshots = snapshotManager.ListSnapshots("vm1@host1", []int{1}, "", false, false)
+	if numberOfSnapshots != 1 {
+		t.Errorf("Expecting 1 snapshot, got %d instead", numberOfSnapshots)
+	}
+	if storage.getFileInfoCalls != 1 {
+		t.Errorf("A revision specified by the user should be checked once, but %d checks were made",
+			storage.getFileInfoCalls)
+	}
+
+	// The existence check must still be enforced for a revision that is no longer in the storage but whose file is
+	// still in the snapshot cache, otherwise a deleted snapshot would remain readable.
+	storage.FileStorage.isCacheNeeded = true
+
+	createTestSnapshot(snapshotManager, "vm1@host1", 3, now, now+3600, []string{chunkHash}, "tag")
+
+	cachedSnapshotPath := path.Join(snapshotManager.snapshotCache.storageDir, "snapshots", "vm1@host1", "3")
+	if _, err := os.Stat(cachedSnapshotPath); err != nil {
+		t.Errorf("Snapshot vm1@host1 at revision 3 should have been added to the cache: %v", err)
+		return
+	}
+
+	// Delete it from the storage only; the cache keeps a stale copy.
+	if err := os.Remove(path.Join(storage.storageDir, "snapshots", "vm1@host1", "3")); err != nil {
+		t.Errorf("Failed to delete the snapshot from the storage: %v", err)
+		return
+	}
+
+	if !downloadedSnapshotMissing(snapshotManager, "vm1@host1", 3) {
+		t.Errorf("Downloading the snapshot vm1@host1 at revision 3 should report that it does not exist")
+	}
+}
+
+// downloadedSnapshotMissing calls DownloadSnapshot and reports whether it reported that the snapshot does not exist,
+// which is signaled by LOG_ERROR raising a SNAPSHOT_NOT_EXIST Exception.
+func downloadedSnapshotMissing(manager *SnapshotManager, snapshotID string, revision int) (missing bool) {
+	// A previous test may have left testingT set, which would turn the expected error into a test failure
+	savedTestingT := testingT
+	testingT = nil
+
+	defer func() {
+		testingT = savedTestingT
+		if r := recover(); r != nil {
+			if exception, ok := r.(Exception); ok && exception.LogID == "SNAPSHOT_NOT_EXIST" {
+				missing = true
+				return
+			}
+			panic(r)
+		}
+	}()
+
+	manager.DownloadSnapshot(snapshotID, revision)
+	return false
+}
+
 // Reading snapshots must never create directories.  The snapshot directory is created by the code that uploads a
 // snapshot, so read-only commands (list, check, cat, ...) leave the storage and the snapshot cache untouched.
 func TestReadSnapshotsDoesNotCreateDirectories(t *testing.T) {

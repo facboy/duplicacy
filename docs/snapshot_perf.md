@@ -1,8 +1,8 @@
 # Why listing snapshot revisions is slow
 
 Investigation into the performance of `duplicacy list`. This document records
-the findings and the candidate fixes; candidate fixes #1 and #2 below have since
-been implemented in `src/duplicacy_snapshotmanager.go`.
+the findings and the candidate fixes; candidate fixes #1, #2 and #3 below have
+since been implemented in `src/duplicacy_snapshotmanager.go`.
 
 ## Summary
 
@@ -12,10 +12,12 @@ chunk operator hard-coded to a single thread and a snapshot cache that is
 written but never read.
 
 Against cloud storage each of those operations is a network round trip, so the
-cost grows linearly at roughly two round trips per revision. Against local
-storage the same code runs, but each hop is a syscall instead of a round trip:
-it is usually fine on a fast native filesystem (~3 ms per revision) and painful
-on a slow local mount.
+cost grows linearly at roughly two round trips per revision; fix #3 removed the
+existence check when the revision was just listed, halving that.
+
+Against local storage the same code runs, but each hop is a syscall instead of a
+round trip: it is usually fine on a fast native filesystem (~3 ms per revision)
+and painful on a slow local mount.
 
 ## The call path
 
@@ -45,7 +47,7 @@ list.
 
 ## Cost per revision
 
-`DownloadSnapshot` (`src/duplicacy_snapshotmanager.go:209-242`) does two
+`DownloadSnapshot` (`src/duplicacy_snapshotmanager.go:209-242`) used to do two
 operations for every revision, including revisions already present in the local
 cache:
 
@@ -54,16 +56,24 @@ cache:
    may hold a stale copy, but it costs a round trip per revision even when the
    file is already cached (`src/duplicacy_sftpstorage.go:242-263`,
    `src/duplicacy_b2storage.go:177-202`,
-   `src/duplicacy_gcdstorage.go:741-772`).
+   `src/duplicacy_gcdstorage.go:741-772`). Fix #3 skips it when the revision
+   came from `ListSnapshotRevisions`, which already enumerated the directory.
 2. `manager.DownloadFile(snapshotPath, snapshotPath)` — a cache lookup that
    misses on the first run, then the actual download
    (`src/duplicacy_snapshotmanager.go:2610-2665`).
 
-So the default `list` is approximately:
+So the default `list` used to be approximately:
 
 ```
 1 x ListFiles("snapshots/<id>/")
 + for each revision: (GetFileInfo + DownloadFile)
+```
+
+and is now:
+
+```
+1 x ListFiles("snapshots/<id>/")
++ for each revision: DownloadFile
 ```
 
 Until fix #2 was implemented there was also a
@@ -207,6 +217,27 @@ DownloadSnapshot:
 Measured on the same 20-revision repository: `mkdirat` went from 44 to 2 calls
 per `list`, and the cached snapshot files written went from 20 to 0.
 
+After fix #3 the `GetFileInfo` is also gone for revisions that were just listed
+by `ListSnapshotRevisions`:
+
+```
+ListSnapshotRevisions:
+  storage.ListFiles("snapshots/<id>/") -> openat + read            :500
+DownloadSnapshot (revision was listed, so no GetFileInfo):
+  DownloadFile:
+    cache read (SKIPPED, IsCacheNeeded() == false)                 :2627
+    storage.DownloadFile   -> openat + read                        :2637
+```
+
+`DownloadSnapshot` still calls `GetFileInfo` for a revision the user named
+explicitly with `-r`, because that revision was not enumerated and the check
+protects against a stale snapshot cache entry.
+
+Measured on a 60-revision local repository: `newfstatat` per `list` fell from 77
+to 37 (one per revision), and on a slow drvfs mount `/usr/bin/time` went from
+0.40 s to 0.27 s. On native ext4 the same repository is ~0.02 s either way,
+where the syscall is a few microseconds.
+
 ## `list -files` and `list -chunks`
 
 With `showFiles` (`src/duplicacy_snapshotmanager.go:713-751`) each revision gets:
@@ -289,7 +320,13 @@ Ordered roughly by expected benefit for local storage.
   `WebDAVStorage`, `OneDriveStorage` and `HubicStorage` were changed to match.
 - **Skip the `GetFileInfo` existence check** when the snapshot body is already
   cached, or fold it into the directory listing that `ListSnapshotRevisions`
-  just performed.
+  just performed. **Implemented**: `ListSnapshotRevisions` already enumerated the
+  snapshot directory, so the revisions it returns are known to exist and
+  `ListSnapshots`, `CheckSnapshots`, `ShowHistory`, `downloadLatestSnapshot`,
+  `PruneSnapshots` and `CopySnapshots` all download them through the private
+  `downloadSnapshot(..., listed = true)`, which skips the check. `DownloadSnapshot`
+  keeps it, so a revision named with `-r` is still validated against the storage
+  (the cache may hold a stale copy), and `copy` keeps its own destination check.
 - **Parallelise the revision loop** and raise the chunk operator thread count for
   `list`; revisions are independent. This is the only change that helps when the
   filesystem itself is the bottleneck.

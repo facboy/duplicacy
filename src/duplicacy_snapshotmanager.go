@@ -208,22 +208,31 @@ func CreateSnapshotManager(config *Config, storage Storage) *SnapshotManager {
 
 // DownloadSnapshot downloads the specified snapshot.
 func (manager *SnapshotManager) DownloadSnapshot(snapshotID string, revision int) *Snapshot {
+	return manager.downloadSnapshot(snapshotID, revision, false)
+}
+
+// downloadSnapshot downloads the specified snapshot.  If 'listed' is true, the revision is known to exist in the
+// storage because it was returned by ListSnapshotRevisions, which already enumerated the snapshot directory; the
+// existence check is then skipped instead of repeating an operation that was just performed (and, on cloud
+// storages, paying for an extra round trip per revision).  Otherwise the snapshot file is checked first, because
+// the snapshot cache may store a copy of the file even if the snapshot has been deleted in the storage (possibly
+// by a different client).
+func (manager *SnapshotManager) downloadSnapshot(snapshotID string, revision int, listed bool) *Snapshot {
 
 	snapshotPath := fmt.Sprintf("snapshots/%s/%d", snapshotID, revision)
 
-	// We must check if the snapshot file exists in the storage, because the snapshot cache may store a copy of the
-	// file even if the snapshot has been deleted in the storage (possibly by a different client)
-	exist, _, _, err := manager.storage.GetFileInfo(0, snapshotPath)
-	if err != nil {
-		LOG_ERROR("SNAPSHOT_INFO", "Failed to get the information on the snapshot %s at revision %d: %v",
-			snapshotID, revision, err)
-		return nil
-	}
+	if !listed {
+		exist, _, _, err := manager.storage.GetFileInfo(0, snapshotPath)
+		if err != nil {
+			LOG_ERROR("SNAPSHOT_INFO", "Failed to get the information on the snapshot %s at revision %d: %v",
+				snapshotID, revision, err)
+			return nil
+		}
 
-	if !exist {
-		LOG_ERROR("SNAPSHOT_NOT_EXIST", "Snapshot %s at revision %d does not exist", snapshotID, revision)
-		return nil
-
+		if !exist {
+			LOG_ERROR("SNAPSHOT_NOT_EXIST", "Snapshot %s at revision %d does not exist", snapshotID, revision)
+			return nil
+		}
 	}
 
 	description := manager.DownloadFile(snapshotPath, snapshotPath)
@@ -526,7 +535,7 @@ func (manager *SnapshotManager) downloadLatestSnapshot(snapshotID string) (remot
 	}
 
 	if latest > 0 {
-		remote = manager.DownloadSnapshot(snapshotID, latest)
+		remote = manager.downloadSnapshot(snapshotID, latest, true)
 	}
 
 	return remote
@@ -684,17 +693,19 @@ func (manager *SnapshotManager) ListSnapshots(snapshotID string, revisionsToList
 	for _, snapshotID = range snapshotIDs {
 
 		revisions := revisionsToList
+		listed := false
 		if len(revisions) == 0 {
 			revisions, err = manager.ListSnapshotRevisions(snapshotID)
 			if err != nil {
 				LOG_ERROR("SNAPSHOT_LIST", "Failed to list all revisions for snapshot %s: %v", snapshotID, err)
 				return 0
 			}
+			listed = true
 		}
 
 		for _, revision := range revisions {
 
-			snapshot := manager.DownloadSnapshot(snapshotID, revision)
+			snapshot := manager.downloadSnapshot(snapshotID, revision, listed)
 			if tag != "" && snapshot.Tag != tag {
 				continue
 			}
@@ -832,16 +843,18 @@ func (manager *SnapshotManager) CheckSnapshots(snapshotID string, revisionsToChe
 	for snapshotID = range snapshotMap {
 
 		revisions := revisionsToCheck
+		listed := false
 		if len(revisions) == 0 || showStatistics || showTabular {
 			revisions, err = manager.ListSnapshotRevisions(snapshotID)
 			if err != nil {
 				LOG_ERROR("SNAPSHOT_LIST", "Failed to list all revisions for snapshot %s: %v", snapshotID, err)
 				return false
 			}
+			listed = true
 		}
 
 		for _, revision := range revisions {
-			snapshot := manager.DownloadSnapshot(snapshotID, revision)
+			snapshot := manager.downloadSnapshot(snapshotID, revision, listed)
 			if tag != "" && snapshot.Tag != tag {
 				continue
 			}
@@ -1727,18 +1740,20 @@ func (manager *SnapshotManager) ShowHistory(top string, snapshotID string, revis
 
 	var err error
 
+	listed := false
 	if len(revisions) == 0 {
 		revisions, err = manager.ListSnapshotRevisions(snapshotID)
 		if err != nil {
 			LOG_ERROR("SNAPSHOT_LIST", "Failed to list all revisions for snapshot %s: %v", snapshotID, err)
 			return false
 		}
+		listed = true
 	}
 
 	var lastVersion *Entry
 	sort.Ints(revisions)
 	for _, revision := range revisions {
-		snapshot := manager.DownloadSnapshot(snapshotID, revision)
+		snapshot := manager.downloadSnapshot(snapshotID, revision, listed)
 		manager.DownloadSnapshotSequences(snapshot)
 		file := manager.FindFile(snapshot, filePath, true)
 
@@ -1959,7 +1974,7 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
 		sort.Ints(revisions)
 		var snapshots []*Snapshot
 		for _, revision := range revisions {
-			snapshot := manager.DownloadSnapshot(id, revision)
+			snapshot := manager.downloadSnapshot(id, revision, true)
 			if snapshot != nil {
 				snapshots = append(snapshots, snapshot)
 			}
