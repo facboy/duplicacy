@@ -4,8 +4,10 @@ Investigation into the performance of `duplicacy list`. This document records
 the findings and the candidate fixes; candidate fixes #1, #2 and #3 below have
 since been implemented in `src/duplicacy_snapshotmanager.go`, and #4 (the
 parallel `list`) in both `src/duplicacy_snapshotmanager.go` and
-`duplicacy/duplicacy_main.go`, and #5 (the single `list -files` pass) in
-`src/duplicacy_snapshotmanager.go`.
+`duplicacy/duplicacy_main.go`, #5 (the single `list -files` pass) in
+`src/duplicacy_snapshotmanager.go`, and #6 (the id listing) in
+`src/duplicacy_b2storage.go`, `src/duplicacy_b2client.go` and
+`src/duplicacy_azurestorage.go`.
 
 ## Summary
 
@@ -279,12 +281,17 @@ strictly additive.
   `getIDFromPath`/`listByName`, and `ListFiles("snapshots/<id>/")` ->
   `getIDFromPath` again, turned the operations above into several Drive API
   queries per revision, plus Drive quota.
-- **B2** (`src/duplicacy_b2storage.go:41-92` and
-  `src/duplicacy_b2client.go:397-539`): the `snapshots` listing is a flat prefix
-  scan with `maxFileCount = 1000` that pages through every snapshot file of
-  every id and revision, deduplicating subdirectories client-side. `list -all`
-  on a large bucket pays for a full `snapshots/` traversal.
-- **S3, Azure, GCS, Swift, WebDAV**: cheaper for the id listing (delimiter or
+- **B2** (`src/duplicacy_b2storage.go:41-99` and
+  `src/duplicacy_b2client.go:401-554`): the `snapshots` listing used to be a
+  flat prefix scan with `maxFileCount = 1000` that paged through every snapshot
+  file of every id and revision, deduplicating subdirectories client-side, so
+  `list -all` on a large bucket paid for a full `snapshots/` traversal. It now
+  sends a delimiter, and the service returns one `"folder"` entry per id
+  instead.
+- **Azure** (`src/duplicacy_azurestorage.go:55-120`): the same flat prefix scan,
+  deduplicating the ids client-side without a delimiter. It now sends
+  `Delimiter: "/"` for `snapshots/` and reads the `BlobPrefix` entries.
+- **S3, GCS, Swift, WebDAV**: cheaper for the id listing (delimiter or
   CommonPrefixes) but still pay the per-revision `GetFileInfo` and
   `DownloadFile`.
 - **OneDrive, Hubic**: `ListEntries` is non-recursive with 1000-item paging, so
@@ -381,6 +388,24 @@ Ordered roughly by expected benefit for local storage.
   sequence (`chunks/` read on the first pass, snapshot cache hit on the second),
   which `list -files` paid for once per revision.
 - **Let backends list only direct children of `snapshots/`** (B2 and other
-  prefix-based backends) instead of scanning the whole subtree.
+  prefix-based backends) instead of scanning the whole subtree. **Implemented**:
+  `B2Storage` and `AzureStorage` were the two remaining backends whose
+  `snapshots` listing was a flat prefix scan, so they returned every snapshot
+  file of every id and deduplicated the ids client-side. Both now pass the
+  delimiter their object store offers (`/`), which makes the service fold each
+  subdirectory into a single entry and stop descending into it: B2 returns a
+  `"folder"` entry per id and Azure a `BlobPrefix`, and the id listing reads the
+  direct children directly. `GCSStorage`, `S3Storage`, `S3CStorage`,
+  `SwiftStorage`, `StorjStorage` and `HubicStorage` already used a delimiter or
+  a non-recursive listing, so they are unchanged. On a bucket with many ids and
+  revisions `list -all` no longer pays for a full `snapshots/` traversal before
+  each id is visited; the B2 case additionally stops paging through
+  `b2_list_file_names` 1000 names at a time. The listing of a single id
+  (`snapshots/<id>`) is unaffected, because it is restricted to that directory
+  either way. Add `TestB2ListSnapshotsListsOnlyDirectChildren` and
+  `TestAzureListSnapshotsListsOnlyDirectChildren`; they serve the prefix and
+  delimiter semantics from a test endpoint and assert the delimiter, the
+  restricted prefix, that one entry per id came back and that the ids are
+  correct.
 - **Introduce a lightweight revision index** instead of one file per revision, so
   listing a repository becomes a single object read.
