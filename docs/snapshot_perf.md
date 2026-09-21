@@ -2,18 +2,22 @@
 
 Investigation into the performance of `duplicacy list`. This document records
 the findings and the candidate fixes; candidate fixes #1, #2 and #3 below have
-since been implemented in `src/duplicacy_snapshotmanager.go`.
+since been implemented in `src/duplicacy_snapshotmanager.go`, and #4 (the
+parallel `list`) in both `src/duplicacy_snapshotmanager.go` and
+`duplicacy/duplicacy_main.go`.
 
 ## Summary
 
-`duplicacy list` is a serial, one-operation-at-a-time loop. For every revision of
-every snapshot id it performs an existence check and a file download, with a
-chunk operator hard-coded to a single thread and a snapshot cache that is
-written but never read.
+`duplicacy list` used to be a serial, one-operation-at-a-time loop. For every
+revision of every snapshot id it performs an existence check and a file
+download, with a chunk operator hard-coded to a single thread and a snapshot
+cache that is written but never read. Only the file downloads are now overlapped,
+and only when `-threads N` (N > 1) is given; everything else is still serial.
 
 Against cloud storage each of those operations is a network round trip, so the
 cost grows linearly at roughly two round trips per revision; fix #3 removed the
-existence check when the revision was just listed, halving that.
+existence check when the revision was just listed, halving that, and fix #4
+overlaps the remaining round trips on request.
 
 Against local storage the same code runs, but each hop is a syscall instead of a
 round trip: it is usually fine on a fast native filesystem (~3 ms per revision)
@@ -26,19 +30,24 @@ calls `CreateBackupManager` (which downloads the config), calls
 `SetupSnapshotCache`, and then hands off to `SnapshotManager.ListSnapshots`
 (`src/duplicacy_snapshotmanager.go:657-765`).
 
-`ListSnapshots` is a plain nested loop with no concurrency:
+`ListSnapshots` is a plain nested loop whose downloads are now optionally
+overlapped (fix #4):
 
 ```go
 manager.CreateChunkOperator(false, false, 1, false)   // threads == 1
 ...
 for _, snapshotID = range snapshotIDs {
     revisions, err = manager.ListSnapshotRevisions(snapshotID)
-    for _, revision := range revisions {
-        snapshot := manager.DownloadSnapshot(snapshotID, revision)
+    snapshots := manager.downloadSnapshots(snapshotID, revisions, listed, threads)
+    for i, revision := range revisions {
+        snapshot := snapshots[i]   // already downloaded
         ...
     }
 }
 ```
+
+With `threads == 1` (the default) the downloads happen one at a time, exactly as
+before; the printing is serial in either case.
 
 `revisionsToList` is empty unless `-r` was passed, so `ListSnapshotRevisions`
 (`src/duplicacy_snapshotmanager.go:484-507`) always runs and always hits the
@@ -291,6 +300,10 @@ strictly additive.
   list` and sum the per-call times. If `fsync` dominates, it is the write-only
   snapshot cache.
 - `list -r 1` versus a full `list` gives the per-revision marginal cost.
+- `list -threads N` overlaps the per-revision downloads. The output is
+  independent of `N`, so `list` and `list -threads 8` can be diffed directly to
+  confirm that; the benefit only shows up when the latency of a single download
+  dominates, which is the round-trip case rather than the local one.
 - Compare the same repository on a native filesystem against the mount in
   question: syscall counts will match while timings differ.
 
@@ -329,7 +342,30 @@ Ordered roughly by expected benefit for local storage.
   (the cache may hold a stale copy), and `copy` keeps its own destination check.
 - **Parallelise the revision loop** and raise the chunk operator thread count for
   `list`; revisions are independent. This is the only change that helps when the
-  filesystem itself is the bottleneck.
+  filesystem itself is the bottleneck. **Implemented**: `list` has a `-threads`
+  flag (default 1, so the on-the-wire behaviour is unchanged unless it is asked
+  for) and the snapshot files are downloaded by that many workers through
+  `downloadSnapshots`. Each worker owns a `Chunk` so the downloads don't share
+  `manager.fileChunk`, and passes its own thread index because some backends keep
+  a per-thread client or nested directory; to keep those indexes in range,
+  `list` now creates its storage with the requested number of threads instead of
+  a hard-coded 1. Only the downloads overlap -- everything that prints is still
+  done in revision order, so the output is byte-for-byte identical to the
+  single-threaded one. This is the only change that helps when the filesystem
+  itself is the bottleneck.
+
+  Measured on a 120-revision repository on drvfs (the slow local mount from the
+  table above), `/usr/bin/time` for `list`:
+
+  ```
+  threads=1   threads=2   threads=4   threads=8   threads=16
+  0.25 s      0.19 s      0.18 s      0.20 s      0.26 s
+  ```
+
+  On a native ext4 filesystem the per-download syscall is a few microseconds, so
+  there is nothing to overlap and more threads only add scheduling overhead
+  (~0.12 s at one thread against ~0.18 s at four on a 300-revision repository).
+  That is why the default stays at 1: the flag is for the round-trip case.
 - **Avoid the double `ListRemoteFiles` pass** in the `showFiles` branch by
   computing sizes and printing in a single traversal.
 - **Let backends list only direct children of `snapshots/`** (B2 and other

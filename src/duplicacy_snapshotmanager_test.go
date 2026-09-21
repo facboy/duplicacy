@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -290,16 +291,69 @@ func TestDownloadSnapshotCache(t *testing.T) {
 	}
 }
 
-// countingStorage counts the GetFileInfo calls made through the Storage interface.  Methods not overridden here are
-// promoted from the embedded FileStorage, so the storage behaves exactly like the real one.
+// countingStorage counts the GetFileInfo calls made through the Storage interface, records the thread indexes that
+// file downloads were attributed to, and tracks how many downloads are in flight at the same time.  A small delay in
+// DownloadFile widens the window in which concurrent downloads overlap, so the peak observed here is what a test uses
+// to tell a serial loop from a parallel one.  Methods not overridden here are promoted from the embedded FileStorage,
+// so the storage behaves exactly like the real one.
 type countingStorage struct {
 	*FileStorage
 	getFileInfoCalls int
+	downloadThreads  map[int]bool
+	downloadInFlight int
+	downloadPeak     int
+	downloadLock     sync.Mutex
 }
 
 func (storage *countingStorage) GetFileInfo(threadIndex int, filePath string) (exist bool, isDir bool, size int64, err error) {
 	storage.getFileInfoCalls++
 	return storage.FileStorage.GetFileInfo(threadIndex, filePath)
+}
+
+func (storage *countingStorage) DownloadFile(threadIndex int, filePath string, chunk *Chunk) (err error) {
+
+	storage.downloadLock.Lock()
+	if storage.downloadThreads == nil {
+		storage.downloadThreads = make(map[int]bool)
+	}
+	storage.downloadThreads[threadIndex] = true
+	storage.downloadInFlight++
+	if storage.downloadInFlight > storage.downloadPeak {
+		storage.downloadPeak = storage.downloadInFlight
+	}
+	storage.downloadLock.Unlock()
+
+	// Give the other workers a chance to enter this method before this download finishes.
+	time.Sleep(time.Millisecond)
+
+	err = storage.FileStorage.DownloadFile(threadIndex, filePath, chunk)
+
+	storage.downloadLock.Lock()
+	storage.downloadInFlight--
+	storage.downloadLock.Unlock()
+
+	return err
+}
+
+func (storage *countingStorage) numberOfDownloadThreads() int {
+	storage.downloadLock.Lock()
+	defer storage.downloadLock.Unlock()
+	return len(storage.downloadThreads)
+}
+
+// resetDownloadStats forgets the thread indexes and the peak number of concurrent downloads seen so far.
+func (storage *countingStorage) resetDownloadStats() {
+	storage.downloadLock.Lock()
+	defer storage.downloadLock.Unlock()
+	storage.downloadThreads = nil
+	storage.downloadPeak = 0
+}
+
+// peakConcurrentDownloads returns the largest number of downloads that were in flight at the same time.
+func (storage *countingStorage) peakConcurrentDownloads() int {
+	storage.downloadLock.Lock()
+	defer storage.downloadLock.Unlock()
+	return storage.downloadPeak
 }
 
 // Listing snapshots obtains the revisions from ListSnapshotRevisions, which already enumerated the snapshot
@@ -335,7 +389,7 @@ func TestDownloadSnapshotSkipsExistenceCheck(t *testing.T) {
 	// Listing the revisions of a snapshot id and downloading them must not check their existence individually.
 	storage.getFileInfoCalls = 0
 
-	numberOfSnapshots := snapshotManager.ListSnapshots("vm1@host1", []int{}, "", false, false)
+	numberOfSnapshots := snapshotManager.ListSnapshots("vm1@host1", []int{}, "", false, false, 1)
 	if numberOfSnapshots != 2 {
 		t.Errorf("Expecting 2 snapshots, got %d instead", numberOfSnapshots)
 	}
@@ -347,7 +401,7 @@ func TestDownloadSnapshotSkipsExistenceCheck(t *testing.T) {
 	// A revision given by the user wasn't listed, so it is still checked against the storage before the download.
 	storage.getFileInfoCalls = 0
 
-	numberOfSnapshots = snapshotManager.ListSnapshots("vm1@host1", []int{1}, "", false, false)
+	numberOfSnapshots = snapshotManager.ListSnapshots("vm1@host1", []int{1}, "", false, false, 1)
 	if numberOfSnapshots != 1 {
 		t.Errorf("Expecting 1 snapshot, got %d instead", numberOfSnapshots)
 	}
@@ -399,6 +453,86 @@ func downloadedSnapshotMissing(manager *SnapshotManager, snapshotID string, revi
 
 	manager.DownloadSnapshot(snapshotID, revision)
 	return false
+}
+
+// Downloading the revisions concurrently must return the same snapshots as downloading them one at a time, in the
+// same order, without the workers sharing the download buffer of the manager.
+func TestDownloadSnapshotsConcurrently(t *testing.T) {
+
+	setTestingT(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+	counting := &countingStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
+	snapshotManager.storage = counting
+
+	chunkHash := uploadRandomChunk(snapshotManager, 1024)
+	if chunkHash == "" {
+		t.Errorf("Failed to upload a chunk")
+		return
+	}
+
+	now := time.Now().Unix()
+	for revision := 1; revision <= 8; revision++ {
+		createTestSnapshot(snapshotManager, "vm1@host1", revision, now-int64(revision)*3600, now, []string{chunkHash}, "tag")
+	}
+
+	revisions, err := snapshotManager.ListSnapshotRevisions("vm1@host1")
+	if err != nil {
+		t.Errorf("Failed to list the revisions: %v", err)
+		return
+	}
+	if len(revisions) != 8 {
+		t.Errorf("Expecting 8 revisions, got %d", len(revisions))
+		return
+	}
+
+	// The revisions must come back in order, each carrying its own revision number, no matter how many workers
+	// downloaded them and in which order they finished.
+	for _, threads := range []int{1, 2, 4, 16} {
+		counting.resetDownloadStats()
+
+		snapshots := snapshotManager.downloadSnapshots("vm1@host1", revisions, true, threads)
+		if len(snapshots) != len(revisions) {
+			t.Errorf("With %d threads: expecting %d snapshots, got %d", threads, len(revisions), len(snapshots))
+			continue
+		}
+		for i, revision := range revisions {
+			snapshot := snapshots[i]
+			if snapshot == nil {
+				t.Errorf("With %d threads: the snapshot at revision %d was not downloaded", threads, revision)
+				continue
+			}
+			if snapshot.Revision != revision {
+				t.Errorf("With %d threads: expecting revision %d at position %d, got %d",
+					threads, revision, i, snapshot.Revision)
+			}
+		}
+
+		// Each snapshot is a separate download attributed to the worker that handled it, and the downloads must be
+		// spread over the thread indexes the storage was told to expect -- but never beyond them, since some
+		// backends index a per-thread client or nested directory with the thread index.
+		usedThreads := counting.numberOfDownloadThreads()
+		if usedThreads > threads {
+			t.Errorf("With %d threads: the storage saw %d different thread indexes, more than the storage was created with",
+				threads, usedThreads)
+		}
+
+		// The downloads must really overlap: a serial loop never has two of them in flight at the same time.
+		peak := counting.peakConcurrentDownloads()
+		if threads == 1 && peak != 1 {
+			t.Errorf("With 1 thread: expecting at most one download at a time, got %d", peak)
+		}
+		if threads > 1 && peak < 2 {
+			t.Errorf("With %d threads: the downloads did not overlap, at most %d was in flight at a time", threads, peak)
+		}
+	}
+
+	// The number of snapshots reported by list must not depend on the number of threads either.
+	if numberOfSnapshots := snapshotManager.ListSnapshots("vm1@host1", []int{}, "", false, false, 4); numberOfSnapshots != 8 {
+		t.Errorf("Expecting 8 snapshots from a concurrent list, got %d", numberOfSnapshots)
+	}
 }
 
 // Reading snapshots must never create directories.  The snapshot directory is created by the code that uploads a

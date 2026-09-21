@@ -913,7 +913,15 @@ func listSnapshots(context *cli.Context) {
 	runScript(context, preference.Name, "pre")
 
 	resetPassword := context.Bool("reset-passwords")
-	storage := duplicacy.CreateStorage(*preference, resetPassword, 1)
+
+	threads := context.Int("threads")
+	if threads < 1 {
+		threads = 1
+	}
+
+	// The storage must know how many concurrent downloads to expect: some backends keep one client or one nested
+	// directory per thread, indexed by the thread number the download is attributed to.
+	storage := duplicacy.CreateStorage(*preference, resetPassword, threads)
 	if storage == nil {
 		return
 	}
@@ -944,7 +952,7 @@ func listSnapshots(context *cli.Context) {
 	loadRSAPrivateKey(context.String("key"), "", preference, backupManager, resetPassword)
 
 	backupManager.SetupSnapshotCache(preference.Name)
-	backupManager.SnapshotManager.ListSnapshots(id, revisions, tag, showFiles, showChunks)
+	backupManager.SnapshotManager.ListSnapshots(id, revisions, tag, showFiles, showChunks, threads)
 
 	runScript(context, preference.Name, "post")
 }
@@ -1680,6 +1688,11 @@ func main() {
 					Name:     "key",
 					Usage:    "the RSA private key to decrypt file chunks",
 					Argument: "<private key>",
+				},
+				cli.IntFlag{
+					Name:  "threads",
+					Value: 1,
+					Usage: "number of snapshot files to download concurrently",
 				},
 			},
 			Usage:     "List snapshots",

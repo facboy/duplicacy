@@ -208,7 +208,7 @@ func CreateSnapshotManager(config *Config, storage Storage) *SnapshotManager {
 
 // DownloadSnapshot downloads the specified snapshot.
 func (manager *SnapshotManager) DownloadSnapshot(snapshotID string, revision int) *Snapshot {
-	return manager.downloadSnapshot(snapshotID, revision, false)
+	return manager.downloadSnapshot(snapshotID, revision, false, manager.fileChunk, 0)
 }
 
 // downloadSnapshot downloads the specified snapshot.  If 'listed' is true, the revision is known to exist in the
@@ -217,12 +217,17 @@ func (manager *SnapshotManager) DownloadSnapshot(snapshotID string, revision int
 // storages, paying for an extra round trip per revision).  Otherwise the snapshot file is checked first, because
 // the snapshot cache may store a copy of the file even if the snapshot has been deleted in the storage (possibly
 // by a different client).
-func (manager *SnapshotManager) downloadSnapshot(snapshotID string, revision int, listed bool) *Snapshot {
+//
+// 'chunk' receives the snapshot file and must be owned by the caller for the duration of the call, so that
+// concurrent downloads don't share manager.fileChunk.  'threadIndex' selects the per-thread client or nested
+// directory that some storages maintain, and must be less than the number of threads the storage was created with.
+func (manager *SnapshotManager) downloadSnapshot(snapshotID string, revision int, listed bool, chunk *Chunk,
+	threadIndex int) *Snapshot {
 
 	snapshotPath := fmt.Sprintf("snapshots/%s/%d", snapshotID, revision)
 
 	if !listed {
-		exist, _, _, err := manager.storage.GetFileInfo(0, snapshotPath)
+		exist, _, _, err := manager.storage.GetFileInfo(threadIndex, snapshotPath)
 		if err != nil {
 			LOG_ERROR("SNAPSHOT_INFO", "Failed to get the information on the snapshot %s at revision %d: %v",
 				snapshotID, revision, err)
@@ -235,7 +240,7 @@ func (manager *SnapshotManager) downloadSnapshot(snapshotID string, revision int
 		}
 	}
 
-	description := manager.DownloadFile(snapshotPath, snapshotPath)
+	description := manager.downloadFile(snapshotPath, snapshotPath, chunk, threadIndex)
 
 	snapshot, err := CreateSnapshotFromDescription(description)
 
@@ -535,7 +540,7 @@ func (manager *SnapshotManager) downloadLatestSnapshot(snapshotID string) (remot
 	}
 
 	if latest > 0 {
-		remote = manager.downloadSnapshot(snapshotID, latest, true)
+		remote = manager.downloadSnapshot(snapshotID, latest, true, manager.fileChunk, 0)
 	}
 
 	return remote
@@ -662,12 +667,84 @@ func (manager *SnapshotManager) GetSnapshotChunkHashes(snapshot *Snapshot, chunk
 	snapshot.ClearChunks()
 }
 
-// ListSnapshots shows the information about a snapshot.
-func (manager *SnapshotManager) ListSnapshots(snapshotID string, revisionsToList []int, tag string,
-	showFiles bool, showChunks bool) int {
+// downloadSnapshots downloads the snapshot files for 'revisions' using up to 'threads' concurrent workers and returns
+// them in the order of 'revisions'.  Each worker owns a chunk so that the downloads don't share manager.fileChunk, and
+// passes its own thread index because some storages keep a per-thread client or nested directory.  'threads' must be no
+// larger than the number of threads the storage was created with.
+func (manager *SnapshotManager) downloadSnapshots(snapshotID string, revisions []int, listed bool, threads int) []*Snapshot {
 
-	LOG_DEBUG("LIST_PARAMETERS", "id: %s, revisions: %v, tag: %s, showFiles: %t, showChunks: %t",
-		snapshotID, revisionsToList, tag, showFiles, showChunks)
+	snapshots := make([]*Snapshot, len(revisions))
+
+	if threads <= 1 || len(revisions) <= 1 {
+		for i, revision := range revisions {
+			snapshots[i] = manager.downloadSnapshot(snapshotID, revision, listed, manager.fileChunk, 0)
+		}
+		return snapshots
+	}
+
+	if threads > len(revisions) {
+		threads = len(revisions)
+	}
+
+	chunks := make([]*Chunk, threads)
+	for i := range chunks {
+		chunks[i] = manager.config.GetChunk()
+	}
+
+	nextRevision := int64(0)
+	var waitGroup sync.WaitGroup
+
+	// A worker that hits an error can't report it by itself, since the panic raised by LOG_ERROR would unwind its own
+	// goroutine only.  It is captured here and re-raised in the calling goroutine after all workers have finished, so
+	// that the caller and the top-level exception handler see exactly what they see in the single-threaded case.
+	var failure interface{}
+	var failureLock sync.Mutex
+
+	waitGroup.Add(threads)
+	for i := 0; i < threads; i++ {
+		go func(threadIndex int) {
+			defer waitGroup.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					failureLock.Lock()
+					if failure == nil {
+						failure = r
+					}
+					failureLock.Unlock()
+				}
+			}()
+
+			chunk := chunks[threadIndex]
+			for {
+				index := int(atomic.AddInt64(&nextRevision, 1)) - 1
+				if index >= len(revisions) {
+					return
+				}
+				snapshots[index] = manager.downloadSnapshot(snapshotID, revisions[index], listed, chunk, threadIndex)
+			}
+		}(i)
+	}
+
+	waitGroup.Wait()
+
+	for _, chunk := range chunks {
+		manager.config.PutChunk(chunk)
+	}
+
+	if failure != nil {
+		panic(failure)
+	}
+
+	return snapshots
+}
+
+// ListSnapshots shows the information about a snapshot.  'threads' is the number of snapshot files that are
+// downloaded concurrently; the output is printed sequentially and in revision order regardless of it.
+func (manager *SnapshotManager) ListSnapshots(snapshotID string, revisionsToList []int, tag string,
+	showFiles bool, showChunks bool, threads int) int {
+
+	LOG_DEBUG("LIST_PARAMETERS", "id: %s, revisions: %v, tag: %s, showFiles: %t, showChunks: %t, threads: %d",
+		snapshotID, revisionsToList, tag, showFiles, showChunks, threads)
 
 	manager.CreateChunkOperator(false, false, 1, false)
 	defer func() {
@@ -703,9 +780,13 @@ func (manager *SnapshotManager) ListSnapshots(snapshotID string, revisionsToList
 			listed = true
 		}
 
-		for _, revision := range revisions {
+		// Revisions are independent, so their snapshot files are downloaded concurrently.  Everything that follows
+		// is done in revision order, which keeps the output identical to the single-threaded case.
+		snapshots := manager.downloadSnapshots(snapshotID, revisions, listed, threads)
 
-			snapshot := manager.downloadSnapshot(snapshotID, revision, listed)
+		for i, revision := range revisions {
+
+			snapshot := snapshots[i]
 			if tag != "" && snapshot.Tag != tag {
 				continue
 			}
@@ -854,7 +935,7 @@ func (manager *SnapshotManager) CheckSnapshots(snapshotID string, revisionsToChe
 		}
 
 		for _, revision := range revisions {
-			snapshot := manager.downloadSnapshot(snapshotID, revision, listed)
+			snapshot := manager.downloadSnapshot(snapshotID, revision, listed, manager.fileChunk, 0)
 			if tag != "" && snapshot.Tag != tag {
 				continue
 			}
@@ -1753,7 +1834,7 @@ func (manager *SnapshotManager) ShowHistory(top string, snapshotID string, revis
 	var lastVersion *Entry
 	sort.Ints(revisions)
 	for _, revision := range revisions {
-		snapshot := manager.downloadSnapshot(snapshotID, revision, listed)
+		snapshot := manager.downloadSnapshot(snapshotID, revision, listed, manager.fileChunk, 0)
 		manager.DownloadSnapshotSequences(snapshot)
 		file := manager.FindFile(snapshot, filePath, true)
 
@@ -1974,7 +2055,7 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
 		sort.Ints(revisions)
 		var snapshots []*Snapshot
 		for _, revision := range revisions {
-			snapshot := manager.downloadSnapshot(id, revision, true)
+			snapshot := manager.downloadSnapshot(id, revision, true, manager.fileChunk, 0)
 			if snapshot != nil {
 				snapshots = append(snapshots, snapshot)
 			}
@@ -2623,18 +2704,25 @@ func (manager *SnapshotManager) CheckSnapshot(snapshot *Snapshot) (err error) {
 // DownloadFile downloads a non-chunk file from the storage.  The only non-chunk files in the current implementation
 // are snapshot files.
 func (manager *SnapshotManager) DownloadFile(path string, derivationKey string) (content []byte) {
+	return manager.downloadFile(path, derivationKey, manager.fileChunk, 0)
+}
+
+// downloadFile downloads a non-chunk file into 'chunk'.  'chunk' must be owned by the caller for the duration of the
+// call, so that concurrent downloads don't share manager.fileChunk, and 'threadIndex' must be less than the number of
+// threads the storage was created with.
+func (manager *SnapshotManager) downloadFile(path string, derivationKey string, chunk *Chunk, threadIndex int) (content []byte) {
 
 	if manager.storage.IsCacheNeeded() {
-		manager.fileChunk.Reset(false)
-		err := manager.snapshotCache.DownloadFile(0, path, manager.fileChunk)
-		if err == nil && len(manager.fileChunk.GetBytes()) > 0 {
+		chunk.Reset(false)
+		err := manager.snapshotCache.DownloadFile(0, path, chunk)
+		if err == nil && len(chunk.GetBytes()) > 0 {
 			LOG_DEBUG("DOWNLOAD_FILE_CACHE", "Loaded file %s from the snapshot cache", path)
-			return manager.fileChunk.GetBytes()
+			return chunk.GetBytes()
 		}
 	}
 
-	manager.fileChunk.Reset(false)
-	err := manager.storage.DownloadFile(0, path, manager.fileChunk)
+	chunk.Reset(false)
+	err := manager.storage.DownloadFile(threadIndex, path, chunk)
 	if err != nil {
 		LOG_ERROR("DOWNLOAD_FILE", "Failed to download the file %s: %v", path, err)
 		return nil
@@ -2644,7 +2732,7 @@ func (manager *SnapshotManager) DownloadFile(path string, derivationKey string) 
 		derivationKey = derivationKey[len(derivationKey)-64:]
 	}
 
-	err, rewriteNeeded := manager.fileChunk.Decrypt(manager.config.FileKey, derivationKey)
+	err, rewriteNeeded := chunk.Decrypt(manager.config.FileKey, derivationKey)
 	if err != nil {
 		LOG_ERROR("DOWNLOAD_DECRYPT", "Failed to decrypt the file %s: %v", path, err)
 		return nil
@@ -2654,10 +2742,10 @@ func (manager *SnapshotManager) DownloadFile(path string, derivationKey string) 
 
 		newChunk := manager.config.GetChunk()
 		newChunk.Reset(true)
-		newChunk.Write(manager.fileChunk.GetBytes())
+		newChunk.Write(chunk.GetBytes())
 		err = newChunk.Encrypt(manager.config.FileKey, derivationKey, true)
 		if err == nil {
-			err = manager.storage.UploadFile(0, path, newChunk.GetBytes())
+			err = manager.storage.UploadFile(threadIndex, path, newChunk.GetBytes())
 			if err != nil {
 				LOG_WARN("DOWNLOAD_REWRITE", "Failed to re-uploaded the file %s: %v", path, err)
 			} else{
@@ -2668,7 +2756,7 @@ func (manager *SnapshotManager) DownloadFile(path string, derivationKey string) 
 	}
 
 	if manager.storage.IsCacheNeeded() {
-		err = manager.snapshotCache.UploadFile(0, path, manager.fileChunk.GetBytes())
+		err = manager.snapshotCache.UploadFile(0, path, chunk.GetBytes())
 		if err != nil {
 			LOG_WARN("DOWNLOAD_FILE_CACHE", "Failed to add the file %s to the snapshot cache: %v", path, err)
 		}
@@ -2676,7 +2764,7 @@ func (manager *SnapshotManager) DownloadFile(path string, derivationKey string) 
 
 	LOG_DEBUG("DOWNLOAD_FILE", "Downloaded file %s", path)
 
-	return manager.fileChunk.GetBytes()
+	return chunk.GetBytes()
 }
 
 // UploadFile uploads a non-chunk file from the storage.

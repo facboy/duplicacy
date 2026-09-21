@@ -1646,7 +1646,7 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 
 			// The revision was returned by ListSnapshotRevisions, so it is known to exist in the source
 			// storage; only the destination storage still needs to be checked.
-			snapshot := manager.SnapshotManager.downloadSnapshot(id, revision, true)
+			snapshot := manager.SnapshotManager.downloadSnapshot(id, revision, true, manager.SnapshotManager.fileChunk, 0)
 			snapshots = append(snapshots, snapshot)
 		}
 
