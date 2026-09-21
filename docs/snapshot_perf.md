@@ -7,7 +7,8 @@ parallel `list`) in both `src/duplicacy_snapshotmanager.go` and
 `duplicacy/duplicacy_main.go`, #5 (the single `list -files` pass) in
 `src/duplicacy_snapshotmanager.go`, and #6 (the id listing) in
 `src/duplicacy_b2storage.go`, `src/duplicacy_b2client.go` and
-`src/duplicacy_azurestorage.go`.
+`src/duplicacy_azurestorage.go`. Candidate #7 (the revision index) is not going
+to be implemented, because it would change the storage format on disk.
 
 ## Summary
 
@@ -408,4 +409,17 @@ Ordered roughly by expected benefit for local storage.
   restricted prefix, that one entry per id came back and that the ids are
   correct.
 - **Introduce a lightweight revision index** instead of one file per revision, so
-  listing a repository becomes a single object read.
+  listing a repository becomes a single object read. **Not going to be
+  implemented**: this is the only candidate that would change the storage format
+  on disk, and that is out of scope. The revision list is the directory listing
+  itself: one object per revision at `snapshots/<id>/<revision>`, written by
+  `backup` (`src/duplicacy_backupmanager.go:1140-1141`) and `copy` (`:1782-1783`),
+  enumerated by `ListSnapshotRevisions`
+  (`src/duplicacy_snapshotmanager.go:498-521`), existence-checked by `copy`
+  (`src/duplicacy_backupmanager.go:1632-1633`) and deleted one file at a time by
+  `prune` (`src/duplicacy_snapshotmanager.go:2378-2379`). An index would have to
+  replace all of those, would need a compatibility path for existing
+  repositories and old clients, and would trade the independence of revisions
+  (which is what makes the concurrent downloads of fix #4 safe without locks) for
+  a shared mutable object. `list` therefore keeps paying one directory listing
+  plus one download per revision.
