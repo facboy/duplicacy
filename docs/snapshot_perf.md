@@ -4,7 +4,8 @@ Investigation into the performance of `duplicacy list`. This document records
 the findings and the candidate fixes; candidate fixes #1, #2 and #3 below have
 since been implemented in `src/duplicacy_snapshotmanager.go`, and #4 (the
 parallel `list`) in both `src/duplicacy_snapshotmanager.go` and
-`duplicacy/duplicacy_main.go`.
+`duplicacy/duplicacy_main.go`, and #5 (the single `list -files` pass) in
+`src/duplicacy_snapshotmanager.go`.
 
 ## Summary
 
@@ -256,10 +257,12 @@ With `showFiles` (`src/duplicacy_snapshotmanager.go:713-751`) each revision gets
   has one worker, and every chunk download is a `FindChunk` followed by a
   `DownloadFile` (`src/duplicacy_chunkoperator.go:284-490`) — two serial
   operations per metadata chunk, per revision.
-- `snapshot.ListRemoteFiles(...)` called twice (`:727` and `:742`), each
-  re-iterating and re-decoding the whole file sequence
-  (`src/duplicacy_snapshot.go:107-207`). The second pass is served from the
-  cache, but the first is still fully remote.
+- `snapshot.ListRemoteFiles(...)`, one pass per sequence
+  (`src/duplicacy_snapshot.go:107-207`). This used to be called twice for the
+  file sequence, re-iterating and re-decoding every entry on the second call
+  (`:727` and `:742` in the original report). The first pass is remote; the
+  second was served from the cache, but it still cost a metadata chunk fetch per
+  revision. Fix #5 removed that second call.
 
 Against local storage these are a couple of syscalls rather than network round
 trips, so they are proportionally cheaper than in the cloud case but still
@@ -367,7 +370,16 @@ Ordered roughly by expected benefit for local storage.
   (~0.12 s at one thread against ~0.18 s at four on a 300-revision repository).
   That is why the default stays at 1: the flag is for the round-trip case.
 - **Avoid the double `ListRemoteFiles` pass** in the `showFiles` branch by
-  computing sizes and printing in a single traversal.
+  computing sizes and printing in a single traversal. **Implemented**: the
+  `showFiles` branch of `ListSnapshots` now walks the file sequence once and
+  keeps the entries it walks, instead of computing the sizes in one pass and
+  printing in another. The size column is only `String(maxSizeDigits)` wide, and
+  its width is not known until the largest file has been seen, so the entries
+  are collected during the walk and printed from the collected slice afterwards.
+  The output is unchanged, but the second pass over the sequence is gone: it
+  re-decoded every entry and re-fetched every metadata chunk of the file
+  sequence (`chunks/` read on the first pass, snapshot cache hit on the second),
+  which `list -files` paid for once per revision.
 - **Let backends list only direct children of `snapshots/`** (B2 and other
   prefix-based backends) instead of scanning the whole subtree.
 - **Introduce a lightweight revision index** instead of one file per revision, so

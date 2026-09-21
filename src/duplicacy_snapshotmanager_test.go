@@ -5,6 +5,7 @@
 package duplicacy
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/vmihailenco/msgpack"
 )
 
 func createDummySnapshot(snapshotID string, revision int, endTime int64) *Snapshot {
@@ -177,6 +180,133 @@ func createTestSnapshot(manager *SnapshotManager, snapshotID string, revision in
 	manager.UploadFile(path, path, description)
 }
 
+// uploadTestMetadataChunk uploads 'content' as a metadata chunk, the same way the backup code does for the sequences
+// that make up a snapshot.
+func uploadTestMetadataChunk(manager *SnapshotManager, content []byte) string {
+
+	chunkOperator := CreateChunkOperator(manager.config, manager.storage, manager.snapshotCache, false, false, 1, false)
+	defer chunkOperator.Stop()
+
+	chunkOperator.UploadCompletionFunc = func(chunk *Chunk, chunkIndex int, skipped bool, chunkSize int, uploadSize int) {
+	}
+
+	chunk := CreateChunk(manager.config, true)
+	chunk.Reset(true)
+	chunk.Write(content)
+
+	chunkOperator.Upload(chunk, 0, true)
+	chunkOperator.WaitForCompletion()
+
+	return chunk.GetHash()
+}
+
+// createTestSnapshotWithFiles uploads a snapshot that lists the given files rather than an empty one, so that the
+// commands that walk the file list of a snapshot (list -files) have something to read.  Each file is stored in its own
+// chunk, and the entries are encoded the same way BackupManager.UploadSnapshot writes them.  The file hashes that the
+// entries carry are returned, so that a test can predict what the file list is printed as.
+func createTestSnapshotWithFiles(manager *SnapshotManager, snapshotID string, revision int, startTime int64,
+	endTime int64, fileNames []string, fileSizes []int64, tag string) (fileHashes []string) {
+
+	// One chunk per file, with one byte of content per byte of file size.
+	chunkHashes := make([]string, len(fileNames))
+	chunkLengths := make([]int, len(fileNames))
+	fileHashes = make([]string, len(fileNames))
+
+	for i, fileSize := range fileSizes {
+		content := make([]byte, fileSize)
+		if _, err := rand.Read(content); err != nil {
+			LOG_ERROR("SNAPSHOT_UPLOAD", "Failed to generate the content of the file %s: %v", fileNames[i], err)
+			return nil
+		}
+		chunkHashes[i] = uploadTestChunk(manager, content)
+		chunkLengths[i] = int(fileSize)
+
+		hasher := manager.config.NewFileHasher()
+		hasher.Write(content)
+		fileHashes[i] = hex.EncodeToString(hasher.Sum(nil))
+	}
+
+	buffer := new(bytes.Buffer)
+	encoder := msgpack.NewEncoder(buffer)
+
+	var snapshotChunkHashes []string
+	var snapshotChunkLengths []int
+	lastChunk := -1
+	lastEndChunk := 0
+
+	for i, fileName := range fileNames {
+
+		entry := CreateEntry(fileName, fileSizes[i], startTime, 0644)
+		entry.Hash = fileHashes[i]
+		entry.StartChunk = i
+		entry.StartOffset = 0
+		entry.EndChunk = i
+		entry.EndOffset = int(fileSizes[i])
+
+		// This mirrors the way UploadSnapshot rewrites the chunk indexes: the chunk indexes of an entry are relative
+		// to the previous entry, and each entry only refers to the chunks that weren't referenced before it.
+		delta := entry.StartChunk - len(snapshotChunkHashes) + 1
+		if entry.StartChunk != lastChunk {
+			snapshotChunkHashes = append(snapshotChunkHashes, chunkHashes[entry.StartChunk])
+			snapshotChunkLengths = append(snapshotChunkLengths, chunkLengths[entry.StartChunk])
+			delta--
+		}
+		for chunk := entry.StartChunk + 1; chunk <= entry.EndChunk; chunk++ {
+			snapshotChunkHashes = append(snapshotChunkHashes, chunkHashes[chunk])
+			snapshotChunkLengths = append(snapshotChunkLengths, chunkLengths[chunk])
+		}
+
+		lastChunk = entry.EndChunk
+		entry.StartChunk -= delta
+		entry.EndChunk -= delta
+
+		delta = entry.EndChunk - entry.StartChunk
+		entry.StartChunk -= lastEndChunk
+		lastEndChunk = entry.EndChunk
+		entry.EndChunk = delta
+
+		if err := encoder.Encode(entry); err != nil {
+			LOG_ERROR("SNAPSHOT_UPLOAD", "Failed to encode the entry %s: %v", fileName, err)
+			return nil
+		}
+	}
+
+	var totalFileSize int64
+	for _, fileSize := range fileSizes {
+		totalFileSize += fileSize
+	}
+
+	snapshot := &Snapshot{
+		Version:       1,
+		ID:            snapshotID,
+		Revision:      revision,
+		StartTime:     startTime,
+		EndTime:       endTime,
+		Tag:           tag,
+		FileSize:      totalFileSize,
+		NumberOfFiles: int64(len(fileNames)),
+		ChunkHashes:   snapshotChunkHashes,
+		ChunkLengths:  snapshotChunkLengths,
+	}
+
+	snapshot.FileSequence = []string{uploadTestMetadataChunk(manager, buffer.Bytes())}
+
+	for _, sequenceType := range []string{"chunks", "lengths"} {
+		content, err := snapshot.MarshalSequence(sequenceType)
+		if err != nil {
+			LOG_ERROR("SNAPSHOT_MARSHAL", "Failed to encode the %s in the snapshot: %v", sequenceType, err)
+			return nil
+		}
+		snapshot.SetSequence(sequenceType, []string{uploadTestMetadataChunk(manager, content)})
+	}
+
+	description, _ := snapshot.MarshalJSON()
+	path := fmt.Sprintf("snapshots/%s/%d", snapshotID, revision)
+	manager.UploadFile(path, path, description)
+
+	return fileHashes
+}
+
 func checkTestSnapshots(manager *SnapshotManager, expectedSnapshots int, expectedFossils int) {
 
 	manager.CreateChunkOperator(false, false, 1, false)
@@ -300,6 +430,7 @@ type countingStorage struct {
 	*FileStorage
 	getFileInfoCalls int
 	downloadThreads  map[int]bool
+	downloadPaths    map[string]int
 	downloadInFlight int
 	downloadPeak     int
 	downloadLock     sync.Mutex
@@ -316,7 +447,11 @@ func (storage *countingStorage) DownloadFile(threadIndex int, filePath string, c
 	if storage.downloadThreads == nil {
 		storage.downloadThreads = make(map[int]bool)
 	}
+	if storage.downloadPaths == nil {
+		storage.downloadPaths = make(map[string]int)
+	}
 	storage.downloadThreads[threadIndex] = true
+	storage.downloadPaths[filePath]++
 	storage.downloadInFlight++
 	if storage.downloadInFlight > storage.downloadPeak {
 		storage.downloadPeak = storage.downloadInFlight
@@ -341,12 +476,72 @@ func (storage *countingStorage) numberOfDownloadThreads() int {
 	return len(storage.downloadThreads)
 }
 
+// chunkDownloadCounts returns how many times each chunk file was read from the storage.
+func (storage *countingStorage) chunkDownloadCounts() (counts map[string]int) {
+	storage.downloadLock.Lock()
+	defer storage.downloadLock.Unlock()
+
+	counts = make(map[string]int)
+	for filePath, count := range storage.downloadPaths {
+		if strings.HasPrefix(filePath, "chunks/") {
+			counts[filePath] = count
+		}
+	}
+	return counts
+}
+
 // resetDownloadStats forgets the thread indexes and the peak number of concurrent downloads seen so far.
 func (storage *countingStorage) resetDownloadStats() {
 	storage.downloadLock.Lock()
 	defer storage.downloadLock.Unlock()
 	storage.downloadThreads = nil
+	storage.downloadPaths = nil
 	storage.downloadPeak = 0
+}
+
+// capturedLog is a single message passed to one of the logging functions.
+type capturedLog struct {
+	level   int
+	logID   string
+	message string
+}
+
+// logCapture records the log messages produced while it is installed as LogFunction, so that a test can inspect what
+// a command printed.
+type logCapture struct {
+	logs     []capturedLog
+	logsLock sync.Mutex
+}
+
+func (capture *logCapture) log(level int, logID string, message string) {
+	capture.logsLock.Lock()
+	defer capture.logsLock.Unlock()
+	capture.logs = append(capture.logs, capturedLog{level, logID, message})
+}
+
+// messages returns the messages that were logged under 'logID'.
+func (capture *logCapture) messages(logID string) (messages []string) {
+	capture.logsLock.Lock()
+	defer capture.logsLock.Unlock()
+	for _, log := range capture.logs {
+		if log.logID == logID {
+			messages = append(messages, log.message)
+		}
+	}
+	return messages
+}
+
+// failures returns the messages that were logged as errors, since they are only recorded and never propagated while
+// the capture is installed.
+func (capture *logCapture) failures() (failures []string) {
+	capture.logsLock.Lock()
+	defer capture.logsLock.Unlock()
+	for _, log := range capture.logs {
+		if log.level >= ERROR {
+			failures = append(failures, fmt.Sprintf("%s: %s", log.logID, log.message))
+		}
+	}
+	return failures
 }
 
 // peakConcurrentDownloads returns the largest number of downloads that were in flight at the same time.
@@ -532,6 +727,114 @@ func TestDownloadSnapshotsConcurrently(t *testing.T) {
 	// The number of snapshots reported by list must not depend on the number of threads either.
 	if numberOfSnapshots := snapshotManager.ListSnapshots("vm1@host1", []int{}, "", false, false, 4); numberOfSnapshots != 8 {
 		t.Errorf("Expecting 8 snapshots from a concurrent list, got %d", numberOfSnapshots)
+	}
+}
+
+// 'list -files' printed the file list by walking the file sequence twice: once to compute the total size and the width
+// of the size column, and once to print the entries.  Each walk downloads every metadata chunk of the sequence again,
+// so the second one is pure overhead (and a round trip per chunk on cloud storage).  The file list must instead be
+// produced from a single walk, with the same output as before.
+func TestListFilesWalksTheFileSequenceOnce(t *testing.T) {
+
+	setTestingT(t)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%v", r)
+		}
+	}()
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+	counting := &countingStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
+	snapshotManager.storage = counting
+
+	// The entries are deliberately not in sorted order: the order they are printed in must be the order they are
+	// stored in, which is how the backup writes them.
+	fileNames := []string{"file1", "file2", "file10", "dir1/file3"}
+	fileSizes := []int64{9, 1234, 12345678, 10}
+
+	now := time.Now().Unix()
+	fileHashes := createTestSnapshotWithFiles(snapshotManager, "vm1@host1", 1, now-3600, now, fileNames, fileSizes, "tag")
+
+	// Capture what list prints instead of letting it go to the test log.
+	savedLogFunction := LogFunction
+	capture := &logCapture{}
+	LogFunction = capture.log
+	defer func() {
+		LogFunction = savedLogFunction
+	}()
+
+	counting.resetDownloadStats()
+
+	if numberOfSnapshots := snapshotManager.ListSnapshots("vm1@host1", []int{}, "", true, false, 1); numberOfSnapshots != 1 {
+		t.Errorf("Expecting 1 snapshot, got %d", numberOfSnapshots)
+	}
+
+	if failures := capture.failures(); len(failures) > 0 {
+		t.Errorf("Listing the files of the snapshot failed: %v", failures)
+		return
+	}
+
+	// Every metadata chunk of the snapshot must be fetched exactly once: the file sequence, the chunk sequence and the
+	// length sequence.  A chunk that is fetched a second time is served from the snapshot cache rather than from the
+	// storage, so the downloads and the cache hits are counted together; walking the file sequence twice adds a cache
+	// hit for its chunk, which is exactly the overhead this fix removes.
+	fetches := len(capture.messages("CHUNK_DOWNLOAD")) + len(capture.messages("CHUNK_CACHE"))
+	if fetches != 3 {
+		t.Errorf("Expecting the 3 metadata chunks of the snapshot to be fetched once each, got %d fetches", fetches)
+	}
+
+	downloads := counting.chunkDownloadCounts()
+	if len(downloads) != 3 {
+		t.Errorf("Expecting the 3 metadata chunks of the snapshot to be downloaded, got %v", downloads)
+	}
+	for chunkPath, count := range downloads {
+		if count != 1 {
+			t.Errorf("The metadata chunk %s was downloaded %d times instead of once", chunkPath, count)
+		}
+	}
+
+	// The printed file list must contain every file, in the order the entries are stored, with the size column
+	// widened to the largest file.  The width follows the rule used by list: it grows a digit at a time while a
+	// larger size is found.
+	maxSize := int64(9)
+	maxSizeDigits := 1
+	for _, fileSize := range fileSizes {
+		if fileSize > maxSize {
+			maxSize = maxSize*10 + 9
+			maxSizeDigits++
+		}
+	}
+	modifiedTime := time.Unix(now-3600, 0).Format("2006-01-02 15:04:05")
+
+	files := capture.messages("SNAPSHOT_FILE")
+	if len(files) != len(fileNames) {
+		t.Errorf("Expecting %d files to be printed, got %d: %v", len(fileNames), len(files), files)
+		return
+	}
+
+	for i, fileName := range fileNames {
+		expectedFile := fmt.Sprintf("%*d %s %s %s", maxSizeDigits, fileSizes[i], modifiedTime, fileHashes[i], fileName)
+		if files[i] != expectedFile {
+			t.Errorf("Expecting the file %s to be printed as %q, got %q", fileName, expectedFile, files[i])
+		}
+	}
+
+	// The statistics computed from the same walk must still be printed.
+	stats := capture.messages("SNAPSHOT_STATS")
+	if len(stats) != 2 {
+		t.Errorf("Expecting the file count and the sizes to be printed, got %v", stats)
+		return
+	}
+	if stats[0] != fmt.Sprintf("Files: %d", len(fileNames)) {
+		t.Errorf("Expecting %q, got %q", fmt.Sprintf("Files: %d", len(fileNames)), stats[0])
+	}
+	expectedTotalSize := int64(9 + 1234 + 12345678 + 10)
+	expectedStats := fmt.Sprintf("Total size: %d, file chunks: 4, metadata chunks: 3", expectedTotalSize)
+	if stats[1] != expectedStats {
+		t.Errorf("Expecting %q, got %q", expectedStats, stats[1])
 	}
 }
 

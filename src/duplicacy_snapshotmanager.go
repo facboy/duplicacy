@@ -812,13 +812,16 @@ func (manager *SnapshotManager) ListSnapshots(snapshotID string, revisionsToList
 
 				maxSize := int64(9)
 				maxSizeDigits := 1
-				totalFiles := 0
 				totalFileSize := int64(0)
 				lastChunk := 0
 
+				// The file sequence is traversed only once: the entries are collected here and printed below, because
+				// the width of the size column is not known until the largest file has been seen.  A second traversal
+				// would decode the whole file sequence again, re-reading every metadata chunk that the first
+				// traversal has just downloaded (and saved to the snapshot cache, when the storage has one).
+				files := make([]*Entry, 0, 1024)
 				snapshot.ListRemoteFiles(manager.config, manager.chunkOperator, func(file *Entry)bool {
 					if file.IsFile() {
-						totalFiles++
 						totalFileSize += file.Size
 						if file.Size > maxSize {
 							maxSize = maxSize*10 + 9
@@ -827,16 +830,14 @@ func (manager *SnapshotManager) ListSnapshots(snapshotID string, revisionsToList
 						if file.EndChunk > lastChunk {
 							lastChunk = file.EndChunk
 						}
+						files = append(files, file)
 					}
 					return true
 				})
 
-				snapshot.ListRemoteFiles(manager.config, manager.chunkOperator, func(file *Entry)bool {
-					if file.IsFile() {
-						LOG_INFO("SNAPSHOT_FILE", "%s", file.String(maxSizeDigits))
-					}
-					return true
-				})
+				for _, file := range files {
+					LOG_INFO("SNAPSHOT_FILE", "%s", file.String(maxSizeDigits))
+				}
 
 				metaChunks := len(snapshot.FileSequence) + len(snapshot.ChunkSequence) + len(snapshot.LengthSequence)
 				LOG_INFO("SNAPSHOT_STATS", "Total size: %d, file chunks: %d, metadata chunks: %d", totalFileSize, lastChunk+1, metaChunks)
