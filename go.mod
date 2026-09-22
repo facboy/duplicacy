@@ -16,7 +16,6 @@ require (
 	github.com/gilbertchen/gopass v0.0.0-20170109162249-bf9dde6d0d2c
 	github.com/gilbertchen/highwayhash v0.0.0-20221109044721-eeab1f4799d8
 	github.com/gilbertchen/keyring v0.0.0-20221004152639-1661cbebc508
-	github.com/gilbertchen/xattr v0.0.0-20160926155429-68e7a6806b01
 	github.com/hirochachacha/go-smb2 v1.1.0
 	github.com/klauspost/compress v1.20.0
 	github.com/klauspost/reedsolomon v1.14.2
