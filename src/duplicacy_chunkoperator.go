@@ -60,6 +60,11 @@ type ChunkOperator struct {
 	rewriteChunks bool           // Whether to rewrite corrupted chunks when erasure coding is enabled
 
 	UploadCompletionFunc func(chunk *Chunk, chunkIndex int, inCache bool, chunkSize int, uploadSize int)
+
+	// Set when this operator reads the stored form of the chunks instead of their plaintext, because the storage they
+	// are copied to stores them identically.  'copy' sets this when the two storages share their encryption,
+	// compression and erasure-coding parameters, so that the chunks don't have to be decoded and encoded again.
+	rawData bool
 }
 
 // CreateChunkOperator creates a new ChunkOperator.
@@ -417,6 +422,14 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 			}
 		}
 
+		// When the destination storage stores the chunk identically, the downloaded bytes are exactly what must be
+		// uploaded, so they are passed on as they are instead of being decrypted and encrypted again.  The chunk hash
+		// comes from the task and the id is derived from it, so the chunk keeps its identity without being decoded.
+		if operator.rawData {
+			chunk.SetRawData(task.chunkHash)
+			break
+		}
+
 		rewriteNeeded := false
 		err, rewriteNeeded = chunk.Decrypt(operator.config.ChunkKey, task.chunkHash)
 		if err != nil {
@@ -481,7 +494,7 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 		break
 	}
 
-	if chunk.isMetadata && len(cachedPath) > 0 {
+	if chunk.isMetadata && !chunk.isRawData && len(cachedPath) > 0 {
 		// Save a copy to the local snapshot cache
 		err := operator.snapshotCache.UploadFile(threadIndex, cachedPath, chunk.GetBytes())
 		if err != nil {
@@ -522,9 +535,10 @@ func (operator *ChunkOperator) UploadChunk(threadIndex int, task ChunkTask) bool
 	chunkID := task.chunkID
 	chunkSize := chunk.GetLength()
 
-	// The data in the buffer is checked against the chunk id by Encrypt() below
+	// The data in the buffer is checked against the chunk id by Encrypt() below, unless the chunk already holds the
+	// stored form and is uploaded as it is.
 
-	if task.isMetadata && operator.snapshotCache != nil && operator.storage.IsCacheNeeded() {
+	if task.isMetadata && !chunk.isRawData && operator.snapshotCache != nil && operator.storage.IsCacheNeeded() {
 		// Save a copy to the local snapshot.
 		chunkPath, exist, _, err := operator.snapshotCache.FindChunk(threadIndex, chunkID, false)
 		if err != nil {
@@ -553,11 +567,17 @@ func (operator *ChunkOperator) UploadChunk(threadIndex int, task ChunkTask) bool
 		return false
 	}
 
-	// Encrypt the chunk only after we know that it must be uploaded.
-	err = chunk.Encrypt(operator.config.ChunkKey, chunk.GetHash(), task.isMetadata)
-	if err != nil {
-		LOG_ERROR("UPLOAD_CHUNK", "Failed to encrypt the chunk %s: %v", chunkID, err)
-		return false
+	// Encrypt the chunk only after we know that it must be uploaded.  A chunk that already holds the stored form is
+	// uploaded as it is; it was produced by copying the same chunk from a storage that stores it identically.
+	if !chunk.isRawData {
+		err = chunk.Encrypt(operator.config.ChunkKey, chunk.GetHash(), task.isMetadata)
+		if err != nil {
+			LOG_ERROR("UPLOAD_CHUNK", "Failed to encrypt the chunk %s: %v", chunkID, err)
+			return false
+		}
+	} else {
+		// Encrypt would have performed this check; it still applies because the buffer is what is about to be stored
+		chunk.VerifyChecksum()
 	}
 
 	if !operator.config.dryRun {

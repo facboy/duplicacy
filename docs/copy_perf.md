@@ -1,8 +1,11 @@
 # Why `copy` is slow
 
-Investigation into the performance of `duplicacy copy`. No source changes are
-included: this document records the findings and the candidate fixes, in the
-style of `snapshot_perf.md` and `init_perf.md`.
+Investigation into the performance of `duplicacy copy`. This document records
+the findings and the candidate fixes, in the style of `snapshot_perf.md` and
+`init_perf.md`; candidate fix #1 (don't re-encode chunks that are already
+identical) has since been implemented in `src/duplicacy_config.go`,
+`src/duplicacy_chunk.go`, `src/duplicacy_chunkoperator.go` and
+`src/duplicacy_backupmanager.go`.
 
 ## Summary
 
@@ -38,6 +41,9 @@ check: it is correctness neutral, it removes a round trip per new chunk on cloud
 storage, and it was verified to pass the existing copy integration test. The
 `fsync` question is worth far more locally but is a deliberate durability
 trade-off, so it should not be changed without a decision on that.
+
+Candidate fix #1 (the re-encode) has since been implemented; the remaining
+items are unimplemented.
 
 ## Conclusion
 
@@ -299,6 +305,27 @@ Ordered by expected benefit.
   the chunk id is currently re-derived during `Encrypt`, so the identity check
   that `Encrypt` performs would have to move or be reproduced. Saves ~2 s per
   12.5 k chunks locally, and more where compression is expensive.
+  **Implemented**: `Config.IsBitIdenticalWith` (`src/duplicacy_config.go`)
+  reports whether the two storages store a chunk in the same bytes — the same
+  compression level, `HashKey`, `IDKey` and `ChunkKey`, the same erasure-coding
+  parameters, and no RSA key on either side, because RSA encrypts each chunk
+  with a fresh random key. `CopySnapshots` sets `rawData` on the download
+  operator when that holds, so `DownloadChunk` skips `Decrypt` and marks the
+  chunk with `SetRawData(task.chunkHash)`; the copy loop then hands the stored
+  bytes to the uploader through `Chunk.WriteRawData`, and `UploadChunk` skips
+  `Encrypt` for such a chunk. The identity that `Encrypt` used to establish is
+  preserved two other ways: the hash comes from the source chunk instead of
+  being recomputed, the id is derived from that hash with the destination's
+  `IDKey` (the two are equal here, which is what the predicate checked), and
+  `WriteRawData` arms the same in-memory checksum that `Encrypt` would have
+  verified, so `VerifyChecksum` still guards the buffer that is about to be
+  stored. Unencrypted pairs and `add -copy -bit-identical` pairs take the fast
+  path; an encrypted pair without `-bit-identical`, a pair with different
+  compression, and any pair with erasure coding or RSA keep the decode/encode
+  path unchanged. Covered by `TestCopySnapshots` and `TestIsBitIdenticalWith`
+  (`src/duplicacy_copymanager_test.go`): the test restores the copied snapshot
+  and, for the bit-identical pairs, compares every destination chunk file with
+  the source one byte for byte.
 - **Skip the per-chunk destination check.** Give the uploader a way to be told
   that the caller already knows the chunk is absent — either a field set on the
   `ChunkOperator`, or a path helper derived from the write nesting level instead

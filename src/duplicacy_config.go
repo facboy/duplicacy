@@ -178,6 +178,23 @@ func (config *Config) IsCompatibleWith(otherConfig *Config) bool {
 		bytes.Equal(config.HashKey, otherConfig.HashKey)
 }
 
+// IsBitIdenticalWith reports whether the two storages store a given chunk in exactly the same bytes.  If so, a chunk
+// file can be copied from one storage to the other without being decrypted and encrypted again, which is what the
+// copy command needs to know.  This is the case when the chunk hash, the chunk id and the encryption of the chunk
+// data are all the same, and the chunk is compressed and erasure coded the same way.  RSA encryption is excluded
+// because it encrypts each chunk with a fresh random key, so a chunk stored for one storage can only be read by the
+// other when the matching private key is available.
+func (config *Config) IsBitIdenticalWith(otherConfig *Config) bool {
+
+	return config.CompressionLevel == otherConfig.CompressionLevel &&
+		bytes.Equal(config.HashKey, otherConfig.HashKey) &&
+		bytes.Equal(config.IDKey, otherConfig.IDKey) &&
+		bytes.Equal(config.ChunkKey, otherConfig.ChunkKey) &&
+		config.DataShards == otherConfig.DataShards &&
+		config.ParityShards == otherConfig.ParityShards &&
+		config.rsaPublicKey == nil && otherConfig.rsaPublicKey == nil
+}
+
 func (config *Config) Print() {
 
 	LOG_INFO("CONFIG_INFO", "Compression level: %d", config.CompressionLevel)

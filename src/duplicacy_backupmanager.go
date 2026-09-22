@@ -1727,7 +1727,18 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 
 	LOG_INFO("SNAPSHOT_COPY", "Chunks to copy: %d, to skip: %d, total: %d", len(chunksToCopy), len(chunks) - len(chunksToCopy), len(chunks))
 
+	// When the two storages store a chunk in exactly the same bytes, the chunk can be copied as it is instead of
+	// being decrypted and encoded again.  This is the case for an unencrypted pair, and for an encrypted pair whose
+	// keys and parameters were copied over -- an unencrypted pair always shares them, an encrypted one only with
+	// 'add -copy -bit-identical'.  Erasure coding and a different compression level both change the stored bytes,
+	// and RSA encryption uses a fresh random key per chunk, so those cases keep the decode/encode path.
+	bitIdentical := manager.config.IsBitIdenticalWith(otherManager.config)
+	if bitIdentical {
+		LOG_DEBUG("SNAPSHOT_COPY", "The two storages store chunks identically; the chunks will be copied without re-encoding")
+	}
+
 	chunkDownloader := CreateChunkOperator(manager.config, manager.storage, nil, false, false, downloadingThreads, false)
+	chunkDownloader.rawData = bitIdentical
 
 	var uploadedBytes int64
 	startTime := time.Now()
@@ -1759,8 +1770,14 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 
 		chunkDownloader.DownloadAsync(chunkHash, i, chunks[chunkHash], func(chunk *Chunk, chunkIndex int) {
 			newChunk := otherManager.config.GetChunk()
-			newChunk.Reset(true)
-			newChunk.Write(chunk.GetBytes())
+			if bitIdentical {
+				// The downloaded bytes are already in the form the destination stores them, so the chunk is uploaded
+				// as it is.  Setting the raw flag last leaves the checksum computed over the whole buffer.
+				newChunk.WriteRawData(chunk.GetBytes(), chunk.GetHash())
+			} else {
+				newChunk.Reset(true)
+				newChunk.Write(chunk.GetBytes())
+			}
 			newChunk.isMetadata = chunks[chunk.GetHash()]
 			chunkUploader.Upload(newChunk, chunkIndex, newChunk.isMetadata)
 			manager.config.PutChunk(chunk)
