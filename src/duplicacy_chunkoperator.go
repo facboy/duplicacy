@@ -61,6 +61,11 @@ type ChunkOperator struct {
 
 	UploadCompletionFunc func(chunk *Chunk, chunkIndex int, inCache bool, chunkSize int, uploadSize int)
 
+	// Set when every chunk given to the uploader is known to be absent from the storage, so that it doesn't have to
+	// ask the storage before uploading.  'copy' sets this after filtering out the chunks the destination holds;
+	// 'backup' leaves it unset because its check is what skips a chunk another client has uploaded.
+	skipChunkCheck bool
+
 	// Set when this operator reads the stored form of the chunks instead of their plaintext, because the storage they
 	// are copied to stores them identically.  'copy' sets this when the two storages share their encryption,
 	// compression and erasure-coding parameters, so that the chunks don't have to be decoded and encoded again.
@@ -552,19 +557,33 @@ func (operator *ChunkOperator) UploadChunk(threadIndex int, task ChunkTask) bool
 		}
 	}
 
-	// This returns the path the chunk file should be at.
-	chunkPath, exist, _, err := operator.storage.FindChunk(threadIndex, chunkID, false)
-	if err != nil {
-		LOG_ERROR("UPLOAD_CHUNK", "Failed to find the path for the chunk %s: %v", chunkID, err)
-		return false
-	}
+	// When set, the caller has established that the chunk is absent and the path is derived locally.  Otherwise
+	// FindChunk returns the path and reports whether the chunk is already there, which is how a chunk uploaded by
+	// another client is skipped.
+	chunkPath := ""
+	exist := false
+	var err error
 
-	if exist {
-		// Chunk deduplication by name in effect here.
-		LOG_DEBUG("CHUNK_DUPLICATE", "Chunk %s already exists", chunkID)
+	if operator.skipChunkCheck {
+		chunkPath, err = operator.storage.ChunkPath(chunkID)
+		if err != nil {
+			LOG_ERROR("UPLOAD_CHUNK", "Failed to derive the path for the chunk %s: %v", chunkID, err)
+			return false
+		}
+	} else {
+		chunkPath, exist, _, err = operator.storage.FindChunk(threadIndex, chunkID, false)
+		if err != nil {
+			LOG_ERROR("UPLOAD_CHUNK", "Failed to find the path for the chunk %s: %v", chunkID, err)
+			return false
+		}
 
-		operator.UploadCompletionFunc(chunk, task.chunkIndex, false, chunkSize, 0)
-		return false
+		if exist {
+			// Chunk deduplication by name in effect here.
+			LOG_DEBUG("CHUNK_DUPLICATE", "Chunk %s already exists", chunkID)
+
+			operator.UploadCompletionFunc(chunk, task.chunkIndex, false, chunkSize, 0)
+			return false
+		}
 	}
 
 	// Encrypt the chunk only after we know that it must be uploaded.  A chunk that already holds the stored form is

@@ -5,7 +5,9 @@ the findings and the candidate fixes, in the style of `snapshot_perf.md` and
 `init_perf.md`; candidate fix #1 (don't re-encode chunks that are already
 identical) has since been implemented in `src/duplicacy_config.go`,
 `src/duplicacy_chunk.go`, `src/duplicacy_chunkoperator.go` and
-`src/duplicacy_backupmanager.go`.
+`src/duplicacy_backupmanager.go`. The two items that follow it — the redundant
+per-chunk destination check and the unconditional destination chunk listing —
+were implemented together in the same files, since neither is safe on its own.
 
 ## Summary
 
@@ -24,14 +26,16 @@ The rest of the cost is the usual I/O shape:
   `FindChunk` even though `copy` has already listed every chunk the destination
   holds, and only the chunks missing from that listing are handed to the
   uploader. On a local filesystem that is an extra `newfstatat` per new chunk;
-  on a cloud storage it is an extra round trip per new chunk.
+  on a cloud storage it is an extra round trip per new chunk. (Fixed: the
+  uploader is told the chunk is absent once `copy` has established that.)
 - `FileStorage.UploadFile` calls `fsync` on every chunk. On ext4 one `fsync`
   costs roughly as much as the rest of the per-chunk work put together, and it
   dominates the whole command; on a slow mount it is the single largest cost.
 - The destination chunk listing (`ListAllFiles(storage, "chunks/")`) is
   unconditional and walks every chunk directory, so its cost grows with the
   destination, not with the number of chunks being copied. `backup` already
-  guards the same listing with `IsFastListing()`; `copy` does not.
+  guards the same listing with `IsFastListing()`; `copy` does not. (Fixed: the
+  listing is weighed against the per-chunk lookups.)
 - Each snapshot file is uploaded one at a time with its own `CreateDirectory`
   call, which is a redundant round trip for every revision on a backend where
   `CreateDirectory` is a `Stat` + `Mkdir` pair.
@@ -42,8 +46,10 @@ storage, and it was verified to pass the existing copy integration test. The
 `fsync` question is worth far more locally but is a deliberate durability
 trade-off, so it should not be changed without a decision on that.
 
-Candidate fix #1 (the re-encode) has since been implemented; the remaining
-items are unimplemented.
+Candidate fixes #1, #2 and #3 have since been implemented; the remaining items
+are unimplemented. #2 and #3 became one change: each is only safe while the other
+finds the chunks the destination holds, so `copy` now chooses between them per
+storage and keeps exactly one in effect.
 
 ## Conclusion
 
@@ -114,6 +120,10 @@ for _, snapshot := range snapshots {
 Phases 1 and 2 are serial. Phase 3 is the only phase that overlaps work, and
 only at the granularity the two thread flags ask for. Phase 4 is serial and
 uploads one snapshot file per revision.
+
+Phase 2 has since changed shape: the destination is either listed, as above, or
+each chunk is looked up before it is enqueued for download. Both paths build the
+same `chunksToCopy`, so phases 3 and 4 are untouched.
 
 ## Chunks are re-encoded for no reason
 
@@ -236,6 +246,30 @@ item — otherwise nothing would know what the destination already has, and
 either every chunk would be re-uploaded or the per-chunk `FindChunk` would
 become load-bearing again.
 
+**Implemented**, together with the previous item:
+
+- The listing runs when `IsFastListing()` is true, or when `chunks/` holds fewer
+  directories than there are chunks to copy. One `ListFiles` call counts them,
+  since the entries of `chunks/` are the chunk directories under the single-level
+  nesting a modern storage uses. The older multi-level layout undercounts, which
+  can only leave the listing in place.
+- When the listing does not run, each chunk is looked up with `FindChunk` in
+  `CopySnapshots` itself, before it is enqueued for download, and only the chunks
+  that are missing are offered to the uploader. Enqueuing first and letting the
+  uploader reject the chunk would cost a full download of bytes the destination
+  already holds. A zero-length file counts as absent, as in the listing.
+- Either way the result contains only absent chunks, so
+  `ChunkOperator.skipChunkCheck` is set and `UploadChunk` derives the path with
+  the new `Storage.ChunkPath` instead of calling `FindChunk`. `backup` leaves the
+  check enabled, since nothing else skips a chunk another client uploaded.
+
+`ChunkPath` returns the path at `writeLevel`, the path `FindChunk` reports for a
+missing chunk, and fails with the same "Invalid chunk nesting setup" error when
+the write level is not among the read levels. Covered by `TestCopyChunkProbe` and
+`TestChunkPath` (`src/duplicacy_copymanager_test.go`): the probe test copies an
+unchanged revision a second time in each mode and checks the lookup counts, the
+uploads and the source downloads.
+
 ## `fsync` on every chunk
 
 `FileStorage.UploadFile` syncs every file it writes
@@ -326,25 +360,38 @@ Ordered by expected benefit.
   (`src/duplicacy_copymanager_test.go`): the test restores the copied snapshot
   and, for the bit-identical pairs, compares every destination chunk file with
   the source one byte for byte.
-- **Skip the per-chunk destination check.** Give the uploader a way to be told
-  that the caller already knows the chunk is absent — either a field set on the
+- **Skip the per-chunk destination check, but only where the listing has already
+  answered the question.** Give the uploader a way to be told that the caller
+  already knows the chunk is absent — either a field set on the
   `ChunkOperator`, or a path helper derived from the write nesting level instead
   of `FindChunk`. `copy` sets it because `chunksToCopy` was filtered against the
-  destination listing. Removes one `newfstatat` per new chunk locally, and one
-  round trip per new chunk on cloud storage. **Measured**: on drvfs, 341 chunks,
-  the many-revision copy goes from 18-24 s to 17-19 s; the gain is larger
-  relative to the total when `fsync` is not dominating, i.e. on cloud storage.
-  Verified to pass `integration_tests/copy_test.sh`.
-- **Gate the destination chunk listing on `IsFastListing()`.** Mirror
-  `src/duplicacy_backupmanager.go:190`. When the listing is skipped, every chunk
-  is offered to the uploader, which then rediscovers the duplicates through its
-  own `FindChunk`, so this only pays off for storages where that per-chunk check
-  exists anyway — which is why it should be considered together with the item
-  above rather than on its own. **Measured**: on drvfs with a 100-chunk source and
-  a 12,685-chunk destination, 3.8 s to 1.9 s. Against a destination that holds
-  nothing the copy needs this is a pure win; against a destination that already
-  holds everything, the listing is what short-circuits the run, and skipping it
-  would re-offer every chunk only if the per-chunk check were absent.
+  destination. Removes one `newfstatat` per new chunk locally, and one round trip
+  per new chunk on cloud storage. **Measured**: on drvfs, 341 chunks, the
+  many-revision copy goes from 18-24 s to 17-19 s; the gain is larger relative to
+  the total when `fsync` is not dominating, i.e. on cloud storage. Verified to
+  pass `integration_tests/copy_test.sh`.
+  **Implemented** together with the item below, since "the caller already knows"
+  only holds where the listing or the lookups ran: `ChunkOperator.skipChunkCheck`
+  is set by `CopySnapshots` after filtering `chunksToCopy`, and `UploadChunk`
+  then derives the path through `Storage.ChunkPath`. `backup` keeps the check.
+- **Gate the destination chunk listing on its cost, not on `IsFastListing()`
+  alone.** Mirror `src/duplicacy_backupmanager.go:190`. When the listing is
+  skipped, every chunk is offered to the uploader, which then rediscovers the
+  duplicates through its own `FindChunk`, so this only pays off for storages
+  where that per-chunk check exists anyway — which is why it has to be considered
+  together with the item above rather than on its own. **Measured**: on drvfs
+  with a 100-chunk source and a 12,685-chunk destination, 3.8 s to 1.9 s. Against
+  a destination that holds nothing the copy needs this is a pure win; against a
+  destination that already holds everything, the listing is what short-circuits
+  the run, so skipping it must not be done blindly.
+  **Implemented**, with one correction: `IsFastListing()` alone is the wrong
+  test, because skipping the listing trades the tree walk for one round trip per
+  already-present chunk *and* a full download of each, the download being
+  enqueued before the uploader sees the chunk (`:1771-1784`). `CopySnapshots`
+  counts the chunk directories with one `ListFiles(0, "chunks/")` call, switches
+  to the lookups only when there are more directories than chunks to copy, and
+  does them before enqueuing the download. An incremental copy of a
+  slow-listing destination is still listed.
 - **Check destination revisions with one listing instead of `GetFileInfo` per
   revision.** Same idea as the `list` fix `641cedf`, applied to the destination
   side. Measured on drvfs: 0.42 s to 0.20 s for a 300-revision no-op copy. The
@@ -396,9 +443,11 @@ Ordered by expected benefit.
 - Compare the same copy with the destination on tmpfs: `fsync` is free there, so
   what remains is compress/decompress CPU. The difference between the two is the
   `fsync` cost.
-- To see the redundant destination check, count `newfstatat` calls against the
-  destination `chunks/` path and divide by the number of chunks copied; a fresh
-  destination should show the `FindChunk` stat before every upload.
+- To see whether the destination was listed, look at the `-d` decision line
+  `The destination has N chunk directories for M chunks; listing: <bool>`; the
+  `Chunks to copy:` line appends `the destination storage was not listed` when it
+  was not. A listed copy makes no per-chunk destination `newfstatat`; an unlisted
+  one makes exactly one per chunk, from `CopySnapshots` rather than the uploader.
 - Copy between two storages with an empty destination and then `cmp` the chunk
   trees (`diff -rq s1/chunks s2/chunks`). Identical trees mean the re-encode
   produced exactly the input bytes, which is the premise of the first candidate
@@ -408,3 +457,7 @@ Ordered by expected benefit.
   independent of `N`.
 - Run `integration_tests/copy_test.sh` for any change here: it copies in both
   directions, prunes, and checks both storages afterwards.
+- `TestCopyChunkProbe` (`src/duplicacy_copymanager_test.go`) covers the same
+  ground as a unit test: it copies an unchanged revision in both modes and
+  asserts the destination lookups, the uploads and the source downloads, so it
+  fails if either mechanism is dropped without the other taking over.

@@ -42,6 +42,10 @@ type Storage interface {
 	// the suffix '.fsl'.
 	FindChunk(threadIndex int, chunkID string, isFossil bool) (filePath string, exist bool, size int64, err error)
 
+	// ChunkPath returns the path the chunk with the specified id is stored at, without looking for it.  It is the
+	// path FindChunk returns when it doesn't find the chunk.
+	ChunkPath(chunkID string) (filePath string, err error)
+
 	// DownloadFile reads the file at 'filePath' into the chunk.
 	DownloadFile(threadIndex int, filePath string, chunk *Chunk) (err error)
 
@@ -134,6 +138,23 @@ func (storage *StorageBase) SetNestingLevels(config *Config) {
 		}
 	}
 	LOG_ERROR("STORAGE_NESTING", "The write level %d isn't in the read levels %v", storage.readLevels, storage.writeLevel)
+}
+
+// ChunkPath returns the path the chunk with the specified id is stored at, at the write level: the path FindChunk
+// returns when the chunk isn't found.
+func (storage *StorageBase) ChunkPath(chunkID string) (filePath string, err error) {
+
+	for _, level := range storage.readLevels {
+		if storage.writeLevel == level {
+			chunkPath := "chunks/"
+			for i := 0; i < level; i++ {
+				chunkPath += chunkID[2*i:2*i+2] + "/"
+			}
+			return chunkPath + chunkID[2*level:], nil
+		}
+	}
+
+	return "", fmt.Errorf("Invalid chunk nesting setup")
 }
 
 // FindChunk finds the chunk with the specified id at the levels one by one as specified by 'readLevels'.

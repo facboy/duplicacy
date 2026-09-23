@@ -1700,32 +1700,86 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 		snapshot.ChunkHashes = nil
 	}
 
-	otherChunkFiles, otherChunkSizes := otherManager.SnapshotManager.ListAllFiles(otherManager.storage, "chunks/")
+	// The listing says which of the chunks the snapshots reference are already there, but it walks the whole chunk
+	// tree, so its cost grows with the destination while the per-chunk lookups grow with the copy.  Exactly one of the
+	// two runs, because each is what spares the other.
+	listChunks := otherManager.storage.IsFastListing()
 
-	for i, otherChunkID := range otherChunkFiles {
-		otherChunkID = strings.Replace(otherChunkID, "/", "", -1)
-		if len(otherChunkID) != 64 {
-			continue
+	if !listChunks {
+		entries, _, err := otherManager.storage.ListFiles(0, "chunks/")
+		if err != nil {
+			LOG_ERROR("SNAPSHOT_COPY", "Failed to list the chunks directory of the destination storage: %v", err)
+			return false
 		}
-		if otherChunkSizes[i] == 0 {
-			LOG_DEBUG("SNAPSHOT_COPY", "Chunk %s has length = 0", otherChunkID)
-			continue
+
+		chunkDirs := 0
+		for _, entry := range entries {
+			if strings.HasSuffix(entry, "/") {
+				chunkDirs++
+			}
 		}
-		otherChunks[otherChunkID] = false
+
+		// Exact for the single-level nesting of a modern storage; the older multi-level layout counts only the top
+		// level, which undercounts and so can only leave the listing in place.
+		listChunks = chunkDirs < len(chunks)
+
+		LOG_DEBUG("SNAPSHOT_COPY", "The destination has %d chunk directories for %d chunks; listing: %v",
+			chunkDirs, len(chunks), listChunks)
 	}
-
-	LOG_DEBUG("SNAPSHOT_COPY", "Found %d chunks on destination storage", len(otherChunks))
 
 	var chunksToCopy []string
 
-	for chunkHash := range chunks {
-		otherChunkID := otherManager.config.GetChunkIDFromHash(chunkHash)
-		if _, found := otherChunks[otherChunkID]; !found {
-			chunksToCopy = append(chunksToCopy, chunkHash)
-		}
-	}
+	if listChunks {
 
-	LOG_INFO("SNAPSHOT_COPY", "Chunks to copy: %d, to skip: %d, total: %d", len(chunksToCopy), len(chunks) - len(chunksToCopy), len(chunks))
+		otherChunkFiles, otherChunkSizes := otherManager.SnapshotManager.ListAllFiles(otherManager.storage, "chunks/")
+
+		for i, otherChunkID := range otherChunkFiles {
+			otherChunkID = strings.Replace(otherChunkID, "/", "", -1)
+			if len(otherChunkID) != 64 {
+				continue
+			}
+			if otherChunkSizes[i] == 0 {
+				LOG_DEBUG("SNAPSHOT_COPY", "Chunk %s has length = 0", otherChunkID)
+				continue
+			}
+			otherChunks[otherChunkID] = false
+		}
+
+		LOG_DEBUG("SNAPSHOT_COPY", "Found %d chunks on destination storage", len(otherChunks))
+
+		for chunkHash := range chunks {
+			otherChunkID := otherManager.config.GetChunkIDFromHash(chunkHash)
+			if _, found := otherChunks[otherChunkID]; !found {
+				chunksToCopy = append(chunksToCopy, chunkHash)
+			}
+		}
+
+		LOG_INFO("SNAPSHOT_COPY", "Chunks to copy: %d, to skip: %d, total: %d",
+			len(chunksToCopy), len(chunks)-len(chunksToCopy), len(chunks))
+
+	} else {
+
+		// Look each chunk up here rather than in the uploader, so that a chunk the destination already holds costs
+		// one lookup instead of a lookup plus a download of bytes that are already there.  A zero-length file counts
+		// as absent, as the listing treats it.
+		for chunkHash := range chunks {
+
+			chunkID := otherManager.config.GetChunkIDFromHash(chunkHash)
+
+			_, exist, size, err := otherManager.storage.FindChunk(0, chunkID, false)
+			if err != nil {
+				LOG_ERROR("SNAPSHOT_COPY", "Failed to find the chunk %s at the destination storage: %v", chunkID, err)
+				return false
+			}
+
+			if !exist || size == 0 {
+				chunksToCopy = append(chunksToCopy, chunkHash)
+			}
+		}
+
+		LOG_INFO("SNAPSHOT_COPY", "Chunks to copy: %d, to skip: %d, total: %d; the destination storage was not listed",
+			len(chunksToCopy), len(chunks)-len(chunksToCopy), len(chunks))
+	}
 
 	// When the two storages store a chunk in exactly the same bytes, the chunk can be copied as it is instead of
 	// being decrypted and encoded again.  This is the case for an unencrypted pair, and for an encrypted pair whose
@@ -1745,6 +1799,8 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 
 	copiedChunks := 0
 	chunkUploader := CreateChunkOperator(otherManager.config, otherManager.storage, nil, false, false, uploadingThreads, false)
+	// Every chunk in 'chunksToCopy' is known to be absent, so the uploader doesn't have to check.
+	chunkUploader.skipChunkCheck = true
 	chunkUploader.UploadCompletionFunc =  func(chunk *Chunk, chunkIndex int, skipped bool, chunkSize int, uploadSize int) {
 		action := "Skipped"
 		if !skipped {
