@@ -10,7 +10,8 @@ per-chunk destination check and the unconditional destination chunk listing —
 were implemented together in the same files, since neither is safe on its own.
 Candidate fix #4 (check the destination revisions with one listing) and
 candidate fix #5 (create the snapshot directory once per id) are implemented as
-well.
+well. Candidate fix #6 (raise the thread defaults) is not going to be
+implemented: the defaults stay at 1, and the flags remain the opt-in.
 
 ## Summary
 
@@ -56,11 +57,12 @@ per-revision destination check is the same kind of change applied to the
 revisions instead of the chunks: one listing per snapshot id, and it was verified
 not to re-upload a revision.
 
-Candidate fixes #1 through #5 have since been implemented; the remaining items
-are unimplemented. #2 and #3 became one change: each is only safe while the other
-finds the chunks the destination holds, so `copy` now chooses between them per
-storage and keeps exactly one in effect. #4 reuses the same listing helper on the
-destination side to enumerate the revisions once per snapshot id.
+Candidate fixes #1 through #5 have since been implemented. #2 and #3 became one
+change: each is only safe while the other finds the chunks the destination holds,
+so `copy` now chooses between them per storage and keeps exactly one in effect.
+#4 reuses the same listing helper on the destination side to enumerate the
+revisions once per snapshot id. #6 is not going to be implemented: the thread
+defaults stay at 1.
 
 ## Conclusion
 
@@ -356,9 +358,11 @@ Two smaller per-revision costs sit in phase 1 and phase 4:
 is a real serial bottleneck: on ext4 with 12,585 chunks, `-threads 16` takes
 13.6 s against 37.9 s at one thread. Unlike `list`, where the `-threads` flag was
 added with a default of 1 to leave the request pattern alone, `copy` already has
-the flags; the question is only whether the default should change, which for
-cloud storage would change the request pattern and is therefore not obviously
-right.
+the flags, so the default could have been changed. **It stays at 1**: a bare
+`copy` would otherwise start several connections to whatever storage it is
+pointed at, which is the user's decision to make rather than a side effect of
+making the command faster. The flags remain the opt-in for a copy that wants the
+speed.
 
 ## Candidate fixes
 
@@ -458,8 +462,10 @@ Ordered by expected benefit.
   assertion fails on the old code, which creates it three times.
 - **Raise the default thread counts.** `copy` already has `-threads` and
   `-download-threads`; the serial default leaves 2-3x on the table locally
-  (37.9 s to 13.6 s at 16 threads). A behaviour change for cloud storage, so it
-  needs a decision first.
+  (37.9 s to 13.6 s at 16 threads). **Not going to be implemented**: raising a
+  default changes the request pattern of every cloud copy that did not ask for
+  it, and `-threads`/`-download-threads` are the opt-in for a copy that wants the
+  speed.
 
 ### Deliberately not pursued
 
