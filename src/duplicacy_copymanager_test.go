@@ -117,15 +117,19 @@ type copyCase struct {
 	rawExpected bool // whether the two storages should store a chunk identically
 }
 
-// copyTestStorage is a FileStorage with a settable IsFastListing, counting the lookups, chunk uploads and chunk
-// downloads, which is how a test tells how a copy discovered what the destination already held.
+// copyTestStorage is a FileStorage with a settable IsFastListing, counting the lookups, chunk and snapshot uploads,
+// chunk downloads, snapshot-file existence checks and listings, which is how a test tells how a copy discovered what
+// the destination already held.
 type copyTestStorage struct {
 	*FileStorage
 
-	isFastListing  bool
-	findChunkCalls int64
-	uploadedChunks int64
-	chunkDownloads int64
+	isFastListing     bool
+	findChunkCalls    int64
+	snapshotInfoCalls int64
+	snapshotListings  int64
+	uploadedChunks    int64
+	uploadedSnapshots int64
+	chunkDownloads    int64
 }
 
 func (storage *copyTestStorage) IsFastListing() bool { return storage.isFastListing }
@@ -135,9 +139,29 @@ func (storage *copyTestStorage) FindChunk(threadIndex int, chunkID string, isFos
 	return storage.FileStorage.FindChunk(threadIndex, chunkID, isFossil)
 }
 
+func (storage *copyTestStorage) ListFiles(threadIndex int, dir string) (files []string, sizes []int64, err error) {
+	// Only the listing of one snapshot id's directory is counted; the listing of 'snapshots/' itself enumerates the ids
+	// and is not what the copy can use to learn the destination's revisions.
+	if strings.HasPrefix(dir, "snapshots/") && dir != "snapshots/" {
+		atomic.AddInt64(&storage.snapshotListings, 1)
+	}
+	return storage.FileStorage.ListFiles(threadIndex, dir)
+}
+
+func (storage *copyTestStorage) GetFileInfo(threadIndex int, filePath string) (exist bool, isDir bool, size int64, err error) {
+	// A chunk lookup goes through FindChunk, which calls this method with a chunk path; only the snapshot paths are
+	// counted here, since they are what a per-revision check would ask about.
+	if strings.HasPrefix(filePath, "snapshots/") {
+		atomic.AddInt64(&storage.snapshotInfoCalls, 1)
+	}
+	return storage.FileStorage.GetFileInfo(threadIndex, filePath)
+}
+
 func (storage *copyTestStorage) UploadFile(threadIndex int, filePath string, content []byte) (err error) {
 	if strings.HasPrefix(filePath, "chunks/") {
 		atomic.AddInt64(&storage.uploadedChunks, 1)
+	} else if strings.HasPrefix(filePath, "snapshots/") {
+		atomic.AddInt64(&storage.uploadedSnapshots, 1)
 	}
 	return storage.FileStorage.UploadFile(threadIndex, filePath, content)
 }
@@ -154,7 +178,10 @@ func (storage *copyTestStorage) DownloadFile(threadIndex int, filePath string, c
 // resetCounters clears the counters between operations.
 func (storage *copyTestStorage) resetCounters() {
 	atomic.StoreInt64(&storage.findChunkCalls, 0)
+	atomic.StoreInt64(&storage.snapshotInfoCalls, 0)
+	atomic.StoreInt64(&storage.snapshotListings, 0)
 	atomic.StoreInt64(&storage.uploadedChunks, 0)
+	atomic.StoreInt64(&storage.uploadedSnapshots, 0)
 	atomic.StoreInt64(&storage.chunkDownloads, 0)
 }
 
@@ -420,6 +447,151 @@ func TestCopyChunkProbe(t *testing.T) {
 			t.Errorf("The second %s copy changed the destination from %d to %d chunks", c.name,
 				len(destinationTree), len(secondDestinationTree))
 		}
+	}
+}
+
+// TestCopyDestinationRevisionCheck covers candidate fix #4: the revisions the destination already holds are read with
+// one listing of its snapshot directory, instead of one existence check per source revision.  A copy of N revisions
+// must ask the destination about its snapshot files at most once, and must still skip the revisions it already has.
+func TestCopyDestinationRevisionCheck(t *testing.T) {
+
+	rand.Seed(time.Now().UnixNano())
+	setTestingT(t)
+	SetLoggingLevel(INFO)
+
+	defer func() {
+		if r := recover(); r != nil {
+			switch e := r.(type) {
+			case Exception:
+				t.Errorf("%s %s", e.LogID, e.Message)
+				debug.PrintStack()
+			default:
+				t.Errorf("%v", e)
+				debug.PrintStack()
+			}
+		}
+	}()
+
+	testDir := path.Join(os.TempDir(), "duplicacy_copy_revision_test")
+	os.RemoveAll(testDir)
+	os.MkdirAll(testDir, 0700)
+	defer os.RemoveAll(testDir)
+
+	threads := 1
+	snapshotID := "host1"
+
+	sourceDir := path.Join(testDir, "source_storage")
+	innerSource, err := loadStorage(sourceDir, threads)
+	if err != nil {
+		t.Errorf("Failed to create the source storage: %v", err)
+		return
+	}
+	cleanStorage(innerSource)
+	if !ConfigStorage(innerSource, 16384, DEFAULT_COMPRESSION_LEVEL, 64*1024, 256*1024, 16*1024, "", nil, false, "", 0, 0) {
+		t.Errorf("Failed to configure the source storage")
+		return
+	}
+	sourceStorage := &copyTestStorage{FileStorage: innerSource.(*FileStorage)}
+
+	repository := path.Join(testDir, "repository")
+	os.MkdirAll(path.Join(repository, ".duplicacy"), 0700)
+	createRandomFileSeeded(path.Join(repository, "file1"), 300000, 11)
+
+	SetDuplicacyPreferencePath(path.Join(repository, ".duplicacy"))
+	sourceManager := CreateBackupManager(snapshotID, sourceStorage, repository, "", "", "", false)
+	sourceManager.SetupSnapshotCache("source")
+
+	// Three revisions referring to the same chunks, so the second copy has every revision already.
+	for _, tag := range []string{"first", "second", "third"} {
+		if !sourceManager.Backup(repository, true, threads, tag, false, false, 0, false, 1024, 1024) {
+			t.Errorf("Failed to back the repository up with tag %s", tag)
+			return
+		}
+	}
+
+	// createDestination creates an empty storage configured like the source and its backup manager.
+	createDestination := func(name string) (*copyTestStorage, *BackupManager) {
+		destinationDir := path.Join(testDir, name+"_storage")
+		innerDestination, err := CreateFileStorage(destinationDir, false, threads)
+		if err != nil {
+			t.Errorf("Failed to create the %s destination storage: %v", name, err)
+			return nil, nil
+		}
+		destinationStorage := &copyTestStorage{FileStorage: innerDestination}
+		if !ConfigStorage(destinationStorage, 16384, DEFAULT_COMPRESSION_LEVEL, 64*1024, 256*1024, 16*1024,
+			"", sourceManager.config, false, "", 0, 0) {
+			t.Errorf("Failed to configure the %s destination storage", name)
+			return nil, nil
+		}
+
+		destinationRepository := path.Join(testDir, name+"_repository")
+		os.MkdirAll(path.Join(destinationRepository, ".duplicacy"), 0700)
+		SetDuplicacyPreferencePath(path.Join(destinationRepository, ".duplicacy"))
+		destinationManager := CreateBackupManager(snapshotID, destinationStorage, destinationRepository, "", "", "", false)
+		destinationManager.SetupSnapshotCache(name)
+		return destinationStorage, destinationManager
+	}
+
+	// The destination holds nothing, so all three revisions are copied.  The destination is asked once for its
+	// revisions -- a single listing -- rather than once per source revision.
+	destinationStorage, destinationManager := createDestination("empty")
+	if destinationStorage == nil {
+		return
+	}
+
+	sourceManager.CopySnapshots(destinationManager, "", nil, 1, 1)
+
+	if listings := atomic.LoadInt64(&destinationStorage.snapshotListings); listings != 1 {
+		t.Errorf("The first copy listed the destination snapshot directory %d times instead of once", listings)
+	}
+	if checks := atomic.LoadInt64(&destinationStorage.snapshotInfoCalls); checks != 0 {
+		t.Errorf("The first copy checked the existence of %d destination snapshot files instead of listing the directory",
+			checks)
+	}
+	if uploads := atomic.LoadInt64(&destinationStorage.uploadedSnapshots); uploads != 3 {
+		t.Errorf("The first copy uploaded %d snapshot files instead of 3", uploads)
+	}
+
+	// A second copy finds every revision already there and must report that without any per-revision check.
+	destinationStorage.resetCounters()
+
+	sourceManager.CopySnapshots(destinationManager, "", nil, 1, 1)
+
+	if listings := atomic.LoadInt64(&destinationStorage.snapshotListings); listings != 1 {
+		t.Errorf("The second copy listed the destination snapshot directory %d times instead of once", listings)
+	}
+	if checks := atomic.LoadInt64(&destinationStorage.snapshotInfoCalls); checks != 0 {
+		t.Errorf("The second copy checked the existence of %d destination snapshot files instead of listing the directory",
+			checks)
+	}
+	if uploads := atomic.LoadInt64(&destinationStorage.uploadedSnapshots); uploads != 0 {
+		t.Errorf("The second copy uploaded %d snapshot files although the destination held every revision", uploads)
+	}
+
+	// Restricting the copy to one revision must still copy exactly that revision to a destination that has none.
+	restrictedStorage, restrictedManager := createDestination("restricted")
+	if restrictedStorage == nil {
+		return
+	}
+
+	sourceManager.CopySnapshots(restrictedManager, snapshotID, []int{2}, 1, 1)
+
+	if checks := atomic.LoadInt64(&restrictedStorage.snapshotInfoCalls); checks != 0 {
+		t.Errorf("The restricted copy checked the existence of %d destination snapshot files instead of listing the directory",
+			checks)
+	}
+	if uploads := atomic.LoadInt64(&restrictedStorage.uploadedSnapshots); uploads != 1 {
+		t.Errorf("The restricted copy uploaded %d snapshot files instead of the one revision it was asked for", uploads)
+	}
+	if exist, _, _, err := restrictedStorage.FileStorage.GetFileInfo(0, fmt.Sprintf("snapshots/%s/2", snapshotID)); err != nil {
+		t.Errorf("Failed to check for the copied revision: %v", err)
+	} else if !exist {
+		t.Errorf("The restricted copy did not copy revision 2")
+	}
+	if exist, _, _, err := restrictedStorage.FileStorage.GetFileInfo(0, fmt.Sprintf("snapshots/%s/1", snapshotID)); err != nil {
+		t.Errorf("Failed to check the destination snapshot directory: %v", err)
+	} else if exist {
+		t.Errorf("The restricted copy copied revision 1 although only revision 2 was requested")
 	}
 }
 

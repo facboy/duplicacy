@@ -1617,6 +1617,22 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 			return false
 		}
 
+		// One listing of the destination's snapshot directory replaces the existence check that was made for every
+		// revision.  It enumerates the same directory that those checks probed one path at a time, so it costs a single
+		// listing per snapshot id instead of a look-up per revision -- a Stat round trip on SFTP, a GetFileInfo on GCD,
+		// a newfstatat locally -- and the set it returns is what the loop below filters the source revisions against.
+		destinationRevisions, err := otherManager.SnapshotManager.ListSnapshotRevisions(id)
+		if err != nil {
+			LOG_ERROR("SNAPSHOT_LIST", "Failed to list all revisions for snapshot %s at the destination storage: %v",
+				id, err)
+			return false
+		}
+
+		otherRevisionMap := make(map[int]bool)
+		for _, revision := range destinationRevisions {
+			otherRevisionMap[revision] = true
+		}
+
 		for _, revision := range revisions {
 			if len(revisionsToBeCopied) > 0 {
 				if _, found := revisionMap[id][revision]; found {
@@ -1629,23 +1645,14 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 				revisionMap[id][revision] = true
 			}
 
-			snapshotPath := fmt.Sprintf("snapshots/%s/%d", id, revision)
-			exist, _, _, err := otherManager.storage.GetFileInfo(0, snapshotPath)
-			if err != nil {
-				LOG_ERROR("SNAPSHOT_INFO", "Failed to check if there is a snapshot %s at revision %d: %v",
-					id, revision, err)
-				return false
-			}
-
-			if exist {
+			if otherRevisionMap[revision] {
 				LOG_INFO("SNAPSHOT_EXIST", "Snapshot %s at revision %d already exists at the destination storage",
 					id, revision)
 				revisionMap[id][revision] = false
 				continue
 			}
 
-			// The revision was returned by ListSnapshotRevisions, so it is known to exist in the source
-			// storage; only the destination storage still needs to be checked.
+			// The revision was returned by ListSnapshotRevisions, so it is known to exist in the source storage.
 			snapshot := manager.SnapshotManager.downloadSnapshot(id, revision, true, manager.SnapshotManager.fileChunk, 0)
 			snapshots = append(snapshots, snapshot)
 		}
