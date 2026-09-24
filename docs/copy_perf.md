@@ -88,12 +88,16 @@ storages, and calls `BackupManager.CopySnapshots`
 `CopySnapshots` runs in four phases:
 
 ```go
-// 1. For each snapshot id and revision: list the destination's revisions, download the source snapshot.
-destinationRevisions, err := otherManager.SnapshotManager.ListSnapshotRevisions(id)  // :1624  once per id
-...
+// 1. For each snapshot id and revision: list the destination's revisions (unless -r named them), download the source snapshot.
+listDestination := len(revisionsToBeCopied) == 0
+if listDestination {
+    destinationRevisions, err := otherManager.SnapshotManager.ListSnapshotRevisions(id)  // :1633  once per id
+    ...
+}
 for _, revision := range revisions {
-    if otherRevisionMap[revision] { ... continue }
-    snapshot := manager.SnapshotManager.downloadSnapshot(id, revision, true, ...)  // :1656
+    if listDestination { exist = otherRevisionMap[revision] } else { exist = GetFileInfo(...) }  // :1660  only with -r
+    if exist { ... continue }
+    snapshot := manager.SnapshotManager.downloadSnapshot(id, revision, true, ...)  // :1676
     snapshots = append(snapshots, snapshot)
 }
 
@@ -325,10 +329,15 @@ Two smaller per-revision costs sit in phase 1 and phase 4:
   `otherManager.SnapshotManager.ListSnapshotRevisions(id)` once per snapshot id
   and filters the source revisions against that set. A missing destination
   directory reads as an empty one on every backend, so a destination that has
-  never held the id still copies everything. Covered by
+  never held the id still copies everything. A copy restricted with `-r` names
+  its revisions, so there is nothing to enumerate and the listing would read
+  every revision the destination holds instead of the few that were named; that
+  case keeps the per-revision check, the same choice the snapshot commands make
+  between a revision that was listed and one the user named. Covered by
   `TestCopyDestinationRevisionCheck` (`src/duplicacy_copymanager_test.go`): a
   three-revision copy to an empty destination lists once, makes no per-revision
-  check and uploads all three revisions; a second copy uploads none.
+  check and uploads all three revisions; a second copy uploads none; and a copy
+  restricted with `-r` lists nothing and checks exactly the revision it named.
 - `SnapshotManager.UploadFile` (`src/duplicacy_snapshotmanager.go:2772`) creates
   the containing directory before every snapshot file it writes, so a copy of
   300 revisions issues 300 `mkdirat` calls for one long-existing directory. On
@@ -415,16 +424,19 @@ Ordered by expected benefit.
   side. Measured on drvfs: 0.42 s to 0.20 s for a 300-revision no-op copy. The
   destination listing is also what makes the per-chunk check unnecessary, so the
   two changes reinforce each other.
-  **Implemented**: the per-revision
-  `otherManager.storage.GetFileInfo(0, snapshotPath)` is gone;
-  `CopySnapshots` obtains the destination's revisions from one
-  `ListSnapshotRevisions(id)` per snapshot id and looks each source revision up
-  in that set. The listing enumerates the same directory the per-revision checks
-  probed, so it replaces a round trip per revision with one listing per id, and
-  the filter behaves the same when the destination has never held the id, since
-  a missing directory reads as an empty one. Verified that no revision is
-  uploaded twice and that a restricted copy still copies exactly the requested
-  revisions.
+  **Implemented**, with one exception for `-r`: the per-revision
+  `otherManager.storage.GetFileInfo(0, snapshotPath)` is gone for a full copy of
+  the id, which obtains the destination's revisions from one
+  `ListSnapshotRevisions(id)` and looks each source revision up in that set. The
+  listing enumerates the same directory the per-revision checks probed, so it
+  replaces a round trip per revision with one listing per id, and the filter
+  behaves the same when the destination has never held the id, since a missing
+  directory reads as an empty one. A copy restricted with `-r` names its
+  revisions and keeps the per-revision check, because listing an id with many
+  revisions to answer a question about a few of them is the one case where the
+  listing costs more than the checks. Verified that no revision is uploaded
+  twice, that a restricted copy still copies exactly the requested revisions and
+  that it lists nothing.
 - **Create the snapshot directory once per id, not per revision.** Move the
   `CreateDirectory` out of `SnapshotManager.UploadFile` into the copy loop, or
   memoise it. Saves a round trip per revision on SFTP and similar backends; near

@@ -568,7 +568,9 @@ func TestCopyDestinationRevisionCheck(t *testing.T) {
 		t.Errorf("The second copy uploaded %d snapshot files although the destination held every revision", uploads)
 	}
 
-	// Restricting the copy to one revision must still copy exactly that revision to a destination that has none.
+	// Restricting the copy to one revision must still copy exactly that revision to a destination that has none.  A
+	// copy with -r names its revisions, so there is nothing to enumerate: it checks the named revision against the
+	// destination instead of listing the whole snapshot directory.
 	restrictedStorage, restrictedManager := createDestination("restricted")
 	if restrictedStorage == nil {
 		return
@@ -576,8 +578,12 @@ func TestCopyDestinationRevisionCheck(t *testing.T) {
 
 	sourceManager.CopySnapshots(restrictedManager, snapshotID, []int{2}, 1, 1)
 
-	if checks := atomic.LoadInt64(&restrictedStorage.snapshotInfoCalls); checks != 0 {
-		t.Errorf("The restricted copy checked the existence of %d destination snapshot files instead of listing the directory",
+	if listings := atomic.LoadInt64(&restrictedStorage.snapshotListings); listings != 0 {
+		t.Errorf("The restricted copy listed the destination snapshot directory %d times although it named its revisions",
+			listings)
+	}
+	if checks := atomic.LoadInt64(&restrictedStorage.snapshotInfoCalls); checks != 1 {
+		t.Errorf("The restricted copy checked the existence of %d destination snapshot files instead of the one revision it named",
 			checks)
 	}
 	if uploads := atomic.LoadInt64(&restrictedStorage.uploadedSnapshots); uploads != 1 {
