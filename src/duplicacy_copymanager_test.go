@@ -118,8 +118,8 @@ type copyCase struct {
 }
 
 // copyTestStorage is a FileStorage with a settable IsFastListing, counting the lookups, chunk and snapshot uploads,
-// chunk downloads, snapshot-file existence checks and listings, which is how a test tells how a copy discovered what
-// the destination already held.
+// chunk downloads, snapshot-file existence checks, listings and snapshot directory creations, which is how a test tells
+// how a copy discovered what the destination already held and how often it repeated an operation.
 type copyTestStorage struct {
 	*FileStorage
 
@@ -127,12 +127,22 @@ type copyTestStorage struct {
 	findChunkCalls    int64
 	snapshotInfoCalls int64
 	snapshotListings  int64
+	snapshotDirCalls  int64
 	uploadedChunks    int64
 	uploadedSnapshots int64
 	chunkDownloads    int64
 }
 
 func (storage *copyTestStorage) IsFastListing() bool { return storage.isFastListing }
+
+// CreateDirectory counts the creation of a snapshot id's directory, which the copy must do once rather than once per
+// revision.  The directories created at init time are 'chunks' and 'snapshots', neither of which is under 'snapshots/'.
+func (storage *copyTestStorage) CreateDirectory(threadIndex int, dir string) (err error) {
+	if strings.HasPrefix(dir, "snapshots/") {
+		atomic.AddInt64(&storage.snapshotDirCalls, 1)
+	}
+	return storage.FileStorage.CreateDirectory(threadIndex, dir)
+}
 
 func (storage *copyTestStorage) FindChunk(threadIndex int, chunkID string, isFossil bool) (filePath string, exist bool, size int64, err error) {
 	atomic.AddInt64(&storage.findChunkCalls, 1)
@@ -180,6 +190,7 @@ func (storage *copyTestStorage) resetCounters() {
 	atomic.StoreInt64(&storage.findChunkCalls, 0)
 	atomic.StoreInt64(&storage.snapshotInfoCalls, 0)
 	atomic.StoreInt64(&storage.snapshotListings, 0)
+	atomic.StoreInt64(&storage.snapshotDirCalls, 0)
 	atomic.StoreInt64(&storage.uploadedChunks, 0)
 	atomic.StoreInt64(&storage.uploadedSnapshots, 0)
 	atomic.StoreInt64(&storage.chunkDownloads, 0)
@@ -550,6 +561,10 @@ func TestCopyDestinationRevisionCheck(t *testing.T) {
 	}
 	if uploads := atomic.LoadInt64(&destinationStorage.uploadedSnapshots); uploads != 3 {
 		t.Errorf("The first copy uploaded %d snapshot files instead of 3", uploads)
+	}
+	// The three revisions share one directory, so it is created once for the id rather than once per revision.
+	if dirs := atomic.LoadInt64(&destinationStorage.snapshotDirCalls); dirs != 1 {
+		t.Errorf("The first copy created the destination snapshot directory %d times instead of once", dirs)
 	}
 
 	// A second copy finds every revision already there and must report that without any per-revision check.

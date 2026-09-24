@@ -8,8 +8,9 @@ identical) has since been implemented in `src/duplicacy_config.go`,
 `src/duplicacy_backupmanager.go`. The two items that follow it — the redundant
 per-chunk destination check and the unconditional destination chunk listing —
 were implemented together in the same files, since neither is safe on its own.
-Candidate fix #4 (check the destination revisions with one listing) is
-implemented as well.
+Candidate fix #4 (check the destination revisions with one listing) and
+candidate fix #5 (create the snapshot directory once per id) are implemented as
+well.
 
 ## Summary
 
@@ -40,7 +41,8 @@ The rest of the cost is the usual I/O shape:
   listing is weighed against the per-chunk lookups.)
 - Each snapshot file is uploaded one at a time with its own `CreateDirectory`
   call, which is a redundant round trip for every revision on a backend where
-  `CreateDirectory` is a `Stat` + `Mkdir` pair.
+  `CreateDirectory` is a `Stat` + `Mkdir` pair. (Fixed: the directory is created
+  once per id.)
 - The destination is asked whether it already holds every source revision with a
   `GetFileInfo` per revision, when one listing of its snapshot directory would
   answer for all of them. (Fixed: one listing per snapshot id.)
@@ -54,7 +56,7 @@ per-revision destination check is the same kind of change applied to the
 revisions instead of the chunks: one listing per snapshot id, and it was verified
 not to re-upload a revision.
 
-Candidate fixes #1 through #4 have since been implemented; the remaining items
+Candidate fixes #1 through #5 have since been implemented; the remaining items
 are unimplemented. #2 and #3 became one change: each is only safe while the other
 finds the chunks the destination holds, so `copy` now chooses between them per
 storage and keeps exactly one in effect. #4 reuses the same listing helper on the
@@ -343,7 +345,10 @@ Two smaller per-revision costs sit in phase 1 and phase 4:
   300 revisions issues 300 `mkdirat` calls for one long-existing directory. On
   `SFTPStorage` that is a `Stat` + `Mkdir` pair per revision
   (`src/duplicacy_sftpstorage.go:288-305`). The directory only has to be created
-  once per snapshot id.
+  once per snapshot id. **Implemented**: `SnapshotManager` keeps the directories
+  it has created and `UploadFile` skips the call for one it has already made, so
+  a copy creates `snapshots/<id>` once and writes every revision into it.
+  `backup`, which writes one snapshot file per run, is unaffected.
 
 ## Thread defaults
 
@@ -441,6 +446,16 @@ Ordered by expected benefit.
   `CreateDirectory` out of `SnapshotManager.UploadFile` into the copy loop, or
   memoise it. Saves a round trip per revision on SFTP and similar backends; near
   free on object stores whose `CreateDirectory` is already a no-op.
+  **Implemented** by memoising it: `SnapshotManager.createdDirectories` records
+  the directories `UploadFile` has created, and `UploadFile` calls
+  `CreateDirectory` only for a directory not in it. This keeps the creation on
+  the write path (the `list` fix `d1c1448` moved it there so that read-only
+  commands never touch the storage) while removing the repetition: a copy of N
+  revisions creates `snapshots/<id>` once instead of N times. `UploadFile` is
+  not called concurrently -- it shares `manager.fileChunk` -- so the map needs no
+  lock. Covered by `TestCopyDestinationRevisionCheck`, which asserts a
+  three-revision copy to an empty destination creates the directory once; the
+  assertion fails on the old code, which creates it three times.
 - **Raise the default thread counts.** `copy` already has `-threads` and
   `-download-threads`; the serial default leaves 2-3x on the table locally
   (37.9 s to 13.6 s at 16 threads). A behaviour change for cloud storage, so it
@@ -498,8 +513,9 @@ Ordered by expected benefit.
 - Run `integration_tests/copy_test.sh` for any change here: it copies in both
 directions, prunes, and checks both storages afterwards.
 - `TestCopyDestinationRevisionCheck` (`src/duplicacy_copymanager_test.go`) counts
-  the destination's snapshot listings and per-revision existence checks; it fails
-  if the copy goes back to checking each revision individually.
+  the destination's snapshot listings, per-revision existence checks and snapshot
+  directory creations; it fails if the copy goes back to checking each revision
+  individually or to creating the directory once per revision.
 - `TestCopyChunkProbe` (`src/duplicacy_copymanager_test.go`) covers the same
   ground as a unit test: it copies an unchanged revision in both modes and
   asserts the destination lookups, the uploads and the source downloads, so it

@@ -191,16 +191,21 @@ type SnapshotManager struct {
 	fileChunk     *Chunk
 	snapshotCache *FileStorage
 
-	chunkOperator   *ChunkOperator
+	chunkOperator *ChunkOperator
+
+	// The directories UploadFile has already created on the storage, so that uploading the many revisions of one
+	// snapshot id creates its directory once rather than once per revision.
+	createdDirectories map[string]bool
 }
 
 // CreateSnapshotManager creates a snapshot manager
 func CreateSnapshotManager(config *Config, storage Storage) *SnapshotManager {
 
 	manager := &SnapshotManager{
-		config:    config,
-		storage:   storage,
-		fileChunk: CreateChunk(config, true),
+		config:             config,
+		storage:            storage,
+		fileChunk:          CreateChunk(config, true),
+		createdDirectories: make(map[string]bool),
 	}
 
 	return manager
@@ -2773,13 +2778,19 @@ func (manager *SnapshotManager) UploadFile(path string, derivationKey string, co
 
 	// The containing directory is created here because this is the only place that needs it: read-only commands
 	// (list, check, cat, ...) must not modify the storage, and some storages (Dropbox, for instance) can't upload
-	// a file into a directory that doesn't exist yet.
+	// a file into a directory that doesn't exist yet.  It is created once per directory rather than once per file,
+	// since a command that writes many files into one directory -- copy uploading every revision of a snapshot id,
+	// for instance -- would otherwise repeat a round trip per file on a backend where CreateDirectory is a Stat +
+	// Mkdir pair.  UploadFile is not called concurrently (it shares manager.fileChunk), so the map needs no lock.
 	if index := strings.LastIndex(path, "/"); index > 0 {
 		dir := path[:index]
-		err := manager.storage.CreateDirectory(0, dir)
-		if err != nil {
-			LOG_ERROR("UPLOAD_FILE", "Failed to create the directory %s: %v", dir, err)
-			return false
+		if !manager.createdDirectories[dir] {
+			err := manager.storage.CreateDirectory(0, dir)
+			if err != nil {
+				LOG_ERROR("UPLOAD_FILE", "Failed to create the directory %s: %v", dir, err)
+				return false
+			}
+			manager.createdDirectories[dir] = true
 		}
 	}
 
