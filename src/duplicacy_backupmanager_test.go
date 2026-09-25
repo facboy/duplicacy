@@ -5,6 +5,7 @@
 package duplicacy
 
 import (
+	"bytes"
 	crypto_rand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"math/rand"
 	"os"
 	"path"
+	"strings"
 	"testing"
 	"time"
 
@@ -733,4 +735,170 @@ func TestPersistRestore(t *testing.T) {
 		checkAllUncorrupted("/repository3")
 	}
 
+}
+
+// The chunk cache holds a copy of metadata chunks that remain in the storage, so writing it does not need to flush
+// to disk: a torn entry fails the id check on the next read and is re-fetched from the storage.  The snapshot files,
+// which are read back without verification, must keep fsyncing.  What must not change is that the cache is still
+// written and still read back, since it is what stops a metadata chunk being fetched again.
+func TestSnapshotCacheSkipsSync(t *testing.T) {
+
+	setTestingT(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_cache_test")
+	os.RemoveAll(testDir)
+	os.MkdirAll(testDir, 0700)
+	defer os.RemoveAll(testDir)
+
+	threads := 1
+	repository := path.Join(testDir, "repository")
+	os.MkdirAll(path.Join(repository, ".duplicacy"), 0700)
+	createRandomFile(path.Join(repository, "file1"), 300000)
+
+	storageDir := path.Join(testDir, "storage")
+	innerStorage, err := loadStorage(storageDir, threads)
+	if err != nil {
+		t.Errorf("Failed to create the storage: %v", err)
+		return
+	}
+	if !ConfigStorage(innerStorage, 16384, DEFAULT_COMPRESSION_LEVEL, 64*1024, 256*1024, 16*1024, "", nil, false, "", 0, 0) {
+		t.Errorf("Failed to configure the storage")
+		return
+	}
+
+	// A storage that needs a cache is the one whose cache is written and read back; a plain local storage never
+	// caches, so the cache would stay empty and the test would prove nothing.
+	fileStorage, ok := innerStorage.(*FileStorage)
+	if !ok {
+		t.Skipf("This test requires a file storage, got %T", innerStorage)
+		return
+	}
+	fileStorage.isCacheNeeded = true
+
+	SetDuplicacyPreferencePath(path.Join(repository, ".duplicacy"))
+	manager := CreateBackupManager("host1", innerStorage, repository, "", "", "", false)
+	if !manager.SetupSnapshotCache("default") {
+		t.Errorf("Failed to set up the snapshot cache")
+		return
+	}
+
+	cache := manager.snapshotCache
+
+	if !manager.Backup(repository, true, threads, "first", false, false, 0, false, 1024, 1024) {
+		t.Errorf("Failed to back the repository up")
+		return
+	}
+
+	// Writing the cache must still leave the cached files in place and readable.
+	cachedSnapshots, _ := manager.SnapshotManager.ListAllFiles(cache, "snapshots/")
+	if len(cachedSnapshots) == 0 {
+		t.Errorf("The snapshot file was not written to the cache")
+		return
+	}
+
+	chunk := CreateChunk(manager.config, true)
+	for _, cachedSnapshot := range cachedSnapshots {
+		if strings.HasSuffix(cachedSnapshot, "/") {
+			continue
+		}
+		chunk.Reset(false)
+		if err := cache.DownloadFile(0, path.Join("snapshots", cachedSnapshot), chunk); err != nil {
+			t.Errorf("Failed to read the cached snapshot file %s back: %v", cachedSnapshot, err)
+			return
+		}
+		if _, err := CreateSnapshotFromDescription(chunk.GetBytes()); err != nil {
+			t.Errorf("The cached snapshot file %s is not a valid snapshot: %v", cachedSnapshot, err)
+			return
+		}
+	}
+}
+
+// A cache entry written without fsync may be lost or left torn by a crash.  The chunk cache tolerates this because
+// the reader verifies what it finds: it re-derives the chunk id and falls back to the storage on a mismatch.  This
+// test pins that behaviour down, since it is what makes skipping the fsync safe.
+func TestCorruptCachedChunkIsRefetched(t *testing.T) {
+
+	setTestingT(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "corrupt_cache_test")
+	os.RemoveAll(testDir)
+	os.MkdirAll(testDir, 0700)
+	defer os.RemoveAll(testDir)
+
+	threads := 1
+	repository := path.Join(testDir, "repository")
+	os.MkdirAll(path.Join(repository, ".duplicacy"), 0700)
+	createRandomFile(path.Join(repository, "file1"), 300000)
+
+	innerStorage, err := loadStorage(path.Join(testDir, "storage"), threads)
+	if err != nil {
+		t.Errorf("Failed to create the storage: %v", err)
+		return
+	}
+	if !ConfigStorage(innerStorage, 16384, DEFAULT_COMPRESSION_LEVEL, 64*1024, 256*1024, 16*1024, "", nil, false, "", 0, 0) {
+		t.Errorf("Failed to configure the storage")
+		return
+	}
+	fileStorage, ok := innerStorage.(*FileStorage)
+	if !ok {
+		t.Skipf("This test requires a file storage, got %T", innerStorage)
+		return
+	}
+	fileStorage.isCacheNeeded = true
+
+	SetDuplicacyPreferencePath(path.Join(repository, ".duplicacy"))
+	manager := CreateBackupManager("host1", innerStorage, repository, "", "", "", false)
+	if !manager.SetupSnapshotCache("default") {
+		t.Errorf("Failed to set up the snapshot cache")
+		return
+	}
+
+	if !manager.Backup(repository, true, threads, "first", false, false, 0, false, 1024, 1024) {
+		t.Errorf("Failed to back the repository up")
+		return
+	}
+
+	cache := manager.snapshotCache
+	chunkOperator := CreateChunkOperator(manager.config, innerStorage, cache, false, false, threads, false)
+	defer chunkOperator.Stop()
+
+	// Upload a metadata chunk with a known hash and download it, so that the cache holds a copy of it.
+	content := []byte("a metadata chunk for the cache to hold")
+	chunkHash := uploadTestMetadataChunk(manager.SnapshotManager, content)
+	if chunkHash == "" {
+		t.Errorf("Failed to upload a metadata chunk")
+		return
+	}
+	chunkID := manager.config.GetChunkIDFromHash(chunkHash)
+
+	if downloaded := chunkOperator.Download(chunkHash, 0, true); downloaded == nil || downloaded.GetID() != chunkID {
+		t.Errorf("Failed to download the metadata chunk %s", chunkID)
+		return
+	}
+
+	cachedPath, exist, _, err := cache.FindChunk(0, chunkID, false)
+	if err != nil || !exist {
+		t.Errorf("The metadata chunk %s was not written to the cache (exist=%t, err=%v)", chunkID, exist, err)
+		return
+	}
+
+	// Truncate the cached copy to simulate a write torn by a crash.
+	if err := os.Truncate(path.Join(cache.storageDir, cachedPath), 10); err != nil {
+		t.Errorf("Failed to truncate the cached chunk %s: %v", cachedPath, err)
+		return
+	}
+
+	// The torn entry must be rejected and the chunk served from the storage instead; without the verification in
+	// DownloadChunk this would return the truncated bytes.
+	refetched := chunkOperator.Download(chunkHash, 0, true)
+	if refetched == nil {
+		t.Errorf("A torn cache entry for the chunk %s was not recovered from the storage", chunkID)
+		return
+	}
+	if refetched.GetID() != chunkID {
+		t.Errorf("The recovered chunk has id %s instead of %s", refetched.GetID(), chunkID)
+	}
+	if !bytes.Equal(refetched.GetBytes(), content) {
+		t.Errorf("The recovered chunk does not hold the original content")
+	}
 }

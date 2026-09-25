@@ -500,8 +500,11 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 	}
 
 	if chunk.isMetadata && !chunk.isRawData && len(cachedPath) > 0 {
-		// Save a copy to the local snapshot cache
-		err := operator.snapshotCache.UploadFile(threadIndex, cachedPath, chunk.GetBytes())
+		// Save a copy to the local snapshot cache.  Skipping fsync is safe for the chunk cache and only for it: the
+		// entry is read back through the id check at the top of this function, so a write torn by a crash is rejected
+		// and the chunk is fetched from the storage instead.  This write happens once per metadata chunk, and
+		// fsyncing it is the bulk of the cost of populating the cache.
+		err := operator.snapshotCache.UploadFileNoSync(threadIndex, cachedPath, chunk.GetBytes())
 		if err != nil {
 			LOG_WARN("DOWNLOAD_CACHE", "Failed to add the chunk %s to the snapshot cache: %v", chunkID, err)
 		}
@@ -544,13 +547,14 @@ func (operator *ChunkOperator) UploadChunk(threadIndex int, task ChunkTask) bool
 	// stored form and is uploaded as it is.
 
 	if task.isMetadata && !chunk.isRawData && operator.snapshotCache != nil && operator.storage.IsCacheNeeded() {
-		// Save a copy to the local snapshot.
+		// Save a copy to the local snapshot.  As in DownloadChunk, the chunk cache is safe to write without fsync
+		// because a torn entry fails the id check on the next read and is re-fetched from the storage.
 		chunkPath, exist, _, err := operator.snapshotCache.FindChunk(threadIndex, chunkID, false)
 		if err != nil {
 			LOG_WARN("UPLOAD_CACHE", "Failed to find the cache path for the chunk %s: %v", chunkID, err)
 		} else if exist {
 			LOG_DEBUG("CHUNK_CACHE", "Chunk %s already exists in the snapshot cache", chunkID)
-		} else if err = operator.snapshotCache.UploadFile(threadIndex, chunkPath, chunk.GetBytes()); err != nil {
+		} else if err = operator.snapshotCache.UploadFileNoSync(threadIndex, chunkPath, chunk.GetBytes()); err != nil {
 			LOG_WARN("UPLOAD_CACHE", "Failed to save the chunk %s to the snapshot cache: %v", chunkID, err)
 		} else {
 			LOG_DEBUG("CHUNK_CACHE", "Chunk %s has been saved to the snapshot cache", chunkID)
