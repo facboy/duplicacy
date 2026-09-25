@@ -37,8 +37,9 @@ the `fsync` is only safe where the reader verifies what it finds: a cached
 **chunk** is checked against its id on every read and re-fetched from the storage
 on a mismatch, so a write torn by a crash is rejected rather than believed.
 Cached **snapshot files**, fossil collections and the verified-chunk list are
-read back unverified and JSON-parsed, so those keep fsyncing. See the section
-below.
+read back unverified and JSON-parsed, so those keep fsyncing; when their entry is
+torn, the first two are reported as errors that stop the command, while the
+verified-chunk list is rebuilt by verifying again. See the section below.
 
 `-exhaustive` is the expensive mode, and for a reason that is inherent rather
 than accidental: it must expand the chunk sequences of every revision to build
@@ -358,7 +359,9 @@ The implemented change was verified in three ways.
   `TestSnapshotCacheSkipsSync` checks that the cache is still written and readable.
   `TestPruneSingleRepository` and `TestPruneSingleHost`
   (`src/duplicacy_snapshotmanager_test.go:899`, `:943`) exercise the prune deletion
-  path with and without `exclusive`, tagged snapshots and retention policies.
+  path with and without `exclusive`, tagged snapshots and retention policies, and
+  `TestCorruptNonChunkCacheEntries` records the read-side behaviour of the three
+  cache entries that are *not* covered by the no-fsync change.
 
 What the change gives up is that a chunk-cache entry is no longer guaranteed to
 survive a crash. That is the whole point of the trade: the entry lost is
@@ -491,7 +494,7 @@ Consequences:
   measures the fossil-collection cleanup only rather than the work described
   above.
 - Run `go test ./src/ -run 'TestPrune' -vet=off -v` for the deletion semantics,
-  `go test ./src/ -run 'TestCorruptCachedChunkIsRefetched|TestSnapshotCacheSkipsSync'
+  `go test ./src/ -run 'TestCorruptCachedChunkIsRefetched|TestSnapshotCacheSkipsSync|TestCorruptNonChunkCacheEntries'
   -vet=off -v` for the cache behaviour, and `integration_tests/copy_test.sh` and
   `integration_tests/test.sh`, which run `prune -exhaustive -exclusive` and a
   plain `prune` and check the storages afterwards.

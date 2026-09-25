@@ -1244,6 +1244,140 @@ func TestPruneMultipleThread(t *testing.T) {
 	checkTestSnapshots(snapshotManager, 1, 0)
 }
 
+// Unlike the chunk cache, the cached snapshot files, fossil collections and verified-chunk list are read back
+// without any check on the content, so those writes must stay durable -- which is why only the chunk cache is
+// written through FileStorage.UploadFileNoSync.  This test records how each of the three behaves when its cache
+// entry is torn, so that the reason the durable default was kept for them is not lost: a torn snapshot file or
+// fossil collection is an error the command reports and stops on, while the verified-chunk list is only a record of
+// work already done and is rebuilt by verifying again.
+//
+// The tears are made by truncating the cached files directly rather than by crashing, so this does not depend on
+// how the files were written; it documents the reading side, which is what the no-fsync decision was based on.
+func TestCorruptNonChunkCacheEntries(t *testing.T) {
+
+	setTestingT(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "corrupt_nonchunk_cache_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+	// A storage that needs a cache is the one whose snapshot files are cached and read back.
+	snapshotManager.storage.(*FileStorage).isCacheNeeded = true
+
+	chunkHash := uploadRandomChunk(snapshotManager, 1024)
+	if chunkHash == "" {
+		t.Errorf("Failed to upload a chunk")
+		return
+	}
+
+	now := time.Now().Unix()
+	createTestSnapshot(snapshotManager, "vm1@host1", 1, now-3600, now, []string{chunkHash}, "tag")
+
+	cachedSnapshotPath := path.Join(snapshotManager.snapshotCache.storageDir, "snapshots", "vm1@host1", "1")
+	if _, err := os.Stat(cachedSnapshotPath); err != nil {
+		t.Errorf("The snapshot file was not added to the cache: %v", err)
+		return
+	}
+
+	// Capture the log instead of letting an error fail the test through setTestingT.  Note that this also stops
+	// LOG_ERROR from aborting the command the way it does in production, so a case that reports an error and then
+	// returns continues to run here; that is what lets the test observe the failure and still clean up after it.
+	savedLogFunction := LogFunction
+	capture := &logCapture{}
+	LogFunction = capture.log
+	defer func() {
+		LogFunction = savedLogFunction
+	}()
+
+	// A snapshot that is still readable must come back without an error.
+	if snapshot := snapshotManager.DownloadSnapshot("vm1@host1", 1); snapshot == nil {
+		t.Errorf("Failed to download an intact cached snapshot")
+		return
+	}
+	if failures := capture.failures(); len(failures) > 0 {
+		t.Errorf("Reading an intact cached snapshot failed: %v", failures)
+		return
+	}
+
+	// Truncate the cached snapshot file to simulate a write torn by a crash.  Nothing verifies it, so the parse is
+	// what catches it; the failure must be reported, not papered over.
+	if err := os.Truncate(cachedSnapshotPath, 20); err != nil {
+		t.Errorf("Failed to truncate the cached snapshot %s: %v", cachedSnapshotPath, err)
+		return
+	}
+
+	if snapshot := snapshotManager.DownloadSnapshot("vm1@host1", 1); snapshot != nil {
+		t.Errorf("A torn cached snapshot file was accepted instead of reported")
+	}
+	parseFailures := capture.messages("SNAPSHOT_PARSE")
+	if len(parseFailures) == 0 {
+		t.Errorf("A torn cached snapshot file did not produce a SNAPSHOT_PARSE error")
+	}
+
+	// The entry is unusable, so remove it to give the rest of the test a clean cache; a later download then falls
+	// back to the storage, which is the recovery a user gets in practice.
+	if err := os.Remove(cachedSnapshotPath); err != nil {
+		t.Errorf("Failed to remove the torn cached snapshot %s: %v", cachedSnapshotPath, err)
+		return
+	}
+
+	// The same for a fossil collection, which prune reads back and parses before it acts on it.
+	collectionPath := path.Join(snapshotManager.snapshotCache.storageDir, "fossils", "1")
+	if err := os.MkdirAll(path.Dir(collectionPath), 0700); err != nil {
+		t.Errorf("Failed to create the fossil collection directory: %v", err)
+		return
+	}
+	if err := ioutil.WriteFile(collectionPath, []byte(`{"last_revisions":{},"deleted_revisions":{}`), 0600); err != nil {
+		t.Errorf("Failed to write a torn fossil collection: %v", err)
+		return
+	}
+
+	// prune must fail rather than proceed on a collection it could not read.
+	if success := snapshotManager.PruneSnapshots("vm1@host1", "vm1@host1", []int{}, []string{}, []string{},
+		false, false, []string{}, false, false, false, 1); success {
+		t.Errorf("PruneSnapshots succeeded despite a torn fossil collection")
+	}
+	// Match on the message, not just the log id: FOSSIL_COLLECT is also used for the "Fossil collection N found"
+	// info line, so an id-only check would pass even without the failure.
+	collectionFailures := 0
+	for _, message := range capture.messages("FOSSIL_COLLECT") {
+		if strings.Contains(message, "Failed to load the fossil collection file") {
+			collectionFailures++
+		}
+	}
+	if collectionFailures == 0 {
+		t.Errorf("A torn fossil collection did not report that it could not be loaded")
+	}
+
+	// The verified-chunk list is the third cached file that is read back unverified.  Unlike the other two it is
+	// only a cache of work already done, so 'check -chunks' recovers from a torn copy by verifying the chunks
+	// again rather than failing; that is what keeps it harmless to lose.
+	verifiedChunksPath := path.Join(snapshotManager.snapshotCache.storageDir, "verified_chunks")
+	if err := ioutil.WriteFile(verifiedChunksPath, []byte(`{"aaaaaaaa":1}`), 0600); err != nil {
+		t.Errorf("Failed to write the verified chunks file: %v", err)
+		return
+	}
+	if err := os.Truncate(verifiedChunksPath, 5); err != nil {
+		t.Errorf("Failed to truncate the verified chunks file %s: %v", verifiedChunksPath, err)
+		return
+	}
+
+	// checkFiles=false, checkChunks=true: the verified chunks file is only read when chunks are being checked.
+	if !snapshotManager.CheckSnapshots("vm1@host1", []int{1}, "", false, false, false, true,
+		false, false, false, 1, false) {
+		t.Errorf("CheckSnapshots failed because of a torn verified chunks file")
+	}
+	// As above, match the message rather than the log id: SNAPSHOT_VERIFY also carries info lines.
+	parseWarnings := 0
+	for _, message := range capture.messages("SNAPSHOT_VERIFY") {
+		if strings.Contains(message, "Failed to parse the file containing verified chunks") {
+			parseWarnings++
+		}
+	}
+	if parseWarnings == 0 {
+		t.Errorf("A torn verified chunks file did not report that it could not be parsed")
+	}
+}
+
 // A snapshot not seen by a fossil collection should always be consider a new snapshot in the fossil deletion step
 func TestPruneNewSnapshots(t *testing.T) {
 	setTestingT(t)
