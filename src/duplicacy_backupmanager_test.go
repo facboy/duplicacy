@@ -815,7 +815,8 @@ func TestSnapshotCacheSkipsSync(t *testing.T) {
 
 // A cache entry written without fsync may be lost or left torn by a crash.  The chunk cache tolerates this because
 // the reader verifies what it finds: it re-derives the chunk id and falls back to the storage on a mismatch.  This
-// test pins that behaviour down, since it is what makes skipping the fsync safe.
+// test pins that behaviour down, since it is what makes skipping the fsync safe, and it also checks that the entry
+// is not merely bypassed but rebuilt, so that later revisions of a snapshot still get a cache hit.
 func TestCorruptCachedChunkIsRefetched(t *testing.T) {
 
 	setTestingT(t)
@@ -900,5 +901,31 @@ func TestCorruptCachedChunkIsRefetched(t *testing.T) {
 	}
 	if !bytes.Equal(refetched.GetBytes(), content) {
 		t.Errorf("The recovered chunk does not hold the original content")
+	}
+
+	// The entry must also be repaired, not merely bypassed, so that the next revision still gets a cache hit rather
+	// than fetching the chunk from the storage again.
+	repaired := CreateChunk(manager.config, true)
+	if err := cache.DownloadFile(0, cachedPath, repaired); err != nil {
+		t.Errorf("Failed to read the cached chunk %s back: %v", cachedPath, err)
+		return
+	}
+	if !bytes.Equal(repaired.GetBytes(), content) {
+		t.Errorf("The cached chunk %s was not rewritten with the correct content", cachedPath)
+	}
+
+	// A crash can also leave the entry missing rather than torn, which is the state a write interrupted before the
+	// rename produces; that must be recovered and re-cached just the same.
+	if err := os.Remove(path.Join(cache.storageDir, cachedPath)); err != nil {
+		t.Errorf("Failed to remove the cached chunk %s: %v", cachedPath, err)
+		return
+	}
+	if recovered := chunkOperator.Download(chunkHash, 0, true); recovered == nil || !bytes.Equal(recovered.GetBytes(), content) {
+		t.Errorf("The chunk %s was not recovered after its cache entry was removed", chunkID)
+		return
+	}
+	if _, exist, _, err := cache.FindChunk(0, chunkID, false); err != nil || !exist {
+		t.Errorf("The cache entry for the chunk %s was not rebuilt after it was removed (exist=%t, err=%v)",
+			chunkID, exist, err)
 	}
 }
