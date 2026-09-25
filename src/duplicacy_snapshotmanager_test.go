@@ -730,6 +730,297 @@ func TestDownloadSnapshotsConcurrently(t *testing.T) {
 	}
 }
 
+// Prune reads every snapshot file of every id before it can work out which chunks are unreferenced, and that loop used
+// to download them one at a time however many threads were asked for.  The download reads must overlap when -threads is
+// greater than 1, since on a storage where a read is a round trip this is the largest per-item cost of the command.
+func TestPruneDownloadsRevisionsConcurrently(t *testing.T) {
+
+	setTestingT(t)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%v", r)
+		}
+	}()
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+
+	// Prune creates its storage with the number of threads it was given, so the storage under test is created the same
+	// way, with four threads.
+	threadedStorage, err := CreateFileStorage(testDir, false, 4)
+	if err != nil {
+		t.Errorf("Failed to create the storage: %v", err)
+		return
+	}
+	counting := &countingStorage{FileStorage: threadedStorage}
+	snapshotManager.storage = counting
+
+	chunkHash := uploadRandomChunk(snapshotManager, 1024)
+	if chunkHash == "" {
+		t.Errorf("Failed to upload a chunk")
+		return
+	}
+
+	now := time.Now().Unix()
+	for revision := 1; revision <= 8; revision++ {
+		createTestSnapshot(snapshotManager, "vm1@host1", revision, now-int64(revision)*3600, now, []string{chunkHash}, "tag")
+	}
+
+	// Nothing is being deleted, so prune stops after reading the snapshot files and the only downloads made are theirs.
+	counting.resetDownloadStats()
+	snapshotManager.PruneSnapshots("vm1@host1", "vm1@host1", []int{}, []string{}, []string{}, false, false, []string{},
+		false, false, false, 4)
+
+	// A serial loop never has two revisions in flight at the same time.
+	if peak := counting.peakConcurrentDownloads(); peak < 2 {
+		t.Errorf("Prune did not download the revisions concurrently, at most %d was in flight at a time", peak)
+	}
+
+	// The workers must stay within the thread indexes the storage was told to expect, since some backends index a
+	// per-thread client or nested directory with the thread index.
+	if usedThreads := counting.numberOfDownloadThreads(); usedThreads > 4 {
+		t.Errorf("The storage saw %d different thread indexes, more than the 4 threads it was created with", usedThreads)
+	}
+}
+
+// -exhaustive expands the chunk sequence of every revision it keeps, and each of those expansions is a set of metadata
+// chunk downloads -- one round trip per chunk on a storage where a read is a round trip.  The expansions used to be done
+// one revision at a time on the calling goroutine, so -threads did nothing for them; they must now overlap, and the
+// chunk list of each revision must be the same one the serial expansion produced.
+func TestPruneExpandsSequencesConcurrently(t *testing.T) {
+
+	setTestingT(t)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%v", r)
+		}
+	}()
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+
+	threadedStorage, err := CreateFileStorage(testDir, false, 4)
+	if err != nil {
+		t.Errorf("Failed to create the storage: %v", err)
+		return
+	}
+	counting := &countingStorage{FileStorage: threadedStorage}
+	snapshotManager.storage = counting
+
+	// No snapshot cache, so that every metadata chunk of a sequence is fetched from the storage; otherwise the second
+	// expansion would be served from the cache the first one filled and the downloads would not be visible here.
+	snapshotManager.snapshotCache = nil
+
+	// Every revision refers to its own set of file chunks, so every revision has its own chunk sequence, and the
+	// sequences all share the single metadata chunk that holds the file list.
+	now := time.Now().Unix()
+	var expectedChunks []map[string]bool
+	for revision := 1; revision <= 8; revision++ {
+		chunkHash := uploadRandomChunk(snapshotManager, 1024)
+		if chunkHash == "" {
+			t.Errorf("Failed to upload a chunk")
+			return
+		}
+		createTestSnapshot(snapshotManager, "vm1@host1", revision, now-int64(revision)*3600, now,
+			[]string{chunkHash}, "tag")
+	}
+
+	// What the serial expansion produces, taken before any concurrent run so that both go through the same code path.
+	revisions, err := snapshotManager.ListSnapshotRevisions("vm1@host1")
+	if err != nil {
+		t.Errorf("Failed to list the revisions: %v", err)
+		return
+	}
+
+	var snapshots []*Snapshot
+	for _, revision := range revisions {
+		snapshots = append(snapshots, snapshotManager.DownloadSnapshot("vm1@host1", revision))
+	}
+
+	// Prune creates the chunk operator with the thread count it was given before it selects any chunks, so the storage
+	// and the operator are set up the same way here.
+	snapshotManager.CreateChunkOperator(false, false, 4, false)
+	defer func() {
+		snapshotManager.chunkOperator.Stop()
+		snapshotManager.chunkOperator = nil
+	}()
+
+	serialChunks := snapshotManager.expandSnapshots(snapshots, 1)
+	for _, chunks := range serialChunks {
+		if chunks == nil {
+			t.Errorf("The serial expansion returned no chunks for a snapshot")
+			return
+		}
+		chunkSet := make(map[string]bool)
+		for _, chunk := range chunks {
+			chunkSet[chunk] = true
+		}
+		expectedChunks = append(expectedChunks, chunkSet)
+	}
+
+	// The expansion must happen on the metadata chunks, which is what the storage download count sees.
+	counting.resetDownloadStats()
+	concurrentChunks := snapshotManager.expandSnapshots(snapshots, 4)
+
+	if len(concurrentChunks) != len(expectedChunks) {
+		t.Errorf("Expecting %d chunk lists, got %d", len(expectedChunks), len(concurrentChunks))
+		return
+	}
+
+	for i, chunkSet := range expectedChunks {
+		got := make(map[string]bool)
+		for _, chunk := range concurrentChunks[i] {
+			got[chunk] = true
+		}
+		if len(got) != len(chunkSet) {
+			t.Errorf("Snapshot %d: expecting %d chunks, got %d", i, len(chunkSet), len(got))
+			continue
+		}
+		for chunk := range chunkSet {
+			if !got[chunk] {
+				t.Errorf("Snapshot %d: the chunk %s is missing from the concurrent expansion", i, chunk)
+			}
+		}
+	}
+
+	// The metadata chunk downloads of the expansions must overlap: a serial expansion never has two in flight.
+	if peak := counting.peakConcurrentDownloads(); peak < 2 {
+		t.Errorf("The sequences were not expanded concurrently, at most %d was in flight at a time", peak)
+	}
+}
+
+// A revision that did not change its file list or chunk list shares the chunk sequence of the revision before it; a run
+// of such revisions stores one sequence and references it from all of them.  Expanding each of them separately would
+// fetch that sequence once per revision -- concurrently, so the snapshot cache would not spare it -- which is exactly
+// what the cache used to absorb.  A shared sequence must therefore be expanded once, however many threads were asked for.
+func TestSharedSequenceIsExpandedOnce(t *testing.T) {
+
+	setTestingT(t)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%v", r)
+		}
+	}()
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+
+	threadedStorage, err := CreateFileStorage(testDir, false, 4)
+	if err != nil {
+		t.Errorf("Failed to create the storage: %v", err)
+		return
+	}
+	counting := &countingStorage{FileStorage: threadedStorage}
+	snapshotManager.storage = counting
+
+	// No snapshot cache: the cache would also fold the repeated reads of a shared sequence, so it has to be out of the
+	// way for the download count to measure the grouping itself.
+	snapshotManager.snapshotCache = nil
+
+	// Every revision refers to the same file chunk, so every revision has the same chunk sequence: the file chunk, the
+	// chunk sequence and the length sequence are all stored once and shared by all of them.
+	chunkHash := uploadRandomChunk(snapshotManager, 1024)
+	if chunkHash == "" {
+		t.Errorf("Failed to upload a chunk")
+		return
+	}
+
+	now := time.Now().Unix()
+	for revision := 1; revision <= 8; revision++ {
+		createTestSnapshot(snapshotManager, "vm1@host1", revision, now-int64(revision)*3600, now,
+			[]string{chunkHash}, "tag")
+	}
+
+	revisions, err := snapshotManager.ListSnapshotRevisions("vm1@host1")
+	if err != nil {
+		t.Errorf("Failed to list the revisions: %v", err)
+		return
+	}
+
+	var snapshots []*Snapshot
+	for _, revision := range revisions {
+		snapshots = append(snapshots, snapshotManager.DownloadSnapshot("vm1@host1", revision))
+	}
+
+	snapshotManager.CreateChunkOperator(false, false, 4, false)
+	defer func() {
+		snapshotManager.chunkOperator.Stop()
+		snapshotManager.chunkOperator = nil
+	}()
+
+	counting.resetDownloadStats()
+	chunkLists := snapshotManager.expandSnapshots(snapshots, 4)
+
+	if len(chunkLists) != len(snapshots) {
+		t.Errorf("Expecting %d chunk lists, got %d", len(snapshots), len(chunkLists))
+		return
+	}
+
+	// Every revision must still be told about every chunk it references, even though only one expansion was done:
+	// the chunk sequence chunk and the file chunk.
+	for i, chunks := range chunkLists {
+		if len(chunks) != 2 {
+			t.Errorf("Snapshot %d: expecting 2 chunks, got %d", i, len(chunks))
+		}
+	}
+
+	// The shared metadata chunk must have been fetched from the storage once, not once per revision.
+	downloads := counting.chunkDownloadCounts()
+	metadataDownloads := 0
+	for filePath, count := range downloads {
+		if count > 1 {
+			t.Errorf("The chunk %s was downloaded %d times; a shared sequence must be expanded once", filePath, count)
+		}
+		metadataDownloads += count
+	}
+
+	if metadataDownloads != 1 {
+		t.Errorf("Expecting the single shared metadata chunk to be downloaded once, got %d downloads", metadataDownloads)
+	}
+}
+
+// A sequence must decode to exactly the same content however many chunks it has and however many threads fetch them:
+// the pieces have to be put back in the order of the sequence, not in the order the downloads finish in.
+func TestDownloadSequencePreservesOrderConcurrently(t *testing.T) {
+
+	setTestingT(t)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%v", r)
+		}
+	}()
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+	counting := &countingStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
+	snapshotManager.storage = counting
+
+	// One sequence of ten chunks, each with a distinctive content, so that a swapped pair is detectable.
+	var sequence []string
+	expected := make([]byte, 0)
+	for i := 0; i < 10; i++ {
+		piece := bytes.Repeat([]byte{byte('a' + i)}, 100)
+		sequence = append(sequence, uploadTestChunk(snapshotManager, piece))
+		expected = append(expected, piece...)
+	}
+
+	counting.resetDownloadStats()
+	content := snapshotManager.DownloadSequence(sequence)
+
+	if !bytes.Equal(content, expected) {
+		t.Errorf("The sequence was decoded to %d bytes that do not match the %d bytes that were encoded",
+			len(content), len(expected))
+	}
+}
+
 // 'list -files' printed the file list by walking the file sequence twice: once to compute the total size and the width
 // of the size column, and once to print the entries.  Each walk downloads every metadata chunk of the sequence again,
 // so the second one is pure overhead (and a round trip per chunk on cloud storage).  The file list must instead be

@@ -310,16 +310,187 @@ func (manager *SnapshotManager) CreateChunkOperator(resurrect bool, rewriteChunk
 	}
 }
 
-// DownloadSequence returns the content represented by a sequence of chunks.
+// DownloadSequence returns the content represented by a sequence of chunks.  The chunks of a sequence are independent
+// of each other, so they are all submitted at once and fetched concurrently whenever the chunk operator has more than
+// one thread: prune and check create it with the user's -threads, while the read-only commands create it with one, in
+// which case this is the same serial fetch as before.  Each chunk is copied out and returned to the pool as soon as it
+// arrives and the pieces are concatenated in the sequence's order, so neither the content nor the peak memory depends
+// on the order the downloads finish in.
 func (manager *SnapshotManager) DownloadSequence(sequence []string) (content []byte) {
 	manager.CreateChunkOperator(false, false, 1, false)
-	for _, chunkHash := range sequence {
-		chunk := manager.chunkOperator.Download(chunkHash, 0, true)
-		content = append(content, chunk.GetBytes()...)
-		manager.config.PutChunk(chunk)
+
+	pieces := make([][]byte, len(sequence))
+	var waitGroup sync.WaitGroup
+	waitGroup.Add(len(sequence))
+
+	for i, chunkHash := range sequence {
+		// Each completion owns the chunk it is handed, so it copies the bytes out and returns the chunk to the pool
+		// itself; the pieces are read only after every one of them has been written.
+		manager.chunkOperator.DownloadAsync(chunkHash, i, true, func(chunk *Chunk, chunkIndex int) {
+			pieces[chunkIndex] = append(pieces[chunkIndex], chunk.GetBytes()...)
+			manager.config.PutChunk(chunk)
+			waitGroup.Done()
+		})
+	}
+
+	waitGroup.Wait()
+
+	for _, piece := range pieces {
+		content = append(content, piece...)
 	}
 
 	return content
+}
+
+// expandSnapshots expands the chunk sequences of every snapshot and returns one chunk list per snapshot, in the order
+// the snapshots were given.  Expanding a sequence is a set of metadata chunk downloads, one round trip each on a storage
+// where a read is a round trip, and it is the per-revision cost of the chunk selection phase of prune; the expansions
+// of distinct sequences are independent of each other, so they are overlapped when more than one thread was asked for.
+//
+// Snapshots commonly share a chunk sequence: an unchanged chunk list is stored once and referenced by a whole run of
+// revisions.  A shared sequence is expanded once and its chunk ids are handed to every snapshot that references it, so
+// this does not fetch a metadata chunk once per referencing revision the way the snapshot cache used to spare it.
+//
+// The sequences are identified and grouped, and the results are merged into the per-snapshot lists, by the calling
+// goroutine, so the caller's maps are still written by a single goroutine regardless of the thread count.
+func (manager *SnapshotManager) expandSnapshots(snapshots []*Snapshot, threads int) [][]string {
+	chunkLists := make([][]string, len(snapshots))
+
+	// The operator is shared by the workers, so it has to exist before they start: creating it lazily from inside a
+	// worker would be a write to manager.chunkOperator from several goroutines at once.  Prune has already created it
+	// with the same thread count, and this only creates it when it is absent.
+	manager.CreateChunkOperator(false, false, threads, false)
+
+	// Group the snapshots by their chunk sequence, in the order the sequences are first seen so that the work is handed
+	// out in a stable order.
+	sequenceIndex := make(map[string]int)
+	groups := make([][]*Snapshot, 0)
+
+	for _, snapshot := range snapshots {
+		key := sequenceKey(snapshot.ChunkSequence)
+		index, found := sequenceIndex[key]
+		if !found {
+			index = len(groups)
+			sequenceIndex[key] = index
+			groups = append(groups, nil)
+		}
+		groups[index] = append(groups[index], snapshot)
+	}
+
+	expanded := make([][]string, len(groups))
+
+	if threads > 1 && len(groups) > 1 {
+		if threads > len(groups) {
+			threads = len(groups)
+		}
+
+		nextGroup := int64(0)
+		var waitGroup sync.WaitGroup
+
+		// A worker that hits an error can't report it by itself, since the panic raised by LOG_ERROR would unwind its
+		// own goroutine only.  It is captured here and re-raised in the calling goroutine after all workers have
+		// finished, so the caller sees exactly what it sees in the single-threaded case.
+		var failure interface{}
+		var failureLock sync.Mutex
+
+		waitGroup.Add(threads)
+		for i := 0; i < threads; i++ {
+			go func() {
+				defer waitGroup.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						failureLock.Lock()
+						if failure == nil {
+							failure = r
+						}
+						failureLock.Unlock()
+					}
+				}()
+
+				for {
+					index := int(atomic.AddInt64(&nextGroup, 1)) - 1
+					if index >= len(groups) {
+						return
+					}
+					expanded[index] = manager.expandChunkHashes(expandableSnapshot(groups[index]))
+				}
+			}()
+		}
+
+		waitGroup.Wait()
+
+		if failure != nil {
+			panic(failure)
+		}
+	} else {
+		for index, group := range groups {
+			expanded[index] = manager.expandChunkHashes(expandableSnapshot(group))
+		}
+	}
+
+	// The file, chunk and length sequences only have to be turned into ids; only the chunk-hash sequence is the
+	// expansion, and its result is shared by every snapshot in the group.
+	for i, snapshot := range snapshots {
+		for _, chunkHash := range snapshot.FileSequence {
+			chunkLists[i] = append(chunkLists[i], manager.config.GetChunkIDFromHash(chunkHash))
+		}
+		for _, chunkHash := range snapshot.ChunkSequence {
+			chunkLists[i] = append(chunkLists[i], manager.config.GetChunkIDFromHash(chunkHash))
+		}
+		for _, chunkHash := range snapshot.LengthSequence {
+			chunkLists[i] = append(chunkLists[i], manager.config.GetChunkIDFromHash(chunkHash))
+		}
+		chunkLists[i] = append(chunkLists[i], expanded[sequenceIndex[sequenceKey(snapshot.ChunkSequence)]]...)
+	}
+
+	return chunkLists
+}
+
+// expandableSnapshot picks the snapshot of a group whose chunk sequence is expanded: one that already has its chunk
+// hashes in memory if there is one, so that the sequence is not downloaded again, and otherwise the first one.
+func expandableSnapshot(group []*Snapshot) *Snapshot {
+	for _, snapshot := range group {
+		if len(snapshot.ChunkHashes) > 0 {
+			return snapshot
+		}
+	}
+	return group[0]
+}
+
+// expandChunkHashes makes the chunks named by the chunk sequence of 'snapshot' available and returns their ids.  It is
+// the part of GetSnapshotChunks that costs a round trip per metadata chunk.
+func (manager *SnapshotManager) expandChunkHashes(snapshot *Snapshot) (chunkIDs []string) {
+
+	if len(snapshot.ChunkHashes) == 0 {
+		description := manager.DownloadSequence(snapshot.ChunkSequence)
+		err := snapshot.LoadChunks(description)
+		if err != nil {
+			LOG_ERROR("SNAPSHOT_CHUNK", "Failed to load chunks for snapshot %s at revision %d: %v",
+				snapshot.ID, snapshot.Revision, err)
+			return nil
+		}
+	}
+
+	for _, chunkHash := range snapshot.ChunkHashes {
+		chunkIDs = append(chunkIDs, manager.config.GetChunkIDFromHash(chunkHash))
+	}
+
+	snapshot.ClearChunks()
+
+	return chunkIDs
+}
+
+// sequenceKey identifies a chunk sequence by its chunk hashes, so that a sequence shared by several revisions is
+// recognized as one and expanded once.  Chunk hashes are binary and may contain any byte, so each hash is prefixed with
+// its length: joining them with a separator would be ambiguous and could merge two different sequences.
+func sequenceKey(sequence []string) string {
+	var key strings.Builder
+	for _, hash := range sequence {
+		key.WriteString(strconv.Itoa(len(hash)))
+		key.WriteByte(':')
+		key.WriteString(hash)
+	}
+	return key.String()
 }
 
 // DownloadSnapshotSequence downloads the content represented by a sequence of chunks, and then unmarshal the content
@@ -2059,9 +2230,12 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
 		}
 
 		sort.Ints(revisions)
+
+		// The revisions are independent of each other, so their snapshot files are downloaded concurrently when the
+		// user asked for more than one thread; the revision is known to exist because it came from the listing above.
+		// Only the downloads overlap -- everything that follows works on the snapshots in revision order.
 		var snapshots []*Snapshot
-		for _, revision := range revisions {
-			snapshot := manager.downloadSnapshot(id, revision, true, manager.fileChunk, 0)
+		for _, snapshot := range manager.downloadSnapshots(id, revisions, true, threads) {
 			if snapshot != nil {
 				snapshots = append(snapshots, snapshot)
 			}
@@ -2327,9 +2501,9 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
 
 	var success bool
 	if exhaustive {
-		success = manager.pruneSnapshotsExhaustive(referencedFossils, allSnapshots, collection, logFile, dryRun, exclusive)
+		success = manager.pruneSnapshotsExhaustive(referencedFossils, allSnapshots, collection, logFile, dryRun, exclusive, threads)
 	} else {
-		success = manager.pruneSnapshotsNonExhaustive(allSnapshots, collection, logFile, dryRun, exclusive)
+		success = manager.pruneSnapshotsNonExhaustive(allSnapshots, collection, logFile, dryRun, exclusive, threads)
 	}
 	if !success {
 		return false
@@ -2423,10 +2597,14 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
 
 // pruneSnapshots in non-exhaustive mode, only chunks that exist in the
 // snapshots to be deleted but not other are identified as unreferenced chunks.
-func (manager *SnapshotManager) pruneSnapshotsNonExhaustive(allSnapshots map[string][]*Snapshot, collection *FossilCollection, logFile io.Writer, dryRun, exclusive bool) bool {
+func (manager *SnapshotManager) pruneSnapshotsNonExhaustive(allSnapshots map[string][]*Snapshot, collection *FossilCollection, logFile io.Writer, dryRun, exclusive bool, threads int) bool {
 	targetChunks := make(map[string]bool)
 
-	// Now build all chunks referened by snapshot not deleted
+	// The snapshots to be deleted and the ones to be kept against them, in the order the two passes below use.  The
+	// chunk sequences are not expanded here; they are expanded concurrently and merged in this goroutine below.
+	var deletedSnapshots []*Snapshot
+	var keptSnapshots []*Snapshot
+
 	for _, snapshots := range allSnapshots {
 
 		if len(snapshots) > 0 {
@@ -2441,31 +2619,29 @@ func (manager *SnapshotManager) pruneSnapshotsNonExhaustive(allSnapshots map[str
 
 		for _, snapshot := range snapshots {
 			if !snapshot.Flag {
+				keptSnapshots = append(keptSnapshots, snapshot)
 				continue
 			}
 
 			LOG_INFO("SNAPSHOT_DELETE", "Deleting snapshot %s at revision %d", snapshot.ID, snapshot.Revision)
-			chunks := manager.GetSnapshotChunks(snapshot, false)
-
-			for _, chunk := range chunks {
-				// The initial value is 'false'.  When a referenced chunk is found it will change the value to 'true'.
-				targetChunks[chunk] = false
-			}
+			deletedSnapshots = append(deletedSnapshots, snapshot)
 		}
 	}
 
-	for _, snapshots := range allSnapshots {
-		for _, snapshot := range snapshots {
-			if snapshot.Flag {
-				continue
-			}
+	// Now build all chunks referened by snapshot not deleted.  The sequences of the snapshots are independent, so they
+	// are expanded concurrently; the merge is done here, in the calling goroutine, so that 'targetChunks' is still
+	// written by a single goroutine regardless of the thread count.
+	for _, chunks := range manager.expandSnapshots(deletedSnapshots, threads) {
+		for _, chunk := range chunks {
+			// The initial value is 'false'.  When a referenced chunk is found it will change the value to 'true'.
+			targetChunks[chunk] = false
+		}
+	}
 
-			chunks := manager.GetSnapshotChunks(snapshot, false)
-
-			for _, chunk := range chunks {
-				if _, found := targetChunks[chunk]; found {
-					targetChunks[chunk] = true
-				}
+	for _, chunks := range manager.expandSnapshots(keptSnapshots, threads) {
+		for _, chunk := range chunks {
+			if _, found := targetChunks[chunk]; found {
+				targetChunks[chunk] = true
 			}
 		}
 	}
@@ -2495,9 +2671,12 @@ func (manager *SnapshotManager) pruneSnapshotsNonExhaustive(allSnapshots map[str
 
 // pruneSnapshotsExhaustive in exhaustive, we scan the entire chunk tree to
 // find dangling chunks and temporaries.
-func (manager *SnapshotManager) pruneSnapshotsExhaustive(referencedFossils map[string]bool, allSnapshots map[string][]*Snapshot, collection *FossilCollection, logFile io.Writer, dryRun, exclusive bool) bool {
+func (manager *SnapshotManager) pruneSnapshotsExhaustive(referencedFossils map[string]bool, allSnapshots map[string][]*Snapshot, collection *FossilCollection, logFile io.Writer, dryRun, exclusive bool, threads int) bool {
 	chunkRegex := regexp.MustCompile(`^[0-9a-f]+$`)
 	referencedChunks := make(map[string]bool)
+
+	// The snapshots that are not being deleted, whose sequences have to be expanded to know what is still referenced.
+	var keptSnapshots []*Snapshot
 
 	// Now build all chunks referened by snapshot not deleted
 	for _, snapshots := range allSnapshots {
@@ -2517,12 +2696,17 @@ func (manager *SnapshotManager) pruneSnapshotsExhaustive(referencedFossils map[s
 				continue
 			}
 
-			chunks := manager.GetSnapshotChunks(snapshot, false)
+			keptSnapshots = append(keptSnapshots, snapshot)
+		}
+	}
 
-			for _, chunk := range chunks {
-				// The initial value is 'false'.  When a referenced chunk is found it will change the value to 'true'.
-				referencedChunks[chunk] = false
-			}
+	// A sequence is a set of metadata chunk downloads, one round trip each on a storage where a read is a round trip,
+	// and that is what makes -exhaustive expensive, so the sequences are expanded concurrently.  The merge is done in
+	// this goroutine, so 'referencedChunks' is still written by a single goroutine.
+	for _, chunks := range manager.expandSnapshots(keptSnapshots, threads) {
+		for _, chunk := range chunks {
+			// The initial value is 'false'.  When a referenced chunk is found it will change the value to 'true'.
+			referencedChunks[chunk] = false
 		}
 	}
 

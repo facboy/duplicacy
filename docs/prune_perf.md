@@ -1,27 +1,32 @@
 # Where `prune` spends its time
 
 Investigation into the performance of `duplicacy prune`, in the style of
-`snapshot_perf.md`, `init_perf.md` and `copy_perf.md`. One issue was worth
-fixing and has now been implemented (option 2 below, in `src/duplicacy_filestorage.go`
-and `src/duplicacy_chunkoperator.go`); the remaining candidates are recorded for a
-follow-up.
+`snapshot_perf.md`, `init_perf.md` and `copy_perf.md`. Three issues were worth
+fixing and have now been implemented: the serial revision loop
+(`src/duplicacy_snapshotmanager.go`), option 2 below (`src/duplicacy_filestorage.go`
+and `src/duplicacy_chunkoperator.go`), and the serial sequence expansion
+(`src/duplicacy_snapshotmanager.go`); the remaining candidates are recorded for
+a follow-up.
 
 ## Summary
 
 `prune` is two commands in one. It reads every snapshot of every id, works out
 which chunks are no longer referenced, and rewrites the storage to mark those
 chunks as fossils (or delete them outright with `-exclusive`). The reading half
-is a serial loop over revisions; the chunk half is a multi-threaded chunk
-operator that is already parallel.
+is a loop over revisions, now parallel under `-threads`; the chunk half is a
+multi-threaded chunk operator that is already parallel, and it is fed by the
+sequence expansion, which is now overlapped under the same flag.
 
 The reading half is cheap against a local filesystem and expensive against
-anything where a read is a round trip. It is also strictly serial: `prune`
-accepts `-threads` and uses it for the chunk operator, but the snapshot files
-are fetched one at a time regardless, so the flag does nothing for the largest
+anything where a read is a round trip. It used to be strictly serial: `prune`
+accepted `-threads` and used it for the chunk operator, but the snapshot files
+were fetched one at a time regardless, so the flag did nothing for the largest
 per-item cost in the command. This is the same shape as the fix `6584fb0` made
 for `list`, which added `downloadSnapshots`; `prune` was not updated then and
-still calls `downloadSnapshot` directly in its loop
-(`src/duplicacy_snapshotmanager.go:2064`).
+called `downloadSnapshot` directly in its loop. It now calls `downloadSnapshots`
+(`src/duplicacy_snapshotmanager.go:2238`), so `-threads 8` takes a
+revision-read-dominated run from 0.63 s to 0.31 s (2.0x) with no change at
+`-threads 1`.
 
 The chunk half had one real defect. Every metadata chunk it fetched was copied
 into the local snapshot cache and read back from there, and that cache write was
@@ -39,18 +44,24 @@ on a mismatch, so a write torn by a crash is rejected rather than believed.
 Cached **snapshot files**, fossil collections and the verified-chunk list are
 read back unverified and JSON-parsed, so those keep fsyncing; when their entry is
 torn, the first two are reported as errors that stop the command, while the
-verified-chunk list is rebuilt by verifying again. See the section below.
+verified-chunk list is rebuilt by verifying again.
 
 `-exhaustive` is the expensive mode, and for a reason that is inherent rather
 than accidental: it must expand the chunk sequences of every revision to build
 the referenced set before it can walk the chunk tree, so its cost grows with the
 number of revisions and with the size of the chunk tree. Non-exhaustive returns
 early when there is nothing to delete and does not pay for the expansion at all
-unless a snapshot is actually being removed.
+unless a snapshot is actually being removed. The expansion itself is now
+overlapped under `-threads`.
 
 ## Conclusion
 
-The change worth making is option 2: **keep the cache, but do not `fsync` the
+Three changes were worth making. The first is the parallel revision loop: the
+snapshot files of a revision are independent, and the parallel helper `list`
+already used was simply never wired into prune, so `-threads` bought nothing for
+the largest per-item cost of the command.
+
+The second is option 2: **keep the cache, but do not `fsync` the
 chunk-cache writes**. The defect is real — the chunk operator writes every
 metadata chunk to the snapshot cache without checking `IsCacheNeeded()` — but the
 write is not pure waste, because the cache is also what stops a metadata chunk
@@ -58,22 +69,30 @@ being re-read when many revisions share it. Deleting the write (option 1) is the
 fastest choice on a fast disk but the slowest on a slow mount with reuse.
 Removing the `fsync` takes out the dominant cost of the write while keeping every
 cache hit, and it is the only option that beats HEAD on every fixture measured,
-with no case made worse. It was implemented as described below.
+with no case made worse. It was implemented as option 2 above.
 
-The other candidates are worth less:
+The third is the sequence expansion. `-threads` overlapped the revision reads but
+not the expansions that follow them, so the largest per-item cost of
+`-exhaustive` — one round trip per metadata chunk of every sequence — was still
+taken one chunk at a time. The expansions of distinct sequences are now done
+concurrently, and a sequence shared by several revisions is expanded once rather
+than once per revision. `-threads 4` takes a 40-revision fixture from 0.36 s to
+0.30 s locally, and `-threads 1` is unchanged.
+
+The candidates left are worth less:
 
 | Candidate | Scope | Local gain | Cloud gain |
 | --- | --- | --- | --- |
-| Skip `fsync` on chunk-cache writes | every command that expands a sequence | 3.4-6.5x for `list -files`/`check*`/`prune -exhaustive`; no regression on reuse | none (cache is local by definition) |
-| Download snapshot files in parallel under `-threads` | every `prune`, all modes | none (already fast) | one round trip per revision → overlapped |
 | Create `fossils/` only when a collection is saved | every `prune` | one `mkdirat` | one round trip |
 | Skip the `nesting` probe | every command | one `stat` | one round trip |
+| Filter `-t` before the snapshot files are downloaded | `prune -t` | none | one round trip per filtered revision |
 
 `prune` is not like `init`, which is a fixed handful of operations: it scales
 with revisions and with the chunk tree, and it is the command a long-lived
-repository runs most often. That is why it is worth optimising, and why the two
-scaling costs — the serial revision loop and the per-metadata-chunk cache write —
-are the ones to look at first.
+repository runs most often. That is why it is worth optimising, and why the three
+scaling costs — the serial revision loop, the per-metadata-chunk cache write and
+the serial sequence expansion — were the ones to look at first. All three are now
+fixed.
 
 ## The call path
 
@@ -82,48 +101,48 @@ are the ones to look at first.
 sets up the snapshot cache (`:1225`) and calls `BackupManager.SnapshotManager.
 PruneSnapshots` (`:1226`).
 
-`PruneSnapshots` (`src/duplicacy_snapshotmanager.go:1937`) does, in order:
+`PruneSnapshots` (`src/duplicacy_snapshotmanager.go:2108`) does, in order:
 
 ```go
-manager.CreateChunkOperator(false, false, threads, false)                  // :1952
+manager.CreateChunkOperator(false, false, threads, false)                  // :2123
 ...
-for _, id := range snapshotIDs {                                           // :2053
-    revisions, err = manager.ListSnapshotRevisions(id)                     // :2055
-    for _, revision := range revisions {                                   // :2063
-        snapshot := manager.downloadSnapshot(id, revision, true, manager.fileChunk, 0)  // :2064  serial
+for _, id := range snapshotIDs {                                           // :2224
+    revisions, err = manager.ListSnapshotRevisions(id)                     // :2226
+    for _, snapshot := range manager.downloadSnapshots(id, revisions, true, threads) {  // :2238  parallel
     }
 }
 ...
-if toBeDeleted == 0 && !exhaustive { return false }                        // :2321  early out
+if toBeDeleted == 0 && !exhaustive { return false }                        // :2495  early out
 ...
-success = manager.pruneSnapshotsExhaustive(...)                            // :2330
-        || manager.pruneSnapshotsNonExhaustive(...)                        // :2332
-manager.chunkOperator.WaitForCompletion()                                  // :2338
-manager.CleanSnapshotCache(latestSnapshot, allSnapshots)                   // :2414-2418
+success = manager.pruneSnapshotsExhaustive(...)                            // :2504
+        || manager.pruneSnapshotsNonExhaustive(...)                        // :2506
+manager.chunkOperator.WaitForCompletion()                                  // :2512
+manager.CleanSnapshotCache(latestSnapshot, allSnapshots)                   // :2589
 ```
 
 The chunk selection and fossilization differ by mode:
 
-- `pruneSnapshotsNonExhaustive` (`:2426`) builds `targetChunks` from the
+- `pruneSnapshotsNonExhaustive` (`:2600`) builds `targetChunks` from the
   snapshots being deleted, then walks the snapshots that are being kept and
-  marks the ones that are still referenced. It only calls `GetSnapshotChunks`
-  (which downloads the chunk sequences) when a snapshot is flagged for deletion
-  (`:2448`) or when a snapshot is kept and there is something to check against
-  (`:2463`).
-- `pruneSnapshotsExhaustive` (`:2498`) calls `GetSnapshotChunks` for every
-  snapshot that is *not* flagged (`:2520`) and then lists the whole chunk tree
-  with `ListAllFiles` (`:2529`).
+  marks the ones that are still referenced. It only expands the sequences
+  (`expandSnapshots`, which calls `GetSnapshotChunks` and downloads the chunk
+  sequences) of the snapshots flagged for deletion (`:2634`) and of the ones
+  being kept (`:2641`).
+- `pruneSnapshotsExhaustive` (`:2674`) expands the sequences of every snapshot
+  that is *not* flagged (`:2706`) and then lists the whole chunk tree
+  with `ListAllFiles` (`:2713`).
 
-So a non-exhaustive prune with nothing to delete stops at `:2321` after the
+So a non-exhaustive prune with nothing to delete stops at `:2495` after the
 snapshot files have been read. An exhaustive prune always expands every
 sequence and always walks the chunk tree, which is what makes it the slow mode.
 
-## The revision loop is serial and ignores `-threads`
+## The revision loop used to be serial and ignore `-threads` — fixed
 
-`prune` creates its chunk operator with `threads` (`:1952`) but downloads the
-snapshot files through `downloadSnapshot` one at a time (`:2064`). The
-parallel helper that `list` uses, `downloadSnapshots`
-(`src/duplicacy_snapshotmanager.go:679`), is right there but is not called from
+This was the first of the three scaling costs, and is now implemented. `prune`
+creates its chunk operator with `threads` (`:2123`) but used to download the
+snapshot files through `downloadSnapshot` one at a time (now removed).
+The parallel helper that `list` uses, `downloadSnapshots`
+(`src/duplicacy_snapshotmanager.go:766`), was right there but was not called from
 the prune path. The commit that added it (`6584fb0`) rewrote `list`'s call sites
 and left prune's:
 
@@ -142,21 +161,64 @@ all revision reads), `/usr/bin/time`, best of three:
 | HEAD (`downloadSnapshot` loop) | 0.83 s | 0.84 s |
 | prototype using `downloadSnapshots` | 0.85 s | 0.47 s |
 
-The flag has no effect on HEAD and a 1.8x effect once the loop is parallel. On
+The flag had no effect on HEAD and a 1.8x effect once the loop is parallel. On
 ext4 the same 500 revisions take 0.02-0.03 s either way, because a revision is
 two syscalls and there is nothing to overlap — the same conclusion `list`
 reached, which is why that flag also defaults to 1.
 
-A prototype that replaces the loop with
+### How it was implemented
+
+The loop now calls the helper, keeping the snapshots in revision order:
 
 ```go
-for _, snapshot := range manager.downloadSnapshots(id, revisions, true, threads) { ... }
+var snapshots []*Snapshot
+for _, snapshot := range manager.downloadSnapshots(id, revisions, true, threads) {
+    if snapshot != nil {
+        snapshots = append(snapshots, snapshot)
+    }
+}
 ```
 
-produced byte-identical `prune -exhaustive -dry-run` output on a 60-revision
-repository. Note one prerequisite: like `list`, `prune` would have to keep
-creating its storage with `threads` (`duplicacy/duplicacy_main.go:1188`), which
-it already does.
+The revision is known to exist because it came from `ListSnapshotRevisions`, so
+`listed` is true and the existence check inside `downloadSnapshot` is skipped, as
+it was before. Like `list`, `prune` keeps creating its storage with `threads`
+(`duplicacy/duplicacy_main.go:1188`), which it already did, so the storage
+accepts the thread indexes the workers pass.
+
+Re-measured A/B on the same fixture as the table above (a local ext4 repository
+with 301 revisions, none sharing a metadata chunk), 6 runs per cell, with the two
+binaries alternating so the run order does not bias the result:
+
+| Build | `-threads 1` | `-threads 4` | `-threads 8` |
+| --- | --- | --- | --- |
+| HEAD | 0.627 s | 0.647 s | 0.627 s |
+| with the fix | 0.627 s | 0.323 s | 0.305 s |
+
+The flag is flat on HEAD and `-threads 4`/`-threads 8` roughly halve the run once
+the loop is parallel. `-threads 1` is unchanged, which is what the helper's
+single-threaded branch gives: it falls back to the same `downloadSnapshot` call,
+so a default `prune` takes the same path and the same order as before. This is a
+local-filesystem fixture, so the win here is not the round trips that the drvfs
+measurement isolates; it is the overlap of the per-revision work.
+
+`prune` with more than one id downloads each id's revisions in turn, so the
+concurrency is per id; ids are few and a single-revision id gains nothing, which
+is why the helper returns early for `len(revisions) <= 1`.
+
+### Correctness
+
+- `prune -exhaustive -dry-run` prints byte-identical output on HEAD and with the
+  fix (301-revision repository; `diff` reports no difference, no normalisation
+  needed).
+- A real `prune -r 1-75 -exclusive` against a pristine copy of the same storage
+  produces a tree that `diff -rq` reports identical: the deletions, the fossils
+  and the fossil collection are the same regardless of how many revisions were
+  read at once.
+- `TestPruneDownloadsRevisionsConcurrently` pins the overlap down: it fails with
+  "at most 1 was in flight at a time" when the loop is put back, and it also
+  checks that the workers never use a thread index beyond the number the storage
+  was created with. It joins `TestDownloadSnapshotsConcurrently`, which covers
+  the helper itself.
 
 ## The metadata cache is written even when the storage needs no cache
 
@@ -170,8 +232,8 @@ if task.isMetadata && operator.snapshotCache != nil {                    // :307
     ...
 }
 ...
-if chunk.isMetadata && !chunk.isRawData && len(cachedPath) > 0 {          // :502  no IsCacheNeeded()
-    err := operator.snapshotCache.UploadFile(threadIndex, cachedPath, chunk.GetBytes())  // :504
+if chunk.isMetadata && !chunk.isRawData && len(cachedPath) > 0 {          // :507  no IsCacheNeeded()
+    err := operator.snapshotCache.UploadFileNoSync(threadIndex, cachedPath, chunk.GetBytes())
 }
 ```
 
@@ -179,12 +241,12 @@ if chunk.isMetadata && !chunk.isRawData && len(cachedPath) > 0 {          // :50
 `len(cachedPath) > 0` is always true when a cache exists: **every** metadata
 chunk is written to `.duplicacy/cache/<storage>/chunks/`, and read back before
 the storage is consulted. On a cold cache that is one miss plus one write per
-metadata chunk. The write at `:502` is the one the fix targets; it is now
+metadata chunk. The write at `:507` is the one the fix targets; it is now
 `UploadFileNoSync`.
 
 Every other cache access in this area is guarded. `SnapshotManager.downloadFile`
-guards the read (`:2721`) and the write-back (`:2764`), and `UploadFile` guards
-its write (`:2800`). The `list` investigation implemented exactly this rule for
+guards the read (`:2903`) and the write-back (`:2949`), and `UploadFile` guards
+its write (`:2985`). The `list` investigation implemented exactly this rule for
 the snapshot files (`snapshot_perf.md`, candidate #1: "Do not write the snapshot
 cache when `IsCacheNeeded()` is false"). The chunk operator was not part of that
 change.
@@ -198,8 +260,8 @@ or network filesystem that has declared itself cache-free.
 ### What the unnecessary write costs
 
 A local-storage write is not a single syscall. `FileStorage.UploadFile`
-(`src/duplicacy_filestorage.go:150`) does `Lstat`, `MkdirAll` on the parent,
-create a randomised `*.tmp`, write, **`fsync`** (`:194`), close and `rename`.
+(`src/duplicacy_filestorage.go:151`) does `Lstat`, `MkdirAll` on the parent,
+create a randomised `*.tmp`, write, **`fsync`** (`:210`), close and `rename`.
 With `strace -f -c` on a 150-revision repository (452 chunks) whose revisions all
 differ, so 137 metadata chunks are fetched, `prune -exhaustive -dry-run`:
 
@@ -278,8 +340,8 @@ pristine storage and the outputs and side effects compared:
 
 The defect admits three fixes. All three leave the storage byte-identical.
 
-1. **Guard the cache with `IsCacheNeeded()`** (`duplicacy_chunkoperator.go:307`
-   and `:502`), matching every other cache access in the code. Fastest on a fast
+1. **Guard the cache with `IsCacheNeeded()`** (`src/duplicacy_chunkoperator.go:307`
+   and `:507`), matching every other cache access in the code. Fastest on a fast
    disk. It loses badly, however, when one slow mount serves many revisions that
    share their metadata: with the cache gone, the shared chunks are re-read for
    every revision. **Not implemented.**
@@ -358,7 +420,7 @@ The implemented change was verified in three ways.
   pins this down — it fails if the id check in `DownloadChunk` is removed — and
   `TestSnapshotCacheSkipsSync` checks that the cache is still written and readable.
   `TestPruneSingleRepository` and `TestPruneSingleHost`
-  (`src/duplicacy_snapshotmanager_test.go:899`, `:943`) exercise the prune deletion
+  (`src/duplicacy_snapshotmanager_test.go:1190`, `:1234`) exercise the prune deletion
   path with and without `exclusive`, tagged snapshots and retention policies, and
   `TestCorruptNonChunkCacheEntries` records the read-side behaviour of the three
   cache entries that are *not* covered by the no-fsync change.
@@ -384,30 +446,115 @@ unchanged-content run fetches a single one and serves the other 299 revisions
 from the cache. That is the whole difference. The tree walk does grow with the
 chunk tree — with `-v`, `LIST_FILES` ("Listing chunks/...") appears 424 times for
 the 902-chunk fixture against 11 times for the 8-chunk one, since
-`pruneSnapshotsExhaustive` (`:2529`) lists the top directory and every
+`pruneSnapshotsExhaustive` (`:2713`) lists the top directory and every
 subdirectory — but it is a small part of the total next to the per-sequence
 fetches, and it is the same walk `-delete-only` performs.
 
 Consequences:
 
-- `-exhaustive` cannot take the `:2321` early exit, by design: it has to expand
+- `-exhaustive` cannot take the `:2495` early exit, by design: it has to expand
   the sequences to know what is referenced before it can find dangling chunks
   and temporary files. Scheduling it less often (the wiki recommends it
   periodically) is the practical lever.
-- The `-threads` flag does not change any of this. The sequence chunks are
-  fetched by the operator, but each `DownloadSequence` waits for its chunks one
-  at a time (see the smaller items), and the tree walk runs on the calling
-  goroutine. A `-threads 1/4/16` sweep on the 300-revision ext4 fixture was flat
-  (0.94 s / 0.94 s / 0.95 s).
+- The `-threads` flag did not change the sequence expansion until the change
+  described in the next section: each `DownloadSequence` waits for its chunks one
+  at a time on the calling goroutine, and the tree walk also runs there. A
+  `-threads 1/4/16` sweep on the 300-revision ext4 fixture was flat
+  (0.94 s / 0.94 s / 0.95 s). The flag only overlapped the revision reads, which
+  on this fixture are a small part of the run.
 - The non-exhaustive mode with deletions does pay the expansion too, because it
-  calls `GetSnapshotChunks` on the snapshots being deleted and on the ones being
+  expands the sequences of the snapshots being deleted and of the ones being
   kept to compare against. The 0.62 s delete above is mostly that.
+
+## The sequence expansion was serial too — fixed
+
+This is the third scaling cost. `PruneSnapshots` creates its chunk operator with
+`threads` (`:2123`), but the expansion never used them: `DownloadSequence`
+submitted one chunk at a time and blocked on each completion channel before
+submitting the next, so a sequence was fetched serially even with more threads.
+And `pruneSnapshotsExhaustive` / `pruneSnapshotsNonExhaustive` walked their
+snapshots on the calling goroutine, one sequence after another. On a storage
+where a read is a round trip, and an unchanged chunk list is still a stored
+sequence, that is one round trip per metadata chunk of every revision, taken
+strictly in turn.
+
+The measured effect is in the table above: on the 300-revision changing-content
+fixture the expansion is almost the whole 0.87 s of `-exhaustive`, and the
+`-threads` sweep was flat. The work is per revision and per chunk, exactly the
+shape of the revision-loop fix, so `-threads` now reaches it.
+
+### How it was implemented
+
+`DownloadSequence` (`:319`) submits every chunk of the sequence to the operator
+and waits once, keeping the chunks in sequence order:
+
+```go
+for i, chunkHash := range sequence {
+    manager.chunkOperator.DownloadAsync(chunkHash, i, true, func(chunk *Chunk, chunkIndex int) {
+        pieces[chunkIndex] = append(pieces[chunkIndex], chunk.GetBytes()...)
+        manager.config.PutChunk(chunk)
+        waitGroup.Done()
+    })
+}
+```
+
+The chunks arrive in whatever order the operator finishes them, so each one is
+copied out and returned to the pool by the goroutine that completed it, and the
+pieces are concatenated by sequence index afterwards. The content does not depend
+on the order the downloads finish in, and the chunks do not have to be held until
+the last one arrives.
+
+The expansions themselves are driven by `expandSnapshots` (`:356`). It groups
+the snapshots by their chunk sequence first: revisions that did not change their
+chunk list share one sequence, and expanding each of them separately would fetch
+that sequence once per revision. A shared sequence is expanded once and the ids
+are handed to every revision that references it, which is what the serial code
+got for free from the snapshot cache. Distinct sequences are then expanded by
+concurrent workers; a worker that hits an error captures it and it is re-raised
+in the calling goroutine, as `downloadSnapshots` (`:850`) already does for the
+revisions. The merge of the per-sequence results into the caller's maps is done
+by the calling goroutine, so the maps are still written by one goroutine.
+
+The read-only commands (`list`, `cat`, `diff`, `history`) create the operator with
+one thread, so `DownloadSequence` takes its single-threaded path there and their
+behaviour is unchanged.
+
+### Correctness
+
+- A real `prune -exhaustive -r 1-10 -exclusive` and a plain `prune -r 1-10
+  -exclusive` were each run from the same pristine storage by the old and the new
+  binary at `-threads 4`: `diff -rq` reports the storage trees identical, and the
+  `-v` logs are identical as sets once the timestamps and durations are removed.
+- `prune -exhaustive -dry-run` at `-threads 1`, `4` and `8` produces the same
+  output; `-threads 1` is unchanged because a single group takes the serial path.
+- Measured on a drvfs mount, 40 revisions that each changed their file list (so
+  every revision has its own sequence and the expansions are distinct), warm
+  cache, 5 runs per cell with the two binaries alternating: 0.37 s / 0.36 s /
+  0.39 s at `-threads 1` / `4` / `8` before, and 0.37 s / 0.30 s / 0.32 s after.
+  The flag is flat before the change and worth about 1.2x after it. On 300
+  revisions that all share their metadata the numbers are 0.58 s / 0.34 s /
+  0.36 s before and 0.55 s / 0.33 s / 0.34 s after: there the reuse matters more
+  than the overlap, and the grouping is what keeps the change from making it
+  worse. On a native filesystem the expansion is a few syscalls per chunk and the
+  difference is within noise, as the table above says.
+- `TestPruneExpandsSequencesConcurrently` checks that the concurrent expansion
+  returns the same chunk lists as the serial one and that the metadata downloads
+  really overlap; it fails with "at most 1 was in flight at a time" if the
+  workers are put back behind the serial path.
+- `TestSharedSequenceIsExpandedOnce` checks that a sequence referenced by eight
+  revisions is fetched once, not eight times; it fails with "was downloaded 8
+  times" when the grouping is defeated.
+- `TestDownloadSequencePreservesOrderConcurrently` checks that a sequence decodes
+  to the same bytes however the chunks finish.
+- `TestPruneSingleRepository`, `TestPruneSingleHost` and the rest of the prune
+  suite (`go test ./src/ -run TestPrune -race`) pass, as does the full suite with
+  `-race`.
 
 ## Smaller items
 
 - **`fossils/` is created unconditionally.** `PruneSnapshots` calls
-  `manager.snapshotCache.CreateDirectory(0, "fossils")` at `:2078` on every run,
-  including one that ends at the `:2321` early return and creates no collection.
+  `manager.snapshotCache.CreateDirectory(0, "fossils")` at `:2252` on every run,
+  including one that ends at the `:2495` early return and creates no collection.
   `FileStorage.CreateDirectory` is an `os.Mkdir` whose `EEXIST` is swallowed
   (`src/duplicacy_filestorage.go:108-115`), so locally it is a wasted `mkdirat`
   (`mkdirat` count 5 with the guard); on a directory-based backend it is a
@@ -422,26 +569,25 @@ Consequences:
 - **`CleanSnapshotCache` probes every chunk of every cached snapshot.** At the
   end of a successful prune, each cached snapshot file is read and each of its
   chunks is looked up first in the cache and then in the storage
-  (`src/duplicacy_snapshotmanager.go:443-444`). On a 60-revision fixture with the
+  (`src/duplicacy_snapshotmanager.go:614-615`). On a 60-revision fixture with the
   cache enabled, `prune -r 1 -exclusive` issues 290 `newfstatat` calls under the
   cache's `chunks/` and 46 under the storage's. It scales with the size of the
   cache rather than with the repository, so it costs most on a cache that has
   not been cleaned before.
-- **`DownloadSequence` expands a sequence one chunk at a time.** It calls
-  `CreateChunkOperator(false, false, 1, false)` (`:315`) and then, per chunk,
-  `manager.chunkOperator.Download(chunkHash, 0, true)` (`:317`), which blocks on
-  the chunk's completion channel (`src/duplicacy_chunkoperator.go:155-163`). So
-  a sequence is fetched serially even when the operator was created with more
-  threads — in `PruneSnapshots` it is, at `:1952`, and `CreateChunkOperator`
-  only creates the operator if none exists (`:307-311`), so the `1` here is
-  ignored. On a cloud storage each metadata chunk of a sequence is therefore a
-  round trip taken one at a time.
 - **`prune` with a tag or a retention policy downloads every revision anyway.**
-  The tag filter (`:2310`) and the retention policy (`:2259`) are applied after
+  The tag filter (`:2484`) and the retention policy (`:2433`) are applied after
   the snapshot files have been downloaded, which is unavoidable for the
   retention policy (it needs the timestamps) but not for `-t`, which only needs
   `snapshot.Tag`. This is a marginal item: the filter is applied per id, so the
   number of ids bounds the saving, and a tag filter is not a common invocation.
+- **`CreateChunkOperator` keeps the first operator it is given.** The operator is
+  created once and remembered (`:307`), and its thread count is fixed at creation,
+  so a later caller that asks for more threads is ignored. That is what makes
+  `DownloadSequence`'s own `1` harmless, but it also means the concurrency of the
+  expansion is whatever the first caller on the manager asked for; prune happens
+  to ask first, with `-threads` (`:2123`). Making the thread count a property of
+  the request rather than of the operator would be more honest, and it is what
+  would let `check` overlap its expansion too.
 
 ### Deliberately not pursued
 
@@ -450,7 +596,7 @@ Consequences:
   disk. Prune's chunk walk is what an index would replace, but it would have to
   be maintained by every writer and understood by old clients.
 - **Parallelising the tree walk.** `ListAllFiles` is a serial BFS
-  (`src/duplicacy_snapshotmanager.go:555-590`). It is proportional to the number
+  (`src/duplicacy_snapshotmanager.go:726-761`). It is proportional to the number
   of chunk directories, and the measurements above put it well behind the
   sequence expansion; parallelising it would change the order chunks are
   fossilized in, which is user-visible in the log.
@@ -470,9 +616,10 @@ Consequences:
 
 - `duplicacy -d prune ...` sets DEBUG logging
   (`duplicacy/duplicacy_main.go:146-148`); `-v` sets TRACE. The `DOWNLOAD_FILE`
-  lines ("Downloaded file snapshots/<id>/<n>") show the serial revision loop —
-  they are printed one after another with no overlap, and their count is the
-  revision count. Compare with `duplicacy -d list` on the same repository.
+  lines ("Downloaded file snapshots/<id>/<n>") show the revision loop — their
+  count is the revision count, and with `-threads 1` they are printed one after
+  another with no overlap, while under more threads they interleave. Compare
+  with `duplicacy -d list` on the same repository.
 - The `CHUNK_DOWNLOAD` ("Chunk ... has been downloaded") and `CHUNK_CACHE`
   ("loaded from the snapshot cache") counts show the metadata fetches. On a
   local FileStorage the cache hits *and* the cache writes should not happen; if
@@ -490,14 +637,22 @@ Consequences:
   separates filesystem cost from the command's own behaviour.
 - `prune -exhaustive` against `prune` on the same repository sizes the two modes;
   `prune -r N` (a single revision) gives the marginal per-revision cost. Note
-  that `-delete-only` returns at `:2224`, before the chunk-selection phase, so it
+  that `-delete-only` returns at `:2398`, before the chunk-selection phase, so it
   measures the fossil-collection cleanup only rather than the work described
   above.
 - Run `go test ./src/ -run 'TestPrune' -vet=off -v` for the deletion semantics,
+  `go test ./src/ -run 'TestPruneDownloadsRevisionsConcurrently|TestDownloadSnapshotsConcurrently'
+  -vet=off -v` for the parallel revision reads,
+  `go test ./src/ -run 'TestPruneExpandsSequencesConcurrently|TestSharedSequenceIsExpandedOnce|TestDownloadSequencePreservesOrderConcurrently'
+  -vet=off -v` for the sequence expansion, and
   `go test ./src/ -run 'TestCorruptCachedChunkIsRefetched|TestSnapshotCacheSkipsSync|TestCorruptNonChunkCacheEntries'
-  -vet=off -v` for the cache behaviour, and `integration_tests/copy_test.sh` and
-  `integration_tests/test.sh`, which run `prune -exhaustive -exclusive` and a
-  plain `prune` and check the storages afterwards.
-- To check either option does not change results, prune the same pristine copy
-  of a storage with and without it and compare the trees with `diff -rq`; that is
-  how the claims above were verified.
+  -vet=off -v` for the cache behaviour.
+- `-threads` is now visible in three places, so a thread sweep on one repository
+  separates them: the `DOWNLOAD_FILE` lines show the revision loop, the
+  `CHUNK_DOWNLOAD`/`CHUNK_CACHE` counts show the expansion, and the wall clock
+  shows both. To check that the expansion itself overlaps, use a repository whose
+  revisions do not share their chunk list (so there is one group per revision)
+  and watch the chunk downloads interleave under `-d`.
+- To check the change does not alter results, prune the same pristine copy of a
+  storage with and without it and compare the trees with `diff -rq`; that is how
+  the claims above were verified.
