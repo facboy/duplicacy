@@ -785,6 +785,455 @@ func TestPruneDownloadsRevisionsConcurrently(t *testing.T) {
 	}
 }
 
+// deletionTrackingStorage isolates the snapshot-file deletions that PruneSnapshots performs after the chunk phase.  It
+// counts how many of them were in flight at the same time, records the thread index each was attributed to and the
+// order they finished in, and can hold a deletion until the test releases its gate.  Only paths under 'snapshots/' are
+// tracked: the chunk deletions of -exclusive mode go through DeleteFile as well and would otherwise be counted too.
+// Methods not overridden here are promoted from the embedded FileStorage.
+type deletionTrackingStorage struct {
+	*FileStorage
+
+	deleteLock     sync.Mutex
+	deleteInFlight int
+	deletePeak     int
+	deleteThreads  map[int]bool
+	deleteOrder    []string
+
+	// entered is signalled once when a gated deletion has started, and gate holds a deletion until it is closed.
+	entered map[string]chan struct{}
+	gates   map[string]chan struct{}
+
+	// failPaths are the paths whose deletion reports an error instead of deleting.
+	failPaths map[string]bool
+}
+
+func (storage *deletionTrackingStorage) DeleteFile(threadIndex int, filePath string) (err error) {
+
+	if !strings.HasPrefix(filePath, "snapshots/") {
+		return storage.FileStorage.DeleteFile(threadIndex, filePath)
+	}
+
+	storage.deleteLock.Lock()
+	if storage.deleteThreads == nil {
+		storage.deleteThreads = make(map[int]bool)
+	}
+	storage.deleteThreads[threadIndex] = true
+	storage.deleteInFlight++
+	if storage.deleteInFlight > storage.deletePeak {
+		storage.deletePeak = storage.deleteInFlight
+	}
+	entered := storage.entered[filePath]
+	gate := storage.gates[filePath]
+	fail := storage.failPaths[filePath]
+	storage.deleteLock.Unlock()
+
+	if entered != nil {
+		entered <- struct{}{}
+	}
+	if gate != nil {
+		<-gate
+	}
+
+	if fail {
+		err = fmt.Errorf("injected deletion failure for %s", filePath)
+	} else {
+		err = storage.FileStorage.DeleteFile(threadIndex, filePath)
+	}
+
+	storage.deleteLock.Lock()
+	storage.deleteInFlight--
+	storage.deleteOrder = append(storage.deleteOrder, filePath)
+	storage.deleteLock.Unlock()
+
+	return err
+}
+
+// peakConcurrentDeletes returns the largest number of snapshot deletions that were in flight at the same time.
+func (storage *deletionTrackingStorage) peakConcurrentDeletes() int {
+	storage.deleteLock.Lock()
+	defer storage.deleteLock.Unlock()
+	return storage.deletePeak
+}
+
+// numberOfDeleteThreads returns how many distinct thread indexes the snapshot deletions were attributed to.
+func (storage *deletionTrackingStorage) numberOfDeleteThreads() int {
+	storage.deleteLock.Lock()
+	defer storage.deleteLock.Unlock()
+	return len(storage.deleteThreads)
+}
+
+// finishedDeletes returns the snapshot paths in the order their deletions finished.
+func (storage *deletionTrackingStorage) finishedDeletes() []string {
+	storage.deleteLock.Lock()
+	defer storage.deleteLock.Unlock()
+	return append([]string{}, storage.deleteOrder...)
+}
+
+// createPruneDeletionFixture creates 'revisions' snapshots, each referring to its own chunk, and returns a manager whose
+// storage tracks snapshot-file deletions.
+func createPruneDeletionFixture(t *testing.T, testDir string, revisions int) (*SnapshotManager, *deletionTrackingStorage) {
+
+	snapshotManager := createTestSnapshotManager(testDir)
+
+	threadedStorage, err := CreateFileStorage(testDir, false, revisions)
+	if err != nil {
+		t.Errorf("Failed to create the storage: %v", err)
+		return snapshotManager, nil
+	}
+	tracking := &deletionTrackingStorage{
+		FileStorage: threadedStorage,
+		entered:     make(map[string]chan struct{}),
+		gates:       make(map[string]chan struct{}),
+		failPaths:   make(map[string]bool),
+	}
+	snapshotManager.storage = tracking
+
+	now := time.Now().Unix()
+	for revision := 1; revision <= revisions; revision++ {
+		chunkHash := uploadRandomChunk(snapshotManager, 1024)
+		if chunkHash == "" {
+			t.Errorf("Failed to upload a chunk")
+			return snapshotManager, tracking
+		}
+		createTestSnapshot(snapshotManager, "vm1@host1", revision, now-int64(revision)*3600, now, []string{chunkHash}, "tag")
+	}
+
+	return snapshotManager, tracking
+}
+
+// snapshotPathFor returns the storage path of the snapshot file of one revision.
+func snapshotPathFor(revision int) string {
+	return fmt.Sprintf("snapshots/vm1@host1/%d", revision)
+}
+
+// PruneSnapshots deletes the snapshot files of the removed revisions one at a time, so -threads bought nothing for a
+// storage where a delete is a round trip.  The deletions are independent, so they must overlap when more than one
+// thread was asked for, and each worker must stay within the thread count the storage was created with.
+func TestPruneDeletesSnapshotsConcurrently(t *testing.T) {
+
+	setTestingT(t)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%v", r)
+		}
+	}()
+
+	for _, threads := range []int{1, 4} {
+
+		testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+		snapshotManager, tracking := createPruneDeletionFixture(t, testDir, 8)
+		if tracking == nil {
+			return
+		}
+
+		snapshotManager.PruneSnapshots("vm1@host1", "vm1@host1", []int{1, 2, 3, 4, 5, 6, 7, 8}, []string{}, []string{},
+			false, true, []string{}, false, false, false, threads)
+
+		if deleted := len(tracking.finishedDeletes()); deleted != 8 {
+			t.Errorf("With %d threads: expecting 8 snapshot files to be deleted, got %d", threads, deleted)
+			return
+		}
+
+		// A serial loop never has two deletions in flight at the same time.
+		peak := tracking.peakConcurrentDeletes()
+		if threads == 1 && peak != 1 {
+			t.Errorf("With 1 thread: expecting at most one deletion at a time, got %d", peak)
+		}
+		if threads > 1 && peak < 2 {
+			t.Errorf("With %d threads: the snapshot deletions did not overlap, at most %d was in flight at a time",
+				threads, peak)
+		}
+
+		if usedThreads := tracking.numberOfDeleteThreads(); usedThreads > threads {
+			t.Errorf("With %d threads: the deletions used %d different thread indexes, more than the storage accepts",
+				threads, usedThreads)
+		}
+	}
+}
+
+// The lines of the deletion loop are user-visible, so they must stay in revision order however the deletions
+// themselves finish.  The deletions here are held until the test releases them, newest first, so a loop that logged
+// as each deletion finished would print them in reverse order.
+func TestPruneSnapshotDeletionOutputStaysInRevisionOrder(t *testing.T) {
+
+	setTestingT(t)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%v", r)
+		}
+	}()
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	const revisions = 4
+	snapshotManager, tracking := createPruneDeletionFixture(t, testDir, revisions)
+	if tracking == nil {
+		return
+	}
+
+	savedLogFunction := LogFunction
+	capture := &logCapture{}
+	LogFunction = capture.log
+	defer func() {
+		LogFunction = savedLogFunction
+	}()
+
+	// Hold every deletion, and let the test release the newest revision first.
+	entered := make(map[string]chan struct{})
+	gates := make(map[string]chan struct{})
+	for revision := 1; revision <= revisions; revision++ {
+		snapshotPath := snapshotPathFor(revision)
+		entered[snapshotPath] = make(chan struct{}, 1)
+		gates[snapshotPath] = make(chan struct{})
+	}
+	tracking.entered = entered
+	tracking.gates = gates
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		snapshotManager.PruneSnapshots("vm1@host1", "vm1@host1", []int{1, 2, 3, 4}, []string{}, []string{},
+			false, true, []string{}, false, false, false, revisions)
+	}()
+
+	// Wait until every deletion is in flight, so releasing them controls the order they finish in.  A serial loop can
+	// never get this far, which is the point: the order can only be checked against deletions that raced.
+	for revision := 1; revision <= revisions; revision++ {
+		select {
+		case <-entered[snapshotPathFor(revision)]:
+		case <-time.After(10 * time.Second):
+			t.Errorf("The deletions did not overlap: revision %d was still waiting while the others were held", revision)
+			return
+		}
+	}
+
+	// Release the newest revision first and wait for its deletion to finish before releasing the next one, so the
+	// deletions finish in exactly the reverse of revision order.
+	for revision := revisions; revision >= 1; revision-- {
+		close(gates[snapshotPathFor(revision)])
+		expected := revisions - revision + 1
+		deadline := time.Now().Add(10 * time.Second)
+		for len(tracking.finishedDeletes()) < expected {
+			if time.Now().After(deadline) {
+				t.Errorf("The deletion of revision %d never finished", revision)
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Errorf("Prune did not finish after the deletions were released")
+		return
+	}
+
+	// The deletions finished newest first, but the log must still be oldest first.
+	if finishedDeletes := tracking.finishedDeletes(); len(finishedDeletes) != revisions ||
+		finishedDeletes[0] != snapshotPathFor(revisions) {
+		t.Errorf("Expecting the deletions to finish newest first, got %v", finishedDeletes)
+	}
+
+	messages := capture.messages("SNAPSHOT_DELETE")
+	var removals []string
+	for _, message := range messages {
+		if strings.Contains(message, "has been removed") {
+			removals = append(removals, message)
+		}
+	}
+	if len(removals) != revisions {
+		t.Errorf("Expecting %d removal messages, got %d: %v", revisions, len(removals), removals)
+		return
+	}
+	for i, message := range removals {
+		expected := fmt.Sprintf("The snapshot vm1@host1 at revision %d has been removed", i+1)
+		if message != expected {
+			t.Errorf("Expecting %q at position %d, got %q", expected, i, message)
+		}
+	}
+}
+
+// The output must appear while the deletions are still running rather than being held back until the last one has
+// finished.  Here revision 1 is released while the others are still held: its line must already be printed.
+func TestPruneStreamsSnapshotDeletionOutput(t *testing.T) {
+
+	setTestingT(t)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%v", r)
+		}
+	}()
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	const revisions = 4
+	snapshotManager, tracking := createPruneDeletionFixture(t, testDir, revisions)
+	if tracking == nil {
+		return
+	}
+
+	savedLogFunction := LogFunction
+	capture := &logCapture{}
+	LogFunction = capture.log
+	defer func() {
+		LogFunction = savedLogFunction
+	}()
+
+	entered := make(map[string]chan struct{})
+	gates := make(map[string]chan struct{})
+	for revision := 1; revision <= revisions; revision++ {
+		snapshotPath := snapshotPathFor(revision)
+		entered[snapshotPath] = make(chan struct{}, 1)
+		gates[snapshotPath] = make(chan struct{})
+	}
+	tracking.entered = entered
+	tracking.gates = gates
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		snapshotManager.PruneSnapshots("vm1@host1", "vm1@host1", []int{1, 2, 3, 4}, []string{}, []string{},
+			false, true, []string{}, false, false, false, revisions)
+	}()
+
+	for revision := 1; revision <= revisions; revision++ {
+		select {
+		case <-entered[snapshotPathFor(revision)]:
+		case <-time.After(10 * time.Second):
+			t.Errorf("The deletions did not overlap: revision %d was still waiting while the others were held", revision)
+			return
+		}
+	}
+
+	// Release only the oldest revision.  Its line must be printed even though the other three are still held.
+	close(gates[snapshotPathFor(1)])
+
+	removalMessages := func() (removals []string) {
+		for _, message := range capture.messages("SNAPSHOT_DELETE") {
+			if strings.Contains(message, "has been removed") {
+				removals = append(removals, message)
+			}
+		}
+		return removals
+	}
+
+	expectedFirst := "The snapshot vm1@host1 at revision 1 has been removed"
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		removals := removalMessages()
+		if len(removals) > 0 {
+			if removals[0] != expectedFirst {
+				t.Errorf("Expecting %q first, got %q", expectedFirst, removals[0])
+			}
+			if len(removals) != 1 {
+				t.Errorf("The output was not streamed: %d lines were printed before the other deletions finished: %v",
+					len(removals), removals)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("The removal of revision 1 was not printed while the other deletions were still held")
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Let the rest finish so that the command can return.
+	for revision := 2; revision <= revisions; revision++ {
+		close(gates[snapshotPathFor(revision)])
+	}
+
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Errorf("Prune did not finish after the deletions were released")
+		return
+	}
+
+	if removals := removalMessages(); len(removals) != revisions {
+		t.Errorf("Expecting %d removal messages after the run, got %d: %v", revisions, len(removals), removals)
+	}
+}
+
+// A deletion that fails must still stop the command, and it must do so at the same point the serial loop stopped: the
+// revisions before the failure are reported, the failing revision is reported as an error, and the ones after it are
+// not.  The error is raised from the calling goroutine, so a failing worker does not leave the command hung.
+func TestPruneStopsAtTheFirstFailedSnapshotDeletion(t *testing.T) {
+
+	setTestingT(t)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%v", r)
+		}
+	}()
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	const revisions = 4
+	snapshotManager, tracking := createPruneDeletionFixture(t, testDir, revisions)
+	if tracking == nil {
+		return
+	}
+
+	// Revision 3 is the one whose deletion fails.
+	tracking.failPaths[snapshotPathFor(3)] = true
+
+	savedLogFunction := LogFunction
+	capture := &logCapture{}
+	LogFunction = capture.log
+	defer func() {
+		LogFunction = savedLogFunction
+	}()
+
+	// The capture installed above swallows the LOG_ERROR panic, so the command returns false instead of unwinding;
+	// what matters is that it stopped and that the failure names the revision.
+	succeeded := snapshotManager.PruneSnapshots("vm1@host1", "vm1@host1", []int{1, 2, 3, 4}, []string{}, []string{},
+		false, true, []string{}, false, false, false, revisions)
+
+	if succeeded {
+		t.Errorf("A failed deletion should stop the command, but it reported success")
+		return
+	}
+	expectedFailure := "Failed to delete the snapshot vm1@host1 at revision 3: injected deletion failure"
+	failures := capture.failures()
+	if len(failures) != 1 || !strings.Contains(failures[0], expectedFailure) {
+		t.Errorf("Expecting one failure mentioning %q, got %v", expectedFailure, failures)
+	}
+
+	// The revisions before the failure are reported; the failing one and the one after it are not.
+	var printed []string
+	for _, message := range capture.messages("SNAPSHOT_DELETE") {
+		if strings.Contains(message, "has been removed") {
+			printed = append(printed, message)
+		}
+	}
+	expectedPrinted := []string{
+		"The snapshot vm1@host1 at revision 1 has been removed",
+		"The snapshot vm1@host1 at revision 2 has been removed",
+	}
+	if len(printed) != len(expectedPrinted) {
+		t.Errorf("Expecting %d removals before the failure, got %d: %v", len(expectedPrinted), len(printed), printed)
+		return
+	}
+	for i, message := range printed {
+		if message != expectedPrinted[i] {
+			t.Errorf("Expecting %q at position %d, got %q", expectedPrinted[i], i, message)
+		}
+	}
+
+	// The revisions after the failure were still deleted from the storage, since the workers are not stopped early,
+	// but their files must not be reported as removed.
+	if finished := tracking.finishedDeletes(); len(finished) != revisions {
+		t.Errorf("Expecting all %d deletions to have been attempted, got %d: %v", revisions, len(finished), finished)
+	}
+}
+
 // -exhaustive expands the chunk sequence of every revision it keeps, and each of those expansions is a set of metadata
 // chunk downloads -- one round trip per chunk on a storage where a read is a round trip.  The expansions used to be done
 // one revision at a time on the calling goroutine, so -threads did nothing for them; they must now overlap, and the

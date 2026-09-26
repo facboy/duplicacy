@@ -2547,31 +2547,156 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
 		fmt.Fprintf(logFile, "Fossil collection %d saved\n", collectionNumber)
 	}
 
-	// Now delete the snapshot files.
+	// Now delete the snapshot files.  The deletions are independent, so they are performed concurrently when more than
+	// one thread was asked for.  Only the deletions overlap: the log lines and the cache removals are made by the
+	// calling goroutine, in revision order, and each contiguous run of finished deletions is emitted as soon as it
+	// closes, so the output is what the serial loop produced but appears while the deletions are still running.
+	var snapshotsToDelete []*Snapshot
 	for _, snapshots := range allSnapshots {
 		for _, snapshot := range snapshots {
 			if !snapshot.Flag || dryRun {
 				continue
 			}
+			snapshotsToDelete = append(snapshotsToDelete, snapshot)
+		}
+	}
 
-			snapshotPath := fmt.Sprintf("snapshots/%s/%d", snapshot.ID, snapshot.Revision)
-			err = manager.storage.DeleteFile(0, snapshotPath)
-			if err != nil {
+	// A deletion finishes its own slot and wakes the calling goroutine, which emits the finished slots in order.  That
+	// is what keeps the output in revision order however the deletions themselves finish.
+	deleteErrors := make([]error, len(snapshotsToDelete))
+	deleteDone := make([]bool, len(snapshotsToDelete))
+	var deleteLock sync.Mutex
+	deleteCond := sync.NewCond(&deleteLock)
+
+	deleteSnapshotFile := func(threadIndex int, index int) {
+		snapshot := snapshotsToDelete[index]
+		snapshotPath := fmt.Sprintf("snapshots/%s/%d", snapshot.ID, snapshot.Revision)
+
+		deleteErr := manager.storage.DeleteFile(threadIndex, snapshotPath)
+
+		deleteLock.Lock()
+		deleteErrors[index] = deleteErr
+		deleteDone[index] = true
+		deleteCond.Broadcast()
+		deleteLock.Unlock()
+	}
+
+	// removeSnapshot logs the deletion and drops the cached copy of the snapshot file, in that order.
+	removeSnapshot := func(snapshot *Snapshot) {
+		LOG_INFO("SNAPSHOT_DELETE", "The snapshot %s at revision %d has been removed",
+			snapshot.ID, snapshot.Revision)
+
+		snapshotPath := fmt.Sprintf("snapshots/%s/%d", snapshot.ID, snapshot.Revision)
+		err := manager.snapshotCache.DeleteFile(0, snapshotPath)
+		if err != nil {
+			LOG_WARN("SNAPSHOT_DELETE", "The cached snapshot %s at revision %d could not be removed: %v",
+				snapshot.ID, snapshot.Revision, err)
+			fmt.Fprintf(logFile, "Cached snapshot %s at revision %d could not be removed: %v",
+				snapshot.ID, snapshot.Revision, err)
+		} else {
+			fmt.Fprintf(logFile, "Deleted cached snapshot %s at revision %d\n", snapshot.ID, snapshot.Revision)
+		}
+	}
+
+	if threads > 1 && len(snapshotsToDelete) > 1 {
+
+		workerCount := threads
+		if workerCount > len(snapshotsToDelete) {
+			workerCount = len(snapshotsToDelete)
+		}
+
+		nextSnapshot := int64(0)
+		var waitGroup sync.WaitGroup
+		waitGroup.Add(workerCount)
+
+		for i := 0; i < workerCount; i++ {
+			go func(threadIndex int) {
+				index := -1
+				defer waitGroup.Done()
+				defer func() {
+					// A worker unwound by a LOG_ERROR panic must still finish its slot, or the caller would wait for it
+					// forever.
+					if r := recover(); r != nil && index >= 0 {
+						deleteLock.Lock()
+						if !deleteDone[index] {
+							deleteErrors[index] = fmt.Errorf("%v", r)
+							deleteDone[index] = true
+							deleteCond.Broadcast()
+						}
+						deleteLock.Unlock()
+					}
+				}()
+
+				for {
+					index = int(atomic.AddInt64(&nextSnapshot, 1)) - 1
+					if index >= len(snapshotsToDelete) {
+						index = -1
+						return
+					}
+					deleteSnapshotFile(threadIndex, index)
+				}
+			}(i)
+		}
+
+		deleteLock.Lock()
+		nextToRemove := 0
+		failedIndex := -1
+		for nextToRemove < len(snapshotsToDelete) {
+
+			for nextToRemove < len(snapshotsToDelete) && !deleteDone[nextToRemove] {
+				deleteCond.Wait()
+			}
+
+			// Everything before the first unfinished deletion is done, so it can be logged in revision order even
+			// though the deletions finished out of order.
+			var ready []int
+			for nextToRemove < len(snapshotsToDelete) && deleteDone[nextToRemove] {
+				ready = append(ready, nextToRemove)
+				nextToRemove++
+			}
+			deleteLock.Unlock()
+
+			for _, index := range ready {
+				if deleteErrors[index] != nil {
+					// The workers are not stopped early, so the deletions already queued still finish; the first
+					// failure in revision order is the one reported once they have.
+					if failedIndex < 0 {
+						failedIndex = index
+					}
+					continue
+				}
+				if failedIndex >= 0 {
+					// A failure earlier in revision order stopped the command, so this revision is not reported,
+					// which is where the serial loop stopped too.
+					continue
+				}
+				removeSnapshot(snapshotsToDelete[index])
+			}
+
+			deleteLock.Lock()
+		}
+		deleteLock.Unlock()
+
+		// The workers must have finished before the error is reported, since LOG_ERROR unwinds this function and its
+		// callers close the prune log file.
+		waitGroup.Wait()
+
+		if failedIndex >= 0 {
+			snapshot := snapshotsToDelete[failedIndex]
+			LOG_ERROR("SNAPSHOT_DELETE", "Failed to delete the snapshot %s at revision %d: %v",
+				snapshot.ID, snapshot.Revision, deleteErrors[failedIndex])
+			return false
+		}
+	} else {
+		for index := range snapshotsToDelete {
+			deleteSnapshotFile(0, index)
+			if deleteErr := deleteErrors[index]; deleteErr != nil {
+				snapshot := snapshotsToDelete[index]
 				LOG_ERROR("SNAPSHOT_DELETE", "Failed to delete the snapshot %s at revision %d: %v",
-					snapshot.ID, snapshot.Revision, err)
+					snapshot.ID, snapshot.Revision, deleteErr)
 				return false
 			}
-			LOG_INFO("SNAPSHOT_DELETE", "The snapshot %s at revision %d has been removed",
-				snapshot.ID, snapshot.Revision)
-			err = manager.snapshotCache.DeleteFile(0, snapshotPath)
-			if err != nil {
-				LOG_WARN("SNAPSHOT_DELETE", "The cached snapshot %s at revision %d could not be removed: %v",
-					snapshot.ID, snapshot.Revision, err)
-				fmt.Fprintf(logFile, "Cached snapshot %s at revision %d could not be removed: %v",
-					snapshot.ID, snapshot.Revision, err)
-			} else {
-				fmt.Fprintf(logFile, "Deleted cached snapshot %s at revision %d\n", snapshot.ID, snapshot.Revision)
-			}
+			removeSnapshot(snapshotsToDelete[index])
 		}
 	}
 

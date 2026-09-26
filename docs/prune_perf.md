@@ -1,12 +1,13 @@
 # Where `prune` spends its time
 
 Investigation into the performance of `duplicacy prune`, in the style of
-`snapshot_perf.md`, `init_perf.md` and `copy_perf.md`. Four issues were worth
+`snapshot_perf.md`, `init_perf.md` and `copy_perf.md`. Five issues were worth
 fixing and have now been implemented: the serial revision loop
 (`src/duplicacy_snapshotmanager.go`), option 2 below (`src/duplicacy_filestorage.go`
 and `src/duplicacy_chunkoperator.go`), the serial sequence expansion
-(`src/duplicacy_snapshotmanager.go`), and the 100 ms poll in the chunk operator's
-completion wait (`src/duplicacy_chunkoperator.go`); the remaining candidates are
+(`src/duplicacy_snapshotmanager.go`), the 100 ms poll in the chunk operator's
+completion wait (`src/duplicacy_chunkoperator.go`), and the serial snapshot-file
+deletion loop (`src/duplicacy_snapshotmanager.go`); the remaining candidates are
 recorded for a follow-up.
 
 ## Summary
@@ -63,9 +64,15 @@ the entire tick was paid for nothing: a real `prune -r 1-3 -exclusive` on a
 flat rather than proportional to the work. The same wait is shared, so `backup`
 and `check` paid it too; the wait is now woken by the task that finishes last.
 
+The last one is the deletion loop. After the chunk phase, `prune` deletes the
+snapshot file of every revision it removed, one at a time on the calling
+goroutine, so `-threads` did nothing for a delete that is a round trip on a
+cloud backend. It now overlaps them, and while it does so it keeps the
+`has been removed` lines in revision order.
+
 ## Conclusion
 
-Four changes were worth making. The first is the parallel revision loop: the
+Five changes were worth making. The first is the parallel revision loop: the
 snapshot files of a revision are independent, and the parallel helper `list`
 already used was simply never wired into prune, so `-threads` bought nothing for
 the largest per-item cost of the command.
@@ -96,6 +103,15 @@ everything that queues chunk work, `backup` goes from 0.24 s to 0.03 s on the
 same fixture. It costs nothing when the storage is slow, since the wait is what
 the round trips take either way.
 
+The fifth is the deletion loop, which was the last per-item serial cost in the
+command. It ran after the chunk phase and removed each snapshot file one at a
+time, with the same `0` thread index every time. The deletions are independent,
+so they now overlap under `-threads`, and because the `has been removed` lines
+are user-visible the finished deletions are flushed to the log in revision order
+rather than in the order they complete. On a 200-revision repository on a slow
+mount, deleting 150 revisions goes from 0.44 s to 0.37 s at `-threads 8`, and
+`-threads 1` is unchanged.
+
 The candidates left are worth less:
 
 | Candidate | Scope | Local gain | Cloud gain |
@@ -109,7 +125,8 @@ with revisions and with the chunk tree, and it is the command a long-lived
 repository runs most often. That is why it is worth optimising, and why the three
 scaling costs — the serial revision loop, the per-metadata-chunk cache write and
 the serial sequence expansion — were the ones to look at first. All three are now
-fixed, along with the fixed completion-wait tick that sat on top of all of them.
+fixed, along with the fixed completion-wait tick that sat on top of all of them,
+and the deletion loop that followed them.
 
 ## The call path
 
@@ -134,20 +151,21 @@ if toBeDeleted == 0 && !exhaustive { return false }                        // :2
 success = manager.pruneSnapshotsExhaustive(...)                            // :2504
         || manager.pruneSnapshotsNonExhaustive(...)                        // :2506
 manager.chunkOperator.WaitForCompletion()                                  // :2512
-manager.CleanSnapshotCache(latestSnapshot, allSnapshots)                   // :2589
+for ... { manager.storage.DeleteFile(...) }                                // :2550  parallel snapshot deletes
+manager.CleanSnapshotCache(latestSnapshot, allSnapshots)                   // :2714
 ```
 
 The chunk selection and fossilization differ by mode:
 
-- `pruneSnapshotsNonExhaustive` (`:2600`) builds `targetChunks` from the
+- `pruneSnapshotsNonExhaustive` (`:2725`) builds `targetChunks` from the
   snapshots being deleted, then walks the snapshots that are being kept and
   marks the ones that are still referenced. It only expands the sequences
   (`expandSnapshots`, which calls `GetSnapshotChunks` and downloads the chunk
-  sequences) of the snapshots flagged for deletion (`:2634`) and of the ones
-  being kept (`:2641`).
-- `pruneSnapshotsExhaustive` (`:2674`) expands the sequences of every snapshot
-  that is *not* flagged (`:2706`) and then lists the whole chunk tree
-  with `ListAllFiles` (`:2713`).
+  sequences) of the snapshots flagged for deletion (`:2759`) and of the ones
+  being kept (`:2766`).
+- `pruneSnapshotsExhaustive` (`:2799`) expands the sequences of every snapshot
+  that is *not* flagged (`:2831`) and then lists the whole chunk tree
+  with `ListAllFiles` (`:2838`).
 
 So a non-exhaustive prune with nothing to delete stops at `:2495` after the
 snapshot files have been read. An exhaustive prune always expands every
@@ -262,8 +280,8 @@ metadata chunk. The write at `:526` is the one the fix targets; it is now
 `UploadFileNoSync`.
 
 Every other cache access in this area is guarded. `SnapshotManager.downloadFile`
-guards the read (`:2905`) and the write-back (`:2949`), and `UploadFile` guards
-its write (`:2984`). The `list` investigation implemented exactly this rule for
+guards the read (`:3028`) and the write-back (`:3073`), and `UploadFile` guards
+its write (`:3109`). The `list` investigation implemented exactly this rule for
 the snapshot files (`snapshot_perf.md`, candidate #1: "Do not write the snapshot
 cache when `IsCacheNeeded()` is false"). The chunk operator was not part of that
 change.
@@ -463,7 +481,7 @@ unchanged-content run fetches a single one and serves the other 299 revisions
 from the cache. That is the whole difference. The tree walk does grow with the
 chunk tree — with `-v`, `LIST_FILES` ("Listing chunks/...") appears 424 times for
 the 902-chunk fixture against 11 times for the 8-chunk one, since
-`pruneSnapshotsExhaustive` (`:2713`) lists the top directory and every
+`pruneSnapshotsExhaustive` (`:2838`) lists the top directory and every
 subdirectory — but it is a small part of the total next to the per-sequence
 fetches, and it is the same walk `-delete-only` performs.
 
@@ -660,6 +678,115 @@ what the old loop achieved by spinning first.
   prune tests under `-race` are clean. `go vet ./src/` reports the same
   pre-existing findings as on HEAD, and no new ones.
 
+## The snapshot-file deletions were serial too — fixed
+
+This is the fifth cost, and the last per-item serial loop in the command. After
+the chunk phase has fossilized or deleted what it must, `prune` removes the
+snapshot file of every revision it flagged:
+
+```go
+// Now delete the snapshot files.
+for _, snapshots := range allSnapshots {
+    for _, snapshot := range snapshots {
+        if !snapshot.Flag || dryRun { continue }
+        snapshotPath := fmt.Sprintf("snapshots/%s/%d", snapshot.ID, snapshot.Revision)
+        err = manager.storage.DeleteFile(0, snapshotPath)   // threadIndex 0, one at a time
+        ...
+    }
+}
+```
+
+The loop ignored `-threads` exactly as the revision loop and the expansion did,
+and it hard-coded the thread index `0` as well. A delete is a round trip on every
+cloud backend (`S3Storage.DeleteFile` is a `DeleteObject` call, and the others
+are their equivalent), so deleting a large run of revisions was one round trip
+after another.
+
+Measured on a 200-revision repository whose revisions share their metadata, with
+the storage on a slow mount and the cache on ext4, deleting 150 revisions:
+`strace -f -tt -e trace=unlinkat` shows the 150 storage deletes issued by a
+single thread over a 0.285 s span on HEAD.
+
+### How it was implemented
+
+The storage deletions are handed to worker goroutines; the log lines and the
+cache removals stay on the calling goroutine, which keeps the `has been removed`
+lines in revision order:
+
+```go
+deleteErrors := make([]error, len(snapshotsToDelete))
+deleteDone := make([]bool, len(snapshotsToDelete))
+var deleteLock sync.Mutex
+deleteCond := sync.NewCond(&deleteLock)
+
+// A worker deletes one snapshot file and finishes its own slot.
+func deleteSnapshotFile(threadIndex int, index int) {
+    ...
+    deleteErr := manager.storage.DeleteFile(threadIndex, snapshotPath)
+    deleteLock.Lock()
+    deleteErrors[index] = deleteErr
+    deleteDone[index] = true
+    deleteCond.Broadcast()
+    deleteLock.Unlock()
+}
+
+// The caller emits every contiguous run that is now complete, in order.
+for nextToRemove < len(snapshotsToDelete) && failedIndex < 0 {
+    for nextToRemove < len(snapshotsToDelete) && !deleteDone[nextToRemove] {
+        deleteCond.Wait()
+    }
+    for nextToRemove < len(snapshotsToDelete) && deleteDone[nextToRemove] {
+        ready = append(ready, nextToRemove)
+        nextToRemove++
+    }
+    ... // log and drop the cached copy of each ready snapshot
+}
+```
+
+Two points make it correct. The `deleteDone` slot is what decouples the two
+orders: the deletes race, but each one only marks its own slot, and the caller
+emits a slot only once every earlier slot is filled, so the output is the serial
+loop's output. And the flush is a contiguous prefix rather than a wait for the
+whole list, so a line is printed as soon as the gap in front of it closes
+instead of being held until the last delete lands. A worker unwound by a
+`LOG_ERROR` panic fills its own slot in its `recover`, otherwise the caller would
+wait on it forever.
+
+The thread index is the worker's own, so a backend that keeps a per-thread client
+or nested directory (`azureStorage.containers[threadIndex]`, B2's upload URLs)
+sees the same indexes it already sees from the chunk operator, within the count
+the storage was created with.
+
+### Correctness
+
+- `prune -r 1-25 -exclusive` at `-threads 1`, `4` and `8` prints output that is
+  byte-identical to HEAD's, both in full and as the ordered run of
+  `SNAPSHOT_DELETE` "has been removed" lines, and the storage tree digest is
+  identical. The `The chunk ... has been permanently removed` lines that
+  `-exclusive` also prints come from ranging over `targetChunks` and already
+  differ between two HEAD runs, so they are not compared by order.
+- `strace -f -tt -e trace=unlinkat,write` on the 150-deletion run shows the
+  storage deletes issued by 8 worker threads over a 0.13 s span, and 140 of the
+  150 removal lines written while the deletions were still running rather than
+  after the last one.
+- Measured A/B, best of nine with the binaries alternating: 0.44 s → 0.37 s at
+  `-threads 8` and 0.41 s → 0.35 s at `-threads 4`, with `-threads 1` unchanged,
+  so the default path is untouched. On ext4 it is 89 ms vs 87 ms, within noise,
+  since a delete is then one syscall.
+- `TestPruneDeletesSnapshotsConcurrently` checks that the deletions overlap at
+  `-threads 4` and do not at `-threads 1`, and that no worker uses a thread index
+  beyond what the storage accepts. `TestPruneSnapshotDeletionOutputStaysInRevisionOrder`
+  releases the held deletions newest first and checks the log is still oldest
+  first, and `TestPruneStreamsSnapshotDeletionOutput` checks that the oldest
+  revision's line is printed while the others are still held. Each fails if the
+  serial loop is put back.
+- A failed deletion still stops the command at the revision it failed on, and the
+  error is raised from the calling goroutine rather than from a worker, so it
+  cannot be lost with the worker's goroutine.
+  `TestPruneStopsAtTheFirstFailedSnapshotDeletion` pins that down: with revision
+  3 failing, revisions 1 and 2 are reported, 3 and 4 are not, and the command
+  returns false.
+
 ## Smaller items
 
 - **`fossils/` is created unconditionally.** `PruneSnapshots` calls
@@ -794,6 +921,13 @@ what the old loop achieved by spinning first.
   shows both. To check that the expansion itself overlaps, use a repository whose
   revisions do not share their chunk list (so there is one group per revision)
   and watch the chunk downloads interleave under `-d`.
+- The snapshot-file deletions are timed with `strace -f -tt -e trace=unlinkat`,
+  which shows both the number of threads issuing them and the span they cover:
+  one thread over ~0.29 s for 150 revisions on HEAD, eight over ~0.13 s after the
+  fix. `strace -f -tt -e trace=unlinkat,write` also shows the `has been removed`
+  lines landing inside that window. `go test ./src/ -run
+  'TestPruneDeletesSnapshotsConcurrently|TestPruneSnapshotDeletionOutputStaysInRevisionOrder|TestPruneStreamsSnapshotDeletionOutput'
+  -vet=off -v` covers the same three properties without the mount.
 - To check the change does not alter results, prune the same pristine copy of a
   storage with and without it and compare the trees with `diff -rq`; that is how
   the claims above were verified.
