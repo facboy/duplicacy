@@ -672,7 +672,7 @@ what the old loop achieved by spinning first.
 - **The `nesting` probe is paid by every command, prune included.** `prune`
   creates the storage at `duplicacy/duplicacy_main.go:1188` and
   `CreateBackupManager` downloads the config, which ends in
-  `storage.SetNestingLevels(config)` (`src/duplicacy_config.go:476`) and probes
+  `storage.SetNestingLevels(config)` (`src/duplicacy_config.go:493`) and probes
   for a file named `nesting` that nothing writes
   (`src/duplicacy_storage.go:109-126`). This is the same item recorded as a
   candidate in `init_perf.md`; it is one round trip per run.
@@ -684,6 +684,21 @@ what the old loop achieved by spinning first.
   cache's `chunks/` and 46 under the storage's. It scales with the size of the
   cache rather than with the repository, so it costs most on a cache that has
   not been cleaned before.
+- **The chunk cache is read even when the storage needs no cache.** `DownloadChunk`
+  guards the cache with `snapshotCache != nil` alone
+  (`src/duplicacy_chunkoperator.go:331`), where every other cache access in the
+  function's neighbourhood asks `IsCacheNeeded()` first. The cache write-back was
+  left unguarded on purpose (option 2 above), but the read has no such excuse: a
+  storage that declared itself cache-free still pays a `FindChunk` miss per
+  metadata chunk, then writes the entry it will never consult again. On a
+  40-revision ext4 fixture (234 chunks) `prune -r 1-3 -exclusive` issues 193
+  `newfstatat` calls under the cache's `chunks/`, and adding `IsCacheNeeded()`
+  to the read removes all of them: 398 `newfstatat` to 129 and 38 ms to 29 ms.
+  Bounding the read does not disturb a storage that does want the cache, because
+  the condition is true for exactly the storages for which the write-back was
+  already happening. Not implemented; it is a one-line change and the cheapest
+  item in this list, but it belongs with `check`, `list` and `restore`, which
+  share the read.
 - **`prune` with a tag or a retention policy downloads every revision anyway.**
   The tag filter (`:2484`) and the retention policy (`:2433`) are applied after
   the snapshot files have been downloaded, which is unavoidable for the
