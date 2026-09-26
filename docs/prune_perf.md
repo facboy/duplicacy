@@ -672,7 +672,7 @@ what the old loop achieved by spinning first.
 - **The `nesting` probe is paid by every command, prune included.** `prune`
   creates the storage at `duplicacy/duplicacy_main.go:1188` and
   `CreateBackupManager` downloads the config, which ends in
-  `storage.SetNestingLevels(config)` (`src/duplicacy_config.go:476`) and probes
+  `storage.SetNestingLevels(config)` (`src/duplicacy_config.go:493`) and probes
   for a file named `nesting` that nothing writes
   (`src/duplicacy_storage.go:109-126`). This is the same item recorded as a
   candidate in `init_perf.md`; it is one round trip per run.
@@ -684,6 +684,28 @@ what the old loop achieved by spinning first.
   cache's `chunks/` and 46 under the storage's. It scales with the size of the
   cache rather than with the repository, so it costs most on a cache that has
   not been cleaned before.
+- **The chunk cache is read even when the storage needs no cache.** `DownloadChunk`
+  guards the cache with `snapshotCache != nil` alone
+  (`src/duplicacy_chunkoperator.go:331`), where every other cache access nearby
+  asks `IsCacheNeeded()` first. It is not the cheap one-line win it looks like:
+  `cachedPath` is assigned only inside that block, so gating the read gates the
+  write-back with it, and the change is option 1 above rather than a refinement
+  of option 2. On a fast local disk it wins — `list -files` 69 ms → 47 ms,
+  `check` 48 ms → 40 ms, `prune -exhaustive -dry-run` 53 ms → 40 ms on a
+  40-revision ext4 fixture — because there the cache read costs what the storage
+  read costs and only the write is saved. On a storage that is a slow mount with
+  the cache on a fast local disk — an `rclone mount`, an NFS export handed over
+  as a plain path — it loses badly, because the cache is what absorbs the
+  repeated reads of a shared sequence: a 300-revision repository whose revisions
+  all share one metadata sequence (4 chunks) goes `list -files` 605 ms →
+  2649 ms, `check` 620 ms → 1312 ms, `list -chunks` 580 ms → 1258 ms.
+  `strace -f -e trace=openat` shows why: HEAD opens 3 storage chunks and 900
+  cache files, the guard 900 storage chunks and 0 cache files. `prune` itself is
+  flat either way, because the sequence grouping above fetches a shared sequence
+  once. Not implemented: the guard needs `list` and `check` to group shared
+  sequences the way `prune` now does, or the reuse the cache provides today goes
+  with it — which is also why option 1's rejection rests on `list`/`check`
+  rather than on `prune`.
 - **`prune` with a tag or a retention policy downloads every revision anyway.**
   The tag filter (`:2484`) and the retention policy (`:2433`) are applied after
   the snapshot files have been downloaded, which is unavoidable for the
