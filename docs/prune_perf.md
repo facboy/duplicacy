@@ -1,12 +1,13 @@
 # Where `prune` spends its time
 
 Investigation into the performance of `duplicacy prune`, in the style of
-`snapshot_perf.md`, `init_perf.md` and `copy_perf.md`. Three issues were worth
+`snapshot_perf.md`, `init_perf.md` and `copy_perf.md`. Four issues were worth
 fixing and have now been implemented: the serial revision loop
 (`src/duplicacy_snapshotmanager.go`), option 2 below (`src/duplicacy_filestorage.go`
-and `src/duplicacy_chunkoperator.go`), and the serial sequence expansion
-(`src/duplicacy_snapshotmanager.go`); the remaining candidates are recorded for
-a follow-up.
+and `src/duplicacy_chunkoperator.go`), the serial sequence expansion
+(`src/duplicacy_snapshotmanager.go`), and the 100 ms poll in the chunk operator's
+completion wait (`src/duplicacy_chunkoperator.go`); the remaining candidates are
+recorded for a follow-up.
 
 ## Summary
 
@@ -54,9 +55,17 @@ early when there is nothing to delete and does not pay for the expansion at all
 unless a snapshot is actually being removed. The expansion itself is now
 overlapped under `-threads`.
 
+A fourth cost is not part of the work at all. `prune` hands its deletions to the
+chunk operator and then waits for it, and that wait used to poll a counter every
+100 ms. On a fast disk the whole batch finishes in a few milliseconds, so almost
+the entire tick was paid for nothing: a real `prune -r 1-3 -exclusive` on a
+41-revision ext4 fixture took 142 ms before and 40 ms after, and the 100 ms is
+flat rather than proportional to the work. The same wait is shared, so `backup`
+and `check` paid it too; the wait is now woken by the task that finishes last.
+
 ## Conclusion
 
-Three changes were worth making. The first is the parallel revision loop: the
+Four changes were worth making. The first is the parallel revision loop: the
 snapshot files of a revision are independent, and the parallel helper `list`
 already used was simply never wired into prune, so `-threads` bought nothing for
 the largest per-item cost of the command.
@@ -79,6 +88,14 @@ concurrently, and a sequence shared by several revisions is expanded once rather
 than once per revision. `-threads 4` takes a 40-revision fixture from 0.36 s to
 0.30 s locally, and `-threads 1` is unchanged.
 
+The fourth is the completion wait, and it is the cheapest to fix: the operator
+knows when its last task finishes, so it signals a condition variable instead of
+being polled on a 100 ms timer. `prune -r 1-3 -exclusive` on a 41-revision ext4
+fixture goes from 0.15 s to 0.04 s, and because the same helper is used by
+everything that queues chunk work, `backup` goes from 0.24 s to 0.03 s on the
+same fixture. It costs nothing when the storage is slow, since the wait is what
+the round trips take either way.
+
 The candidates left are worth less:
 
 | Candidate | Scope | Local gain | Cloud gain |
@@ -92,7 +109,7 @@ with revisions and with the chunk tree, and it is the command a long-lived
 repository runs most often. That is why it is worth optimising, and why the three
 scaling costs — the serial revision loop, the per-metadata-chunk cache write and
 the serial sequence expansion — were the ones to look at first. All three are now
-fixed.
+fixed, along with the fixed completion-wait tick that sat on top of all of them.
 
 ## The call path
 
@@ -226,13 +243,13 @@ This is the largest finding. `ChunkOperator.DownloadChunk` treated the snapshot
 cache as if it were always required:
 
 ```go
-if task.isMetadata && operator.snapshotCache != nil {                    // :307  no IsCacheNeeded()
+if task.isMetadata && operator.snapshotCache != nil {                    // :331  no IsCacheNeeded()
     chunk.Reset(true)
-    cachedPath, exist, _, err = operator.snapshotCache.FindChunk(...)     // :315
+    cachedPath, exist, _, err = operator.snapshotCache.FindChunk(...)     // :339
     ...
 }
 ...
-if chunk.isMetadata && !chunk.isRawData && len(cachedPath) > 0 {          // :507  no IsCacheNeeded()
+if chunk.isMetadata && !chunk.isRawData && len(cachedPath) > 0 {          // :526  no IsCacheNeeded()
     err := operator.snapshotCache.UploadFileNoSync(threadIndex, cachedPath, chunk.GetBytes())
 }
 ```
@@ -241,12 +258,12 @@ if chunk.isMetadata && !chunk.isRawData && len(cachedPath) > 0 {          // :50
 `len(cachedPath) > 0` is always true when a cache exists: **every** metadata
 chunk is written to `.duplicacy/cache/<storage>/chunks/`, and read back before
 the storage is consulted. On a cold cache that is one miss plus one write per
-metadata chunk. The write at `:507` is the one the fix targets; it is now
+metadata chunk. The write at `:526` is the one the fix targets; it is now
 `UploadFileNoSync`.
 
 Every other cache access in this area is guarded. `SnapshotManager.downloadFile`
-guards the read (`:2903`) and the write-back (`:2949`), and `UploadFile` guards
-its write (`:2985`). The `list` investigation implemented exactly this rule for
+guards the read (`:2905`) and the write-back (`:2949`), and `UploadFile` guards
+its write (`:2984`). The `list` investigation implemented exactly this rule for
 the snapshot files (`snapshot_perf.md`, candidate #1: "Do not write the snapshot
 cache when `IsCacheNeeded()` is false"). The chunk operator was not part of that
 change.
@@ -341,7 +358,7 @@ pristine storage and the outputs and side effects compared:
 The defect admits three fixes. All three leave the storage byte-identical.
 
 1. **Guard the cache with `IsCacheNeeded()`** (`src/duplicacy_chunkoperator.go:307`
-   and `:507`), matching every other cache access in the code. Fastest on a fast
+   and `:526`), matching every other cache access in the code. Fastest on a fast
    disk. It loses badly, however, when one slow mount serves many revisions that
    share their metadata: with the cache gone, the shared chunks are re-read for
    every revision. **Not implemented.**
@@ -550,6 +567,99 @@ behaviour is unchanged.
   suite (`go test ./src/ -run TestPrune -race`) pass, as does the full suite with
   `-race`.
 
+## The completion wait polled every 100 ms — fixed
+
+This is the fourth cost, and unlike the other three it is not proportional to
+anything. `PruneSnapshots` submits its deletions to the chunk operator and then
+waits for them (`src/duplicacy_snapshotmanager.go:2512`), and `backup` and
+`check` do the same (`src/duplicacy_backupmanager.go:496`/`:1127`,
+`src/duplicacy_snapshotmanager.go:1381`). The wait was a poll:
+
+```go
+for atomic.LoadInt64(&operator.numberOfActiveTasks) > 0 {
+    time.Sleep(100 * time.Millisecond)
+}
+```
+
+`Stop` (`src/duplicacy_chunkoperator.go:121`) re-used the same loop before it
+stopped the workers, so it paid the tick as well.
+
+The operator already knows when its last task finishes, so the 100 ms was only
+there because the completion was not signalled. On a fast disk the whole batch
+takes a few milliseconds, which means almost the entire tick was spent waiting
+for nothing. Measured with `strace -f -e trace=futex,nanosleep`, the tick is a Go
+runtime `futex(FUTEX_WAIT, ~99 ms)`: it disappears entirely when the wait is
+woken instead of polling.
+
+### What it costs
+
+A real `prune` that deletes something, on a 41-revision ext4 fixture (233 chunks,
+no cache), best of six, binaries alternating:
+
+| Invocation | HEAD | signalled |
+| --- | --- | --- |
+| `prune -r 1-3 -exclusive` | 142 ms | 40 ms |
+| `prune -r 1-3` (non-exclusive) | 151 ms | 43 ms |
+| `prune -exclusive -r 1-3 -threads 4` | 135 ms | 31 ms |
+
+The cost is a fixed tick, not a scaling one: deleting 1 revision and deleting 20
+both take ~148 ms on HEAD. It is also only paid by invocations that end their run
+with chunk work still outstanding. A `prune` that deletes nothing exits at the
+`:2495` early return and takes ~23 ms, and `-dry-run` and `-delete-only`, which
+submit no deletions, are ~40 ms and ~23 ms either way. That is why the
+`-exhaustive -dry-run` rows in the tables above are unchanged by this fix.
+
+Because the wait is shared, the same tick sat on top of other commands:
+
+| Command | HEAD | signalled |
+| --- | --- | --- |
+| `backup` (one changed file) | 239 ms | 28 ms |
+| `check -chunks` (warm cache) | 51 ms | 30 ms |
+
+### How it was implemented
+
+The counter moved under a mutex that also guards a condition variable, and the
+task that decrements it to zero broadcasts:
+
+```go
+func (operator *ChunkOperator) WaitForCompletion() {
+    operator.completionLock.Lock()
+    for operator.numberOfActiveTasks > 0 {
+        operator.idleCond.Wait()
+    }
+    operator.completionLock.Unlock()
+}
+```
+
+`AddTask` increments the counter *before* pushing the task onto `taskQueue`, not
+after. That ordering is what makes the wait sound: the workers only decrement a
+task once it has been received, so if the increment happened after the push a
+caller that waited in the gap could see a zero count, return, and miss a task
+that was still in the queue. Counting it as outstanding from before the handover
+closes that window, and it is why the counter is now described as "queued or
+running".
+
+`Stop` now waits through the same helper and is made idempotent with a `stopped`
+flag rather than by the `numberOfActiveTasks = -1` sentinel it used before. It
+still stops the workers only after the outstanding tasks have finished, which is
+what the old loop achieved by spinning first.
+
+### Correctness
+
+- `prune -exhaustive -dry-run` prints byte-identical output on HEAD and with the
+  fix, and a real `prune -r 1-5 -exclusive` produces a storage tree that
+  `diff -rq` reports identical.
+- `TestWaitForCompletionIsWokenNotPolled` pins it down. It holds a chunk download
+  in the storage until the test releases it, so the wait cannot be satisfied by a
+  timer: on HEAD the test fails with "took 100.475 ms after the last task
+  finished; it is waiting on a timer, not on the task", and with the fix it
+  passes in well under the 100 ms tick.
+- The full suite passes under `-race`, including the operator, prune, copy and
+  restore tests, which are the ones that exercise `AddTask`, `Run` and `Stop`
+  concurrently. Fifteen repeats of the new test and five of the operator and
+  prune tests under `-race` are clean. `go vet ./src/` reports the same
+  pre-existing findings as on HEAD, and no new ones.
+
 ## Smaller items
 
 - **`fossils/` is created unconditionally.** `PruneSnapshots` calls
@@ -621,9 +731,11 @@ behaviour is unchanged.
   another with no overlap, while under more threads they interleave. Compare
   with `duplicacy -d list` on the same repository.
 - The `CHUNK_DOWNLOAD` ("Chunk ... has been downloaded") and `CHUNK_CACHE`
-  ("loaded from the snapshot cache") counts show the metadata fetches. On a
-  local FileStorage the cache hits *and* the cache writes should not happen; if
-  they do, the unguarded write is active.
+  ("loaded from the snapshot cache") counts show the metadata fetches. The
+  `CHUNK_CACHE` line is what the unguarded write-back leaves behind even on a
+  local path: `DownloadChunk` reads the chunk cache whenever `snapshotCache` is
+  set, without checking `IsCacheNeeded()`, so a local storage reports cache hits
+  although the cache exists only for the storages that ask for one.
 - `duplicacy -d prune ...` prints `SNAPSHOT_DELETE` per revision being removed
   and, for the fossils, `FOSSIL_COLLECT`/`FOSSIL_DELETABLE`. The gap between the
   last `DOWNLOAD_FILE` and the first of those is the chunk-selection phase.
@@ -646,7 +758,14 @@ behaviour is unchanged.
   `go test ./src/ -run 'TestPruneExpandsSequencesConcurrently|TestSharedSequenceIsExpandedOnce|TestDownloadSequencePreservesOrderConcurrently'
   -vet=off -v` for the sequence expansion, and
   `go test ./src/ -run 'TestCorruptCachedChunkIsRefetched|TestSnapshotCacheSkipsSync|TestCorruptNonChunkCacheEntries'
-  -vet=off -v` for the cache behaviour.
+  -vet=off -v` for the cache behaviour, and
+  `go test ./src/ -run 'TestWaitForCompletionIsWokenNotPolled' -vet=off -v` for
+  the completion wait.
+- The completion wait is timed by holding a chunk download until the wait is
+  running and releasing it: on a polled implementation the elapsed time is the
+  whole 100 ms tick regardless of the release, on a signalled one it is the
+  release. `strace -f -e trace=futex,nanosleep` shows the same thing without the
+  test, as a `futex(FUTEX_WAIT, ~99 ms)` that vanishes with the fix.
 - `-threads` is now visible in three places, so a thread sweep on one repository
   separates them: the `DOWNLOAD_FILE` lines show the revision loop, the
   `CHUNK_DOWNLOAD`/`CHUNK_CACHE` counts show the expansion, and the wall clock

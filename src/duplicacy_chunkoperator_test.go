@@ -8,12 +8,107 @@ import (
 	"os"
 	"path"
 	"runtime/debug"
+	"sync"
 	"testing"
 	"time"
 
 	crypto_rand "crypto/rand"
 	"math/rand"
 )
+
+// blockedDownloadStorage holds every chunk download until the test releases it, so that a test can decide exactly when
+// the last outstanding task finishes.
+type blockedDownloadStorage struct {
+	*FileStorage
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (storage *blockedDownloadStorage) DownloadFile(threadIndex int, filePath string, chunk *Chunk) (err error) {
+	storage.once.Do(func() { close(storage.entered) })
+	<-storage.release
+	return storage.FileStorage.DownloadFile(threadIndex, filePath, chunk)
+}
+
+// WaitForCompletion has to be woken by the task that finishes last.  It used to poll the task counter every
+// 100 ms, so a command whose chunk work takes a few milliseconds -- the whole run on a local storage --
+// spent most of the poll interval waiting for nothing.  The download here is held until WaitForCompletion
+// is already waiting on it, so the elapsed time is one poll interval on a polling implementation and the
+// release itself on a signalled one.
+func TestWaitForCompletionIsWokenNotPolled(t *testing.T) {
+
+	setTestingT(t)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%v", r)
+		}
+	}()
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "chunk_operator_test")
+	os.RemoveAll(testDir)
+	os.MkdirAll(testDir, 0700)
+
+	storage, err := CreateFileStorage(testDir, false, 1)
+	if err != nil {
+		t.Errorf("Failed to create the storage: %v", err)
+		return
+	}
+
+	config := CreateConfig()
+
+	content := make([]byte, 4096)
+	for i := range content {
+		content[i] = byte(i)
+	}
+
+	chunk := CreateChunk(config, true)
+	chunk.Reset(true)
+	chunk.Write(content)
+	chunkHash := chunk.GetHash()
+
+	// Upload the chunk with a plain operator, so that there is something for the operator below to download.
+	uploader := CreateChunkOperator(config, storage, nil, false, false, 1, false)
+	uploader.UploadCompletionFunc = func(chunk *Chunk, chunkIndex int, inCache bool, chunkSize int, uploadSize int) {}
+	uploader.Upload(chunk, 0, false)
+	uploader.WaitForCompletion()
+	uploader.Stop()
+
+	blocked := &blockedDownloadStorage{
+		FileStorage: storage,
+		entered:     make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+
+	// No snapshot cache, so that the download goes to the storage and reaches the blocked DownloadFile.
+	operator := CreateChunkOperator(config, blocked, nil, false, false, 1, false)
+	defer operator.Stop()
+
+	operator.DownloadAsync(chunkHash, 0, false, func(downloaded *Chunk, chunkIndex int) {
+		config.PutChunk(downloaded)
+	})
+
+	<-blocked.entered
+
+	start := time.Now()
+	finished := make(chan struct{})
+	go func() {
+		operator.WaitForCompletion()
+		close(finished)
+	}()
+
+	// The download is still held here, so WaitForCompletion is waiting on it and the release is the only thing that can
+	// wake it up.  This sleep is well under the 100 ms poll interval that this test is against.
+	time.Sleep(20 * time.Millisecond)
+	close(blocked.release)
+	<-finished
+
+	if elapsed := time.Since(start); elapsed >= 60*time.Millisecond {
+		t.Errorf("WaitForCompletion took %v after the last task finished; it is waiting on a timer, not on the task",
+			elapsed)
+	}
+}
 
 func TestChunkOperator(t *testing.T) {
 
