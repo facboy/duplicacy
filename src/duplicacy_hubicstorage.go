@@ -92,9 +92,7 @@ func (storage *HubicStorage) ListFiles(threadIndex int, dir string) ([]string, [
 		entries, err := storage.client.ListEntries(storage.storageDir + "/" + dir)
 		if err != nil {
 			if e, ok := err.(HubicError); ok && e.Status == 404 {
-				// The directory does not exist; this is the same as an empty directory.  It happens when the
-				// snapshot id has never been backed up.
-				return nil, nil, nil
+				return emptyListing()
 			}
 			return nil, nil, err
 		}

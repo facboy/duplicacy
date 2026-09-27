@@ -173,9 +173,7 @@ func (storage *SFTPStorage) ListFiles(threadIndex int, dirPath string) (files []
 	})
 	if err != nil {
 		if os.IsNotExist(err) {
-			// The directory does not exist, which means that the snapshot id (or the chunks directory) has
-			// never been created.  A missing directory is the same as an empty directory.
-			return nil, nil, nil
+			return emptyListing()
 		}
 		return nil, nil, err
 	}

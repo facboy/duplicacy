@@ -14,7 +14,7 @@ The branch is 30 commits ahead of `upstream/master`: about 7,000 added lines ove
 the module files. Almost all of it serves one goal — stop `prune`, `copy` and
 `list` paying a round trip per revision, and drop a redundant `fsync`.
 
-The changes work, and the per-backend listing work is factored well. The four
+The changes work, and the per-backend listing work is factored well. The five
 refactorings below have since been applied; what remains of the duplication is
 lower-value and listed in the same order.
 
@@ -26,6 +26,8 @@ Ordered by payoff:
    each have one definition.
 4. Cloud-file detection (applied) — the denial predicate and the sentinel each have
    one definition.
+5. Empty-listing rationale (applied) — the missing-directory explanation is written
+   once.
 
 ## Duplicated code
 
@@ -103,17 +105,18 @@ skip-the-file path limited to the cloud case. Unit tests: `TestIsCloudFileError`
 `TestChunkMakerReadErrorStillAborts` and (Windows only)
 `TestChunkMakerCloudFileDeniedIsSkipped` in `src/duplicacy_chunkmaker_test.go`.
 
-### Missing directory treated as an empty listing — six blocks
+### Missing directory treated as an empty listing — applied
 
-`src/duplicacy_dropboxstorage.go:79`, `src/duplicacy_gcdstorage.go:522`,
-`src/duplicacy_hubicstorage.go:94`, `src/duplicacy_onestorage.go:104`,
-`src/duplicacy_sftpstorage.go:221` and `src/duplicacy_webdavstorage.go:286` each
-assert a backend-specific error and return `nil, nil, nil` under a byte-identical
-two-line comment.
+`src/duplicacy_dropboxstorage.go`, `src/duplicacy_gcdstorage.go`,
+`src/duplicacy_hubicstorage.go`, `src/duplicacy_onestorage.go`,
+`src/duplicacy_sftpstorage.go` and `src/duplicacy_webdavstorage.go` each assert a
+backend-specific error and returned `nil, nil, nil` under a byte-identical two-line
+comment.
 
-The assertions have to stay per backend, as the per-backend file layout requires,
-so the win is small: move the repeated rationale into one documented helper rather
-than repeating it six times.
+Done: `emptyListing()` in `src/duplicacy_storage.go` holds the rationale, and each
+backend calls it once its own "not found" error has been matched. The assertion
+still has to stay per backend, as the per-backend file layout requires, so the win
+is only in the repeated explanation.
 
 ### `chunkOperator.Stop()` and reassignment — five copies
 
@@ -225,11 +228,11 @@ The sentinel is now the named `cloudFileFailure`, shared by the producer in
 
 ## How to apply
 
-The concurrency helper, the raw-chunk copy plumbing, the path and sequence helpers
-and the cloud-file detection have been applied. The recommended order was the
-concurrency helper first, then the raw-chunk copy flow, then the path and sequence
-helpers; the remaining items -- the test scaffolding and the smaller items -- are
-unchanged. The unit tests in `src/` are the safety net:
+The concurrency helper, the raw-chunk copy plumbing, the path and sequence helpers,
+the cloud-file detection and the empty-listing rationale have been applied. The
+recommended order was the concurrency helper first, then the raw-chunk copy flow,
+then the path and sequence helpers; the remaining items -- the test scaffolding and
+the smaller items -- are unchanged. The unit tests in `src/` are the safety net:
 `go test ./src/ -vet=off`. Note the two tests that fail on a pristine checkout for
 unrelated reasons (`TestEntryExcludeByAttribute`, `TestPersistRestore`), and the
 pre-existing `go vet` warnings, both documented in `AGENTS.md`.

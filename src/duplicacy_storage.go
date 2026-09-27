@@ -86,6 +86,14 @@ type StorageBase struct {
 	writeLevel int   // Store the uploaded chunk to this level
 }
 
+// emptyListing is what ListFiles returns when the directory it was asked for doesn't exist.  A missing directory is
+// the same as an empty directory: it happens when a snapshot id has never been backed up, and the callers treat the
+// two cases alike.  Each backend still asserts its own "not found" error, since only it knows how that error is
+// spelled.
+func emptyListing() ([]string, []int64, error) {
+	return nil, nil, nil
+}
+
 // SetRateLimits sets the maximum download and upload rates
 func (storage *StorageBase) SetRateLimits(downloadRateLimit int, uploadRateLimit int) {
 	storage.DownloadRateLimit = downloadRateLimit

@@ -520,9 +520,7 @@ func (storage *GCDStorage) ListFiles(threadIndex int, dir string) ([]string, []i
 			return nil, nil, err
 		}
 		if pathID == "" {
-			// The directory does not exist; this is the same as an empty directory.  It happens when the
-			// snapshot id has never been backed up.
-			return nil, nil, nil
+			return emptyListing()
 		}
 
 		entries, err := storage.listFiles(threadIndex, pathID, true, false)
