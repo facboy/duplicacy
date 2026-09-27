@@ -31,6 +31,25 @@ const (
 	chunkDir     = "chunks/"
 )
 
+// snapshotDir returns the storage directory holding every revision of one snapshot id, with the trailing slash the
+// storage listings expect.
+func snapshotDir(id string) string {
+	return "snapshots/" + id + "/"
+}
+
+// snapshotPath returns the storage path of the snapshot file of one revision: a file directly in the directory
+// snapshotDir names.  UploadFile creates that directory before writing the file.
+func snapshotPath(id string, revision int) string {
+	return snapshotDir(id) + strconv.Itoa(revision)
+}
+
+// chunkIDFromListedPath turns a path listed under 'chunks/' into the id it encodes, by removing the nesting
+// directories the storage lays the file out in.  A fossil is not a chunk, so its '.fsl' suffix is left for the caller:
+// the suffix is what distinguishes a deleted chunk from the chunk of the same id.
+func chunkIDFromListedPath(listedPath string) string {
+	return strings.Replace(listedPath, "/", "", -1)
+}
+
 // FossilCollection contains fossils and temporary files found during a snapshot deletions.
 type FossilCollection struct {
 
@@ -229,10 +248,10 @@ func (manager *SnapshotManager) DownloadSnapshot(snapshotID string, revision int
 func (manager *SnapshotManager) downloadSnapshot(snapshotID string, revision int, listed bool, chunk *Chunk,
 	threadIndex int) *Snapshot {
 
-	snapshotPath := fmt.Sprintf("snapshots/%s/%d", snapshotID, revision)
+	path := snapshotPath(snapshotID, revision)
 
 	if !listed {
-		exist, _, _, err := manager.storage.GetFileInfo(threadIndex, snapshotPath)
+		exist, _, _, err := manager.storage.GetFileInfo(threadIndex, path)
 		if err != nil {
 			LOG_ERROR("SNAPSHOT_INFO", "Failed to get the information on the snapshot %s at revision %d: %v",
 				snapshotID, revision, err)
@@ -245,7 +264,7 @@ func (manager *SnapshotManager) downloadSnapshot(snapshotID string, revision int
 		}
 	}
 
-	description := manager.downloadFile(snapshotPath, snapshotPath, chunk, threadIndex)
+	description := manager.downloadFile(path, path, chunk, threadIndex)
 
 	snapshot, err := CreateSnapshotFromDescription(description)
 
@@ -388,14 +407,10 @@ func (manager *SnapshotManager) expandSnapshots(snapshots []*Snapshot, threads i
 	// The file, chunk and length sequences only have to be turned into ids; only the chunk-hash sequence is the
 	// expansion, and its result is shared by every snapshot in the group.
 	for i, snapshot := range snapshots {
-		for _, chunkHash := range snapshot.FileSequence {
-			chunkLists[i] = append(chunkLists[i], manager.config.GetChunkIDFromHash(chunkHash))
-		}
-		for _, chunkHash := range snapshot.ChunkSequence {
-			chunkLists[i] = append(chunkLists[i], manager.config.GetChunkIDFromHash(chunkHash))
-		}
-		for _, chunkHash := range snapshot.LengthSequence {
-			chunkLists[i] = append(chunkLists[i], manager.config.GetChunkIDFromHash(chunkHash))
+		for _, sequence := range snapshot.MetadataSequences() {
+			for _, chunkHash := range sequence {
+				chunkLists[i] = append(chunkLists[i], manager.config.GetChunkIDFromHash(chunkHash))
+			}
 		}
 		chunkLists[i] = append(chunkLists[i], expanded[sequenceIndex[sequenceKey(snapshot.ChunkSequence)]]...)
 	}
@@ -592,7 +607,7 @@ func (manager *SnapshotManager) CleanSnapshotCache(latestSnapshot *Snapshot, all
 	allFiles, _ := manager.ListAllFiles(manager.snapshotCache, chunkDir)
 	for _, file := range allFiles {
 		if len(file) > 0 && file[len(file)-1] != '/' {
-			chunkID := strings.Replace(file, "/", "", -1)
+			chunkID := chunkIDFromListedPath(file)
 			if _, found := chunks[chunkID]; !found {
 				LOG_DEBUG("SNAPSHOT_CLEAN", "Delete chunk %s from the snapshot cache", chunkID)
 				err := manager.snapshotCache.DeleteFile(0, path.Join("chunks", file))
@@ -632,9 +647,7 @@ func (manager *SnapshotManager) ListSnapshotRevisions(snapshotID string) (revisi
 
 	LOG_TRACE("SNAPSHOT_LIST_REVISIONS", "Listing revisions for snapshot %s", snapshotID)
 
-	snapshotDir := fmt.Sprintf("snapshots/%s/", snapshotID)
-
-	files, _, err := manager.storage.ListFiles(0, snapshotDir)
+	files, _, err := manager.storage.ListFiles(0, snapshotDir(snapshotID))
 	if err != nil {
 		return nil, err
 	}
@@ -721,16 +734,10 @@ func (manager *SnapshotManager) ListAllFiles(storage Storage, top string) (allFi
 // keepChunkHashes is true, snapshot.ChunkHashes will be populated.
 func (manager *SnapshotManager) GetSnapshotChunks(snapshot *Snapshot, keepChunkHashes bool) (chunks []string) {
 
-	for _, chunkHash := range snapshot.FileSequence {
-		chunks = append(chunks, manager.config.GetChunkIDFromHash(chunkHash))
-	}
-
-	for _, chunkHash := range snapshot.ChunkSequence {
-		chunks = append(chunks, manager.config.GetChunkIDFromHash(chunkHash))
-	}
-
-	for _, chunkHash := range snapshot.LengthSequence {
-		chunks = append(chunks, manager.config.GetChunkIDFromHash(chunkHash))
+	for _, sequence := range snapshot.MetadataSequences() {
+		for _, chunkHash := range sequence {
+			chunks = append(chunks, manager.config.GetChunkIDFromHash(chunkHash))
+		}
 	}
 
 	if len(snapshot.ChunkHashes) == 0 {
@@ -758,25 +765,13 @@ func (manager *SnapshotManager) GetSnapshotChunks(snapshot *Snapshot, keepChunkH
 // GetSnapshotChunkHashes has an option to retrieve chunk hashes in addition to chunk ids.
 func (manager *SnapshotManager) GetSnapshotChunkHashes(snapshot *Snapshot, chunkHashes *map[string]bool, chunkIDs map[string]bool) {
 
-	for _, chunkHash := range snapshot.FileSequence {
-		if chunkHashes != nil {
-			(*chunkHashes)[chunkHash] = true
+	for _, sequence := range snapshot.MetadataSequences() {
+		for _, chunkHash := range sequence {
+			if chunkHashes != nil {
+				(*chunkHashes)[chunkHash] = true
+			}
+			chunkIDs[manager.config.GetChunkIDFromHash(chunkHash)] = true
 		}
-		chunkIDs[manager.config.GetChunkIDFromHash(chunkHash)] = true
-	}
-
-	for _, chunkHash := range snapshot.ChunkSequence {
-		if chunkHashes != nil {
-			(*chunkHashes)[chunkHash] = true
-		}
-		chunkIDs[manager.config.GetChunkIDFromHash(chunkHash)] = true
-	}
-
-	for _, chunkHash := range snapshot.LengthSequence {
-		if chunkHashes != nil {
-			(*chunkHashes)[chunkHash] = true
-		}
-		chunkIDs[manager.config.GetChunkIDFromHash(chunkHash)] = true
 	}
 
 	if len(snapshot.ChunkHashes) == 0 {
@@ -995,7 +990,7 @@ func (manager *SnapshotManager) CheckSnapshots(snapshotID string, revisionsToChe
 			continue
 		}
 
-		chunk = strings.Replace(chunk, "/", "", -1)
+		chunk = chunkIDFromListedPath(chunk)
 		chunkSizeMap[chunk] = allSizes[i]
 
 		if allSizes[i] == 0 && !strings.HasSuffix(chunk, ".tmp") {
@@ -2269,9 +2264,7 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
 
 			for _, fossil := range collection.Fossils {
 
-				chunk := fossil[len(chunkDir):]
-				chunk = strings.Replace(chunk, "/", "", -1)
-				chunk = strings.Replace(chunk, ".fsl", "", -1)
+				chunk := strings.TrimSuffix(chunkIDFromListedPath(fossil[len(chunkDir):]), ".fsl")
 
 				if _, found := newChunks[chunk]; found {
 					// The fossil is referenced so it can't be deleted.
@@ -2493,9 +2486,8 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
 
 	deleteSnapshotFile := func(threadIndex int, index int) {
 		snapshot := snapshotsToDelete[index]
-		snapshotPath := fmt.Sprintf("snapshots/%s/%d", snapshot.ID, snapshot.Revision)
 
-		deleteErr := manager.storage.DeleteFile(threadIndex, snapshotPath)
+		deleteErr := manager.storage.DeleteFile(threadIndex, snapshotPath(snapshot.ID, snapshot.Revision))
 
 		deleteLock.Lock()
 		deleteErrors[index] = deleteErr
@@ -2509,8 +2501,7 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
 		LOG_INFO("SNAPSHOT_DELETE", "The snapshot %s at revision %d has been removed",
 			snapshot.ID, snapshot.Revision)
 
-		snapshotPath := fmt.Sprintf("snapshots/%s/%d", snapshot.ID, snapshot.Revision)
-		err := manager.snapshotCache.DeleteFile(0, snapshotPath)
+		err := manager.snapshotCache.DeleteFile(0, snapshotPath(snapshot.ID, snapshot.Revision))
 		if err != nil {
 			LOG_WARN("SNAPSHOT_DELETE", "The cached snapshot %s at revision %d could not be removed: %v",
 				snapshot.ID, snapshot.Revision, err)
@@ -2791,8 +2782,7 @@ func (manager *SnapshotManager) pruneSnapshotsExhaustive(referencedFossils map[s
 			// collection file after making it a fossil.
 			if _, found := referencedFossils[file]; !found {
 
-				chunk := strings.Replace(file, "/", "", -1)
-				chunk = strings.Replace(chunk, ".fsl", "", -1)
+				chunk := strings.TrimSuffix(chunkIDFromListedPath(file), ".fsl")
 
 				if _, found := referencedChunks[chunk]; found {
 
@@ -2824,7 +2814,7 @@ func (manager *SnapshotManager) pruneSnapshotsExhaustive(referencedFossils map[s
 			continue
 		}
 
-		chunk := strings.Replace(file, "/", "", -1)
+		chunk := chunkIDFromListedPath(file)
 
 		if !chunkRegex.MatchString(chunk) {
 			LOG_WARN("CHUNK_UNKNOWN_FILE", "File %s is not a chunk", file)

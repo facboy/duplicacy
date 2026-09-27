@@ -14,16 +14,16 @@ The branch is 30 commits ahead of `upstream/master`: about 7,000 added lines ove
 the module files. Almost all of it serves one goal — stop `prune`, `copy` and
 `list` paying a round trip per revision, and drop a redundant `fsync`.
 
-The changes work, and the per-backend listing work is factored well. The
-concurrency helper and the raw-chunk copy plumbing below have since been applied;
-the remaining shapes nevertheless repeat often enough that a few small helpers
-would shorten the code further: snapshot paths are built in six places.
+The changes work, and the per-backend listing work is factored well. The three
+refactorings below have since been applied; what remains of the duplication is
+lower-value and listed in the same order.
 
 Ordered by payoff:
 
 1. Concurrency helper (applied) — the fan-out is now one helper.
 2. Raw-chunk copy plumbing (applied) — the raw flag has one producer.
-3. Path and sequence helpers — small, local, mechanical.
+3. Path and sequence helpers (applied) — the storage layout and the chunk-id walk
+   each have one definition.
 
 ## Duplicated code
 
@@ -49,41 +49,44 @@ indices, so it is out of scope for a fan-out helper.
 still has its own, because a worker unwound by a panic must still finish its slot to
 wake the emitter.
 
-### Mapping the three sequences to chunk ids — three implementations
+### Mapping the three sequences to chunk ids — applied
 
-`snapshot.FileSequence`, `ChunkSequence` and `LengthSequence` are walked and mapped
-through `config.GetChunkIDFromHash` in:
+`snapshot.FileSequence`, `ChunkSequence` and `LengthSequence` were walked and mapped
+through `config.GetChunkIDFromHash` in `expandSnapshots`, `GetSnapshotChunks`,
+`GetSnapshotChunkHashes` and `CopySnapshots`, and the file sequence alone was
+walked in `CheckSnapshots`.
 
-- `src/duplicacy_snapshotmanager.go:433-443` (`expandSnapshots`, added)
-- `src/duplicacy_snapshotmanager.go:767-792` (`GetSnapshotChunks`)
-- `src/duplicacy_snapshotmanager.go:804-823` (`GetSnapshotChunkHashes`)
-- `src/duplicacy_backupmanager.go:1701-1711` and
-  `src/duplicacy_snapshotmanager.go:1016-1020` walk the same fields
+Done: `Snapshot.MetadataSequences` returns the three sequences as one slice, so
+"which chunks does this snapshot reference" has one definition. `expandSnapshots`
+still expands per group, but no longer re-derives which fields hold the sequences.
+`expandChunkHashes` remains the only variant that downloads. Unit test:
+`TestMetadataSequences` in `src/duplicacy_snapshotmanager_test.go`.
 
-`expandSnapshots` re-derives what `GetSnapshotChunks` already does, because it
-needs the expansions separated per group. A method on `Snapshot` that yields the
-three sequences would give one definition of which chunks a snapshot references,
-with `expandChunkHashes` remaining the only variant that downloads.
+### Snapshot path building — applied
 
-### Snapshot path building — six copies
+`fmt.Sprintf("snapshots/%s/%d", ...)` appeared in six places: the upload in
+`UploadSnapshot`, the destination existence check and the snapshot file upload in
+`CopySnapshots`, the download in `downloadSnapshot`, and both halves of the prune
+deletion.
 
-`fmt.Sprintf("snapshots/%s/%d", ...)` appears at
-`src/duplicacy_backupmanager.go:1140`, `:1659`, `:1882` and
-`src/duplicacy_snapshotmanager.go:232`, `:2573`, `:2589`. Two of those are new and
-sit ten lines apart inside one function.
+Done: `snapshotDir(id)` and `snapshotPath(id, revision)` hold the layout and every
+builder calls them. `UploadFile` still derives the containing directory from the
+path it is handed, because it uploads an arbitrary non-chunk file rather than a
+snapshot file, so that derivation is not the snapshot layout. Unit test:
+`TestSnapshotPathHelpers` in `src/duplicacy_snapshotmanager_test.go`.
 
-`UploadFile` (`src/duplicacy_snapshotmanager.go:3094`) independently slices the
-same string to recover the parent directory, so the storage layout now lives in
-two places. A `snapshotPath(id, revision)` and `snapshotDir(id)` pair would put it
-in one.
+### Chunk id recovered from a listed path — applied
 
-### Chunk id recovered from a listed path — seven copies
+`strings.Replace(x, "/", "", -1)` appeared at seven sites: the backup chunk
+listing, the destination chunk listing in `CopySnapshots`, the snapshot cache
+clean, the snapshot check, and three places in prune.
 
-`strings.Replace(x, "/", "", -1)` at `src/duplicacy_backupmanager.go:203`, `:1764`
-and `src/duplicacy_snapshotmanager.go:638`, `:1075`, `:2350`, `:2871`, `:2904`.
-The pair "strip the slashes, then strip `.fsl`" appears twice (`:2349-2351`,
-`:2871-2872`). A `chunkIDFromListedPath(string) string` helper would make the
-fossil and chunk cases read the same.
+Done: `chunkIDFromListedPath` removes the nesting directories in one place. It
+deliberately keeps the `.fsl` suffix, because that suffix is what tells a caller an
+entry is a fossil rather than a chunk -- the copy's listing relies on it to reject a
+fossil with its `len(...) != 64` guard, and the two prune sites that want the id
+strip the suffix themselves. Unit test: `TestChunkIDFromListedPath` in
+`src/duplicacy_snapshotmanager_test.go`.
 
 ### OneDrive cloud-file detection — two identical blocks, three files agreeing
 
@@ -173,10 +176,13 @@ as they are lives with the one caller that knows it. Unit tests for both halves 
 `src/duplicacy_chunkoperator_test.go`; `TestCopySnapshots` still covers the
 end-to-end byte-for-byte copy.
 
-### Path and sequence helpers
+### Path and sequence helpers (applied)
 
-`snapshotPath`/`snapshotDir`, `chunkIDFromListedPath`, and a `Snapshot` accessor
-for the three sequences. Each is small and local.
+Done: `snapshotDir`/`snapshotPath` in `src/duplicacy_snapshotmanager.go`,
+`chunkIDFromListedPath` there too, and `Snapshot.MetadataSequences` in
+`src/duplicacy_snapshot.go`. Each was small and local, and each replaced copies that
+could have drifted apart; all three are covered by the unit tests named in the
+sections above.
 
 ### The string sentinel in `AddData`
 
@@ -213,10 +219,11 @@ consumer in `duplicacy_backupmanager.go`.
 
 ## How to apply
 
-The concurrency helper and the raw-chunk copy plumbing have been applied; the rest
-of this review is unchanged. The recommended order was the concurrency helper
-first, then the raw-chunk copy flow, then the path and sequence helpers. The unit
-tests in `src/` are the safety net:
+The concurrency helper, the raw-chunk copy plumbing and the path and sequence
+helpers have been applied. The recommended order was the concurrency helper first,
+then the raw-chunk copy flow, then the path and sequence helpers; the remaining
+items -- the `AddData` sentinel, the test scaffolding and the smaller items -- are
+unchanged. The unit tests in `src/` are the safety net:
 `go test ./src/ -vet=off`. Note the two tests that fail on a pristine checkout for
 unrelated reasons (`TestEntryExcludeByAttribute`, `TestPersistRestore`), and the
 pre-existing `go vet` warnings, both documented in `AGENTS.md`.

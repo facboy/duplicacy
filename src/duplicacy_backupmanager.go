@@ -200,7 +200,7 @@ func (manager *BackupManager) Backup(top string, quickMode bool, threads int, ta
 				continue
 			}
 
-			chunk = strings.Replace(chunk, "/", "", -1)
+			chunk = chunkIDFromListedPath(chunk)
 			chunkCache[chunk] = true
 		}
 
@@ -1137,7 +1137,7 @@ func (manager *BackupManager) UploadSnapshot(chunkOperator *ChunkOperator, top s
 		return int64(0), 0, int64(0), int64(0)
 	}
 
-	path := fmt.Sprintf("snapshots/%s/%d", manager.snapshotID, snapshot.Revision)
+	path := snapshotPath(manager.snapshotID, snapshot.Revision)
 	if !manager.config.dryRun {
 		manager.SnapshotManager.UploadFile(path, path, description)
 	}
@@ -1656,8 +1656,7 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 
 			exist := otherRevisionMap[revision]
 			if !listDestination {
-				snapshotPath := fmt.Sprintf("snapshots/%s/%d", id, revision)
-				exist, _, _, err = otherManager.storage.GetFileInfo(0, snapshotPath)
+				exist, _, _, err = otherManager.storage.GetFileInfo(0, snapshotPath(id, revision))
 				if err != nil {
 					LOG_ERROR("SNAPSHOT_INFO", "Failed to check if there is a snapshot %s at revision %d: %v",
 						id, revision, err)
@@ -1698,16 +1697,10 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 
 		LOG_TRACE("SNAPSHOT_COPY", "Copying snapshot %s at revision %d", snapshot.ID, snapshot.Revision)
 
-		for _, chunkHash := range snapshot.FileSequence {
-			chunks[chunkHash] = true  // The chunk is a snapshot chunk
-		}
-
-		for _, chunkHash := range snapshot.ChunkSequence {
-			chunks[chunkHash] = true  // The chunk is a snapshot chunk
-		}
-
-		for _, chunkHash := range snapshot.LengthSequence {
-			chunks[chunkHash] = true  // The chunk is a snapshot chunk
+		for _, sequence := range snapshot.MetadataSequences() {
+			for _, chunkHash := range sequence {
+				chunks[chunkHash] = true  // The chunk is a snapshot chunk
+			}
 		}
 
 		description := manager.SnapshotManager.DownloadSequence(snapshot.ChunkSequence)
@@ -1761,7 +1754,7 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 		otherChunkFiles, otherChunkSizes := otherManager.SnapshotManager.ListAllFiles(otherManager.storage, "chunks/")
 
 		for i, otherChunkID := range otherChunkFiles {
-			otherChunkID = strings.Replace(otherChunkID, "/", "", -1)
+			otherChunkID = chunkIDFromListedPath(otherChunkID)
 			if len(otherChunkID) != 64 {
 				continue
 			}
@@ -1879,7 +1872,7 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 			continue
 		}
 		description, _ := snapshot.MarshalJSON()
-		path := fmt.Sprintf("snapshots/%s/%d", snapshot.ID, snapshot.Revision)
+		path := snapshotPath(snapshot.ID, snapshot.Revision)
 		otherManager.SnapshotManager.UploadFile(path, path, description)
 		LOG_INFO("SNAPSHOT_COPY", "Copied snapshot %s at revision %d", snapshot.ID, snapshot.Revision)
 	}

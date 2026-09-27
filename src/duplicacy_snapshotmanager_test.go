@@ -176,7 +176,7 @@ func createTestSnapshot(manager *SnapshotManager, snapshotID string, revision in
 	snapshot.ChunkSequence = []string{uploadTestChunk(manager, sequence)}
 
 	description, _ := snapshot.MarshalJSON()
-	path := fmt.Sprintf("snapshots/%s/%d", snapshotID, snapshot.Revision)
+	path := snapshotPath(snapshotID, snapshot.Revision)
 	manager.UploadFile(path, path, description)
 }
 
@@ -301,7 +301,7 @@ func createTestSnapshotWithFiles(manager *SnapshotManager, snapshotID string, re
 	}
 
 	description, _ := snapshot.MarshalJSON()
-	path := fmt.Sprintf("snapshots/%s/%d", snapshotID, revision)
+	path := snapshotPath(snapshotID, revision)
 	manager.UploadFile(path, path, description)
 
 	return fileHashes
@@ -324,7 +324,7 @@ func checkTestSnapshots(manager *SnapshotManager, expectedSnapshots int, expecte
 		if file[len(file)-1] == '/' {
 			continue
 		}
-		chunk := strings.Replace(file, "/", "", -1)
+		chunk := chunkIDFromListedPath(file)
 		chunks[chunk] = false
 	}
 
@@ -904,6 +904,60 @@ func createPruneDeletionFixture(t *testing.T, testDir string, revisions int) (*S
 // snapshotPathFor returns the storage path of the snapshot file of one revision.
 func snapshotPathFor(revision int) string {
 	return fmt.Sprintf("snapshots/vm1@host1/%d", revision)
+}
+
+// Both the reading and the writing side derive the path of a snapshot file from snapshotDir and snapshotPath, so the
+// storage layout is defined once.  This pins that layout: the snapshot file of a revision sits directly in the
+// directory named after the snapshot id, and the directory carries the trailing slash the listings expect.
+func TestSnapshotPathHelpers(t *testing.T) {
+
+	if dir := snapshotDir("vm1@host1"); dir != "snapshots/vm1@host1/" {
+		t.Errorf("snapshotDir returned %q instead of %q", dir, "snapshots/vm1@host1/")
+	}
+	if file := snapshotPath("vm1@host1", 3); file != "snapshots/vm1@host1/3" {
+		t.Errorf("snapshotPath returned %q instead of %q", file, "snapshots/vm1@host1/3")
+	}
+}
+
+// A chunk listed under 'chunks/' arrives as the nested path the storage lays it out in.  chunkIDFromListedPath has to
+// recover the 64-character id from it, and it has to leave the '.fsl' suffix of a fossil alone: the suffix is what
+// tells a caller that the entry is a fossil rather than a chunk.
+func TestChunkIDFromListedPath(t *testing.T) {
+
+	chunkID := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	// The nesting directories are the first bytes of the id itself, so removing the separators has to return the id
+	// unchanged.
+	nestedPath := chunkID[:2] + "/" + chunkID[2:4] + "/" + chunkID[4:]
+
+	if id := chunkIDFromListedPath(nestedPath); id != chunkID {
+		t.Errorf("chunkIDFromListedPath returned %q instead of %q", id, chunkID)
+	}
+	if fossil := chunkIDFromListedPath(nestedPath + ".fsl"); fossil != chunkID+".fsl" {
+		t.Errorf("chunkIDFromListedPath returned %q instead of %q for a fossil", fossil, chunkID+".fsl")
+	}
+}
+
+// The three metadata sequences are what 'which chunks does this snapshot reference' means, and the chunk-id walk
+// depends on seeing all of them.  MetadataSequences is the one definition of that set.
+func TestMetadataSequences(t *testing.T) {
+
+	snapshot := &Snapshot{
+		FileSequence:   []string{"file"},
+		ChunkSequence:  []string{"chunks"},
+		LengthSequence: []string{"lengths"},
+	}
+
+	sequences := snapshot.MetadataSequences()
+	if len(sequences) != 3 {
+		t.Errorf("MetadataSequences returned %d sequences instead of 3", len(sequences))
+		return
+	}
+	for i, expected := range []string{"file", "chunks", "lengths"} {
+		if len(sequences[i]) != 1 || sequences[i][0] != expected {
+			t.Errorf("MetadataSequences returned %v at index %d instead of the %s sequence", sequences[i], i, expected)
+		}
+	}
 }
 
 // PruneSnapshots deletes the snapshot files of the removed revisions one at a time, so -threads bought nothing for a
