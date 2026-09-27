@@ -1855,13 +1855,13 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 			newChunk := otherManager.config.GetChunk()
 			if bitIdentical {
 				// The downloaded bytes are already in the form the destination stores them, so the chunk is uploaded
-				// as it is.  Setting the raw flag last leaves the checksum computed over the whole buffer.
-				newChunk.WriteRawData(chunk.GetBytes(), chunk.GetHash())
+				// as it is, under the hash it was downloaded from rather than the one recomputed from the bytes.
+				newChunk.WriteRawData(chunk.GetBytes(), chunkHash)
 			} else {
 				newChunk.Reset(true)
 				newChunk.Write(chunk.GetBytes())
 			}
-			newChunk.isMetadata = chunks[chunk.GetHash()]
+			newChunk.isMetadata = chunks[chunkHash]
 			chunkUploader.Upload(newChunk, chunkIndex, newChunk.isMetadata)
 			manager.config.PutChunk(chunk)
 		})

@@ -15,14 +15,14 @@ the module files. Almost all of it serves one goal — stop `prune`, `copy` and
 `list` paying a round trip per revision, and drop a redundant `fsync`.
 
 The changes work, and the per-backend listing work is factored well. The
-concurrency helper below has since been applied; the remaining shapes nevertheless
-repeat often enough that a few small helpers would shorten the code further:
-snapshot paths are built in six places.
+concurrency helper and the raw-chunk copy plumbing below have since been applied;
+the remaining shapes nevertheless repeat often enough that a few small helpers
+would shorten the code further: snapshot paths are built in six places.
 
 Ordered by payoff:
 
 1. Concurrency helper (applied) — the fan-out is now one helper.
-2. Raw-chunk copy plumbing — four flags set from four call sites for one flow.
+2. Raw-chunk copy plumbing (applied) — the raw flag has one producer.
 3. Path and sequence helpers — small, local, mechanical.
 
 ## Duplicated code
@@ -147,21 +147,31 @@ too. The prune deletion loop was left alone, because it needs per-index completi
 rather than fire-and-forget. Unit tests for the helper are in
 `src/duplicacy_concurrency_test.go`.
 
-### Raw-chunk copy plumbing
+### Raw-chunk copy plumbing (applied)
 
-The branch adds `ChunkOperator.skipChunkCheck`, `ChunkOperator.rawData`,
+The branch added `ChunkOperator.skipChunkCheck`, `ChunkOperator.rawData`,
 `Chunk.isRawData`, `Chunk.WriteRawData` and `Chunk.SetRawData`, driven from
 `src/duplicacy_backupmanager.go:1822`, `:1830`, `:1859` and
 `src/duplicacy_chunkoperator.go:457`.
 
-There is a real redundancy: the raw download calls `SetRawData(task.chunkHash)`,
-and the copy completion then calls `WriteRawData(chunk.GetBytes(),
-chunk.GetHash())`, which calls `SetRawData` a second time. One flag is set through
-two mechanisms. Either the downloader should hand over a chunk the uploader
-uploads unchanged, or there should be a single constructor for "a stored chunk
-copied verbatim" and a single operator flag. Two booleans plus a chunk flag, set
-from four call sites, is the part of the branch a reader is most likely to get
-wrong.
+The redundancy was this: the raw download called `SetRawData(task.chunkHash)`, and
+the copy completion then called `WriteRawData(chunk.GetBytes(), chunk.GetHash())`,
+which called `SetRawData` a second time. One flag was set through two mechanisms,
+so the reader and the writer could disagree with nothing to catch it.
+
+Done: `Chunk.WriteRawData` is now the only constructor for a chunk in stored form
+and the only place that sets `isRawData`; it takes the hash the chunk was stored
+under, and the copy supplies the `chunkHash` it is iterating over rather than one
+recomputed from the bytes. The downloader no longer marks the downloaded chunk as
+raw -- that chunk is not the one uploaded, it belongs to the source config and pool
+-- and instead records only the hash and id through `Chunk.SetStoredHash`, the
+identity half of the constructor, which the reader cannot compute because it skips
+the decryption that would have produced them. `ChunkOperator.rawData` therefore
+means just "hand back the stored bytes", and the decision that they can be uploaded
+as they are lives with the one caller that knows it. Unit tests for both halves are
+`TestWriteRawData` in `src/duplicacy_chunk_test.go` and `TestDownloadRawChunk` in
+`src/duplicacy_chunkoperator_test.go`; `TestCopySnapshots` still covers the
+end-to-end byte-for-byte copy.
 
 ### Path and sequence helpers
 
@@ -203,9 +213,10 @@ consumer in `duplicacy_backupmanager.go`.
 
 ## How to apply
 
-The concurrency helper has been applied; the rest of this review is unchanged. The
-recommended order was the concurrency helper first, then the raw-chunk copy flow,
-then the path and sequence helpers. The unit tests in `src/` are the safety net:
+The concurrency helper and the raw-chunk copy plumbing have been applied; the rest
+of this review is unchanged. The recommended order was the concurrency helper
+first, then the raw-chunk copy flow, then the path and sequence helpers. The unit
+tests in `src/` are the safety net:
 `go test ./src/ -vet=off`. Note the two tests that fail on a pristine checkout for
 unrelated reasons (`TestEntryExcludeByAttribute`, `TestPersistRestore`), and the
 pre-existing `go vet` warnings, both documented in `AGENTS.md`.

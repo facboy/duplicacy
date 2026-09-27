@@ -196,25 +196,26 @@ func (chunk *Chunk) GetHash() string {
 }
 
 // WriteRawData stores the bytes of a chunk exactly as they are held by a storage, so that they can be uploaded to a
-// storage that holds the chunk identically without being decoded and encoded again.  'hash' is the hash the chunk is
-// stored under, from which the id is derived.  A checksum is computed over the bytes, like for a chunk being read in
-// normally, so that VerifyChecksum can still detect in-memory corruption before the chunk is uploaded.
+// storage that holds the chunk identically without being decoded and encoded again.  This is the only constructor for
+// a chunk in that form, and the raw flag it sets is what tells the uploader not to encode the chunk again.  'hash' is
+// the hash the chunk is stored under, which is required because it can no longer be computed from the buffer.  A
+// checksum is computed over the bytes, like for a chunk being read in normally, so that VerifyChecksum can still
+// detect in-memory corruption before the chunk is uploaded.
 func (chunk *Chunk) WriteRawData(data []byte, hash string) {
 	chunk.Reset(false)
 	if chunk.buffer != nil {
 		chunk.checksum = newChunkChecksum()
 	}
 	chunk.Write(data)
-	chunk.SetRawData(hash)
+	chunk.SetStoredHash(hash)
+	chunk.isRawData = true
 }
 
-// SetRawData marks the chunk as holding the data exactly as it is stored in a storage -- compressed, encrypted and
-// possibly erasure coded -- rather than its plaintext.  'hash' is the chunk hash the data was stored under, which is
-// required because it can no longer be computed from the buffer.  The id is derived from the hash the same way
-// Encrypt would have derived it, so that the chunk is uploaded under the correct name.  This is used by copy when
-// both storages store the chunk identically, so that the chunk doesn't have to be decoded and encoded again.
-func (chunk *Chunk) SetRawData(hash string) {
-	chunk.isRawData = true
+// SetStoredHash records the hash a chunk that holds stored bytes was stored under, from which the id is derived the
+// same way Encrypt would have derived it.  It is the identity half of WriteRawData, and is used by the downloader so
+// that a chunk read without decryption still has the hash and id it is stored under.  It does not mark the chunk as
+// raw: only the caller that turns the bytes into the chunk to upload knows that it will be uploaded as they are.
+func (chunk *Chunk) SetStoredHash(hash string) {
 	chunk.hash = []byte(hash)
 	chunk.id = chunk.config.GetChunkIDFromHash(hash)
 }

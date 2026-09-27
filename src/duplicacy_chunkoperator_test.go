@@ -5,6 +5,8 @@
 package duplicacy
 
 import (
+	"bytes"
+	"io/ioutil"
 	"os"
 	"path"
 	"runtime/debug"
@@ -108,6 +110,81 @@ func TestWaitForCompletionIsWokenNotPolled(t *testing.T) {
 		t.Errorf("WaitForCompletion took %v after the last task finished; it is waiting on a timer, not on the task",
 			elapsed)
 	}
+}
+
+// TestDownloadRawChunk checks the reader half of the verbatim copy: with 'rawData' set, the operator hands back the
+// stored bytes without decrypting them, and -- because the caller is the one that knows the destination stores them
+// identically -- without marking the chunk as raw, so the id is derived from the bytes actually held.
+func TestDownloadRawChunk(t *testing.T) {
+
+	setTestingT(t)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%v", r)
+			debug.PrintStack()
+		}
+	}()
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "raw_chunk_test")
+	os.RemoveAll(testDir)
+	os.MkdirAll(testDir, 0700)
+	defer os.RemoveAll(testDir)
+
+	storage, err := CreateFileStorage(testDir, false, 1)
+	if err != nil {
+		t.Errorf("Failed to create the storage: %v", err)
+		return
+	}
+
+	config := CreateConfig()
+
+	content := make([]byte, 8192)
+	crypto_rand.Read(content)
+
+	chunk := CreateChunk(config, true)
+	chunk.Reset(true)
+	chunk.Write(content)
+	chunkHash := chunk.GetHash()
+	chunkID := chunk.GetID()
+
+	uploader := CreateChunkOperator(config, storage, nil, false, false, 1, false)
+	uploader.UploadCompletionFunc = func(chunk *Chunk, chunkIndex int, inCache bool, chunkSize int, uploadSize int) {}
+	uploader.Upload(chunk, 0, false)
+	uploader.WaitForCompletion()
+	uploader.Stop()
+
+	chunkPath, err := storage.ChunkPath(chunkID)
+	if err != nil {
+		t.Errorf("Failed to derive the chunk path: %v", err)
+		return
+	}
+	storedData, err := ioutil.ReadFile(path.Join(testDir, chunkPath))
+	if err != nil {
+		t.Errorf("Failed to read the stored chunk: %v", err)
+		return
+	}
+
+	operator := CreateChunkOperator(config, storage, nil, false, false, 1, false)
+	operator.rawData = true
+	defer operator.Stop()
+
+	downloaded := operator.Download(chunkHash, 0, false)
+
+	if !bytes.Equal(downloaded.GetBytes(), storedData) {
+		t.Errorf("The raw download returned %d bytes that differ from the %d stored bytes",
+			downloaded.GetLength(), len(storedData))
+	}
+	if downloaded.isRawData {
+		t.Errorf("The download marked the chunk as raw; only the caller turning it into an uploaded chunk may do that")
+	}
+	if downloaded.GetID() != chunkID {
+		t.Errorf("The raw download lost the chunk identity: %s instead of %s", downloaded.GetID(), chunkID)
+	}
+	if !bytes.Equal([]byte(downloaded.GetHash()), []byte(chunkHash)) {
+		t.Errorf("The raw download lost the chunk hash: %x instead of %x", downloaded.GetHash(), chunkHash)
+	}
+	config.PutChunk(downloaded)
 }
 
 func TestChunkOperator(t *testing.T) {

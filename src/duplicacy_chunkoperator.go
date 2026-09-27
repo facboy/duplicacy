@@ -452,10 +452,11 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 		}
 
 		// When the destination storage stores the chunk identically, the downloaded bytes are exactly what must be
-		// uploaded, so they are passed on as they are instead of being decrypted and encrypted again.  The chunk hash
-		// comes from the task and the id is derived from it, so the chunk keeps its identity without being decoded.
+		// uploaded, so they are passed on as they are instead of being decrypted and encrypted again.  Only the hash
+		// and id they were stored under are recorded, since they can't be recomputed: the raw flag is left to the
+		// caller, which is the one that turns the bytes into the chunk to upload.
 		if operator.rawData {
-			chunk.SetRawData(task.chunkHash)
+			chunk.SetStoredHash(task.chunkHash)
 			break
 		}
 
