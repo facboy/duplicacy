@@ -470,8 +470,7 @@ Ordered by expected benefit.
 ### Deliberately not pursued
 
 - **Replacing `fsync` outright.** It is a deliberate durability guarantee
-  (`bb652d0`) and the right call is a policy decision, not an optimisation. See
-  the section above for the numbers.
+  (`bb652d0`) and the right call is a policy decision, not an optimisation.
 - **A chunk index or a shared chunk file**, as in `snapshot_perf.md`. `copy`
   reads the destination's chunk layout through `ListAllFiles`, and any index
   would be a storage-format change, which is out of scope for the same reason it

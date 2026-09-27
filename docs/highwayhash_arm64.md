@@ -146,12 +146,12 @@ correct. Renaming only the non-colliding `constants` symbol fixes neither.
 Renaming only the *Go function* (leaving the assembly symbol names alone) fixes
 both as well, because either rename removes the collision.
 
-In other words, **any change that stops the assembly from reading function bytes
-also stops it from producing the 1.0.1 hash**. There is no patch that repairs
-the build while preserving the compatibility behaviour. A further check
-confirmed the mechanism directly: editing the body of the `zipperMerge`
-function without renaming anything left the wrong arm64 hash unchanged, i.e.
-the "constant table" really is the function's code.
+Every change that stops the assembly from reading function bytes also stops it
+from producing the 1.0.1 hash. There is no patch that repairs the build while
+preserving the compatibility behaviour. A further check confirmed the mechanism
+directly: editing the body of the `zipperMerge` function without renaming
+anything left the wrong arm64 hash unchanged, i.e. the "constant table" really
+is the function's code.
 
 ## Why the wrong hash is not a fixed value
 
