@@ -13,6 +13,16 @@ import (
 	"strings"
 )
 
+// cloudFileFailure is the reason AddData reports when a read failed on a OneDrive cloud-only file.  It comes with a
+// negative size, which is what makes the caller skip the file instead of failing the backup.
+const cloudFileFailure = "CLOUD_FILE_FAILURE"
+
+// isCloudFileError reports whether err is the Windows error raised when a OneDrive cloud-only file isn't available
+// locally; it can surface from os.OpenFile or from the first read, depending on when the file is hydrated.
+func isCloudFileError(err error) bool {
+	return runtime.GOOS == "windows" && strings.HasSuffix(err.Error(), " Access to the cloud file is denied.")
+}
+
 // ChunkMaker breaks data into chunks using buzhash.  To save memory, the chunk maker only use a circular buffer
 // whose size is double the minimum chunk size.
 type ChunkMaker struct {
@@ -174,11 +184,9 @@ func (maker *ChunkMaker) AddData(reader io.Reader, sendChunk func(*Chunk)) (int6
 
 				if err != nil {
 					if err != io.EOF {
-						// handle OneDrive 'cloud files' errors (sometimes these are caught by os.OpenFile, sometimes
-						// not)
-						isWarning := runtime.GOOS == "windows" && strings.HasSuffix(err.Error(), " Access to the cloud file is denied.")
+						isWarning := isCloudFileError(err)
 						LOG_WERROR(isWarning, "CHUNK_MAKER", "Failed to read %d bytes: %s", count, err.Error())
-						return -1, "", "CLOUD_FILE_FAILURE" // we'd only hit this if it was a cloud file warning, LOG_ERROR panic exits
+						return -1, "", cloudFileFailure
 					} else {
 						isEOF = true
 					}
@@ -214,10 +222,9 @@ func (maker *ChunkMaker) AddData(reader io.Reader, sendChunk func(*Chunk)) (int6
 			count, err = reader.Read(maker.buffer[start : start+count])
 
 			if err != nil && err != io.EOF {
-				// handle OneDrive 'cloud files' errors (sometimes these are caught by os.OpenFile, sometimes not)
-				isWarning := runtime.GOOS == "windows" && strings.HasSuffix(err.Error(), " Access to the cloud file is denied.")
+				isWarning := isCloudFileError(err)
 				LOG_WERROR(isWarning, "CHUNK_MAKER", "Failed to read %d bytes: %s", count, err.Error())
-				return -1, "", "CLOUD_FILE_FAILURE" // we'd only hit this if it was a cloud file warning, LOG_ERROR panic exits
+				return -1, "", cloudFileFailure // LOG_ERROR panics, so only a cloud-file warning reaches this
 			}
 
 			maker.bufferSize += count

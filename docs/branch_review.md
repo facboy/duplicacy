@@ -14,7 +14,7 @@ The branch is 30 commits ahead of `upstream/master`: about 7,000 added lines ove
 the module files. Almost all of it serves one goal — stop `prune`, `copy` and
 `list` paying a round trip per revision, and drop a redundant `fsync`.
 
-The changes work, and the per-backend listing work is factored well. The three
+The changes work, and the per-backend listing work is factored well. The four
 refactorings below have since been applied; what remains of the duplication is
 lower-value and listed in the same order.
 
@@ -24,6 +24,8 @@ Ordered by payoff:
 2. Raw-chunk copy plumbing (applied) — the raw flag has one producer.
 3. Path and sequence helpers (applied) — the storage layout and the chunk-id walk
    each have one definition.
+4. Cloud-file detection (applied) — the denial predicate and the sentinel each have
+   one definition.
 
 ## Duplicated code
 
@@ -88,14 +90,18 @@ fossil with its `len(...) != 64` guard, and the two prune sites that want the id
 strip the suffix themselves. Unit test: `TestChunkIDFromListedPath` in
 `src/duplicacy_snapshotmanager_test.go`.
 
-### OneDrive cloud-file detection — two identical blocks, three files agreeing
+### OneDrive cloud-file detection — applied
 
-`src/duplicacy_chunkmaker.go:177-181` and `:217-220` are identical, comment
-included, and the sentinel string is matched again at
-`src/duplicacy_backupmanager.go:485`. `isCloudFileError(err) bool` plus a named
-constant, or a typed value instead of the string, would make the contract explicit.
-As it stands `AddData` carries a third return value that is a magic string
-compared by a second call site.
+`src/duplicacy_chunkmaker.go` carried the same read-error block twice, comment
+included, and the sentinel string was matched again at
+`src/duplicacy_backupmanager.go:485`.
+
+Done: `isCloudFileError(err)` holds the message suffix and the Windows check in one
+place, and `cloudFileFailure` names the sentinel both halves share. A read error that
+is not the denial still goes through `LOG_ERROR` and aborts, which is what keeps the
+skip-the-file path limited to the cloud case. Unit tests: `TestIsCloudFileError`,
+`TestChunkMakerReadErrorStillAborts` and (Windows only)
+`TestChunkMakerCloudFileDeniedIsSkipped` in `src/duplicacy_chunkmaker_test.go`.
 
 ### Missing directory treated as an empty listing — six blocks
 
@@ -184,11 +190,10 @@ Done: `snapshotDir`/`snapshotPath` in `src/duplicacy_snapshotmanager.go`,
 could have drifted apart; all three are covered by the unit tests named in the
 sections above.
 
-### The string sentinel in `AddData`
+### The string sentinel in `AddData` (applied)
 
-Replacing `"CLOUD_FILE_FAILURE"` with a named value makes the three-return
-signature self-describing and ties the producer in `duplicacy_chunkmaker.go` to the
-consumer in `duplicacy_backupmanager.go`.
+The sentinel is now the named `cloudFileFailure`, shared by the producer in
+`duplicacy_chunkmaker.go` and the consumer in `duplicacy_backupmanager.go`.
 
 ## Smaller items
 
@@ -203,10 +208,11 @@ consumer in `duplicacy_backupmanager.go`.
   therefore reachable only through the concrete type. That is defensible, since
   only `FileStorage` backs the cache, but the comment explains when to use the
   method rather than why it stays off the interface.
-- `src/duplicacy_chunkmaker.go:177-181` returns `-1` as the size on the failure
+- `src/duplicacy_chunkmaker.go` returns `-1` as the size on the cloud-file failure
   path, and the `entry.Size <= 0` check at `src/duplicacy_backupmanager.go:485` is
-  what makes that work. The coupling deserves a named sentinel or a comment on the
-  backup side.
+  what makes that work. The sentinel is now named, so the two halves agree on the
+  contract; the sign check itself still only reads as a coupling if the comment on
+  the variable is missed.
 
 ## Left alone deliberately
 
@@ -219,10 +225,10 @@ consumer in `duplicacy_backupmanager.go`.
 
 ## How to apply
 
-The concurrency helper, the raw-chunk copy plumbing and the path and sequence
-helpers have been applied. The recommended order was the concurrency helper first,
-then the raw-chunk copy flow, then the path and sequence helpers; the remaining
-items -- the `AddData` sentinel, the test scaffolding and the smaller items -- are
+The concurrency helper, the raw-chunk copy plumbing, the path and sequence helpers
+and the cloud-file detection have been applied. The recommended order was the
+concurrency helper first, then the raw-chunk copy flow, then the path and sequence
+helpers; the remaining items -- the test scaffolding and the smaller items -- are
 unchanged. The unit tests in `src/` are the safety net:
 `go test ./src/ -vet=off`. Note the two tests that fail on a pristine checkout for
 unrelated reasons (`TestEntryExcludeByAttribute`, `TestPersistRestore`), and the
