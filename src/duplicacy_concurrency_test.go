@@ -227,6 +227,58 @@ func TestRunConcurrentlyWaitsForTheWorkersBeforeRaising(t *testing.T) {
 	}
 }
 
+// The benchmark command used to run its uploads, downloads and deletes on a channel-based fan-out of its own, which
+// caught a LOG_ERROR panic and called os.Exit from the worker goroutine instead of reporting it.  It now runs on
+// runConcurrently, so a failing worker must surface from Benchmark itself.
+func TestBenchmarkReraisesWorkerFailure(t *testing.T) {
+
+	setTestingT(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "benchmark_test")
+	os.RemoveAll(testDir)
+	os.MkdirAll(testDir, 0700)
+
+	storage, err := CreateFileStorage(testDir, false, 4)
+	if err != nil {
+		t.Errorf("Failed to create the storage: %v", err)
+		return
+	}
+
+	failing := &failingBenchmarkStorage{Storage: storage}
+
+	// One chunk and one thread keep the run small, and a zero file size skips the local disk write.  The chunk size has
+	// to be a power of two, so it is the smallest valid one rather than zero.
+	recovered := recoverPanicFrom(func() {
+		Benchmark(testDir, failing, 0, 1024, 1, 1, 1)
+	})
+
+	exception, ok := recovered.(Exception)
+	if !ok {
+		t.Errorf("Expecting a benchmark worker failure to be re-raised as an Exception, got %v", recovered)
+		return
+	}
+	if exception.LogID != "BENCHMARK_UPLOAD" {
+		t.Errorf("Expecting the failure to be reported by %s, got %s", "BENCHMARK_UPLOAD", exception.LogID)
+	}
+
+	// The upload was attempted, and every chunk of the run went through the worker before the failure was raised.
+	if attempted := atomic.LoadInt64(&failing.attempted); attempted != 1 {
+		t.Errorf("Expecting the single chunk to be uploaded once, got %d attempts", attempted)
+	}
+}
+
+// failingBenchmarkStorage makes every upload fail, so that the LOG_ERROR the benchmark raises from a worker can be
+// observed from Benchmark itself.  Methods not overridden here are promoted from the embedded storage.
+type failingBenchmarkStorage struct {
+	Storage
+	attempted int64
+}
+
+func (storage *failingBenchmarkStorage) UploadFile(threadIndex int, filePath string, content []byte) (err error) {
+	atomic.AddInt64(&storage.attempted, 1)
+	return fmt.Errorf("injected benchmark failure for %s", filePath)
+}
+
 // failingDownloadStorage makes the download of one file fail, so that a test can check that the error a worker raises
 // is reported from the calling goroutine.
 type failingDownloadStorage struct {

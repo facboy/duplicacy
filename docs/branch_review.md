@@ -16,29 +16,27 @@ the module files. Almost all of it serves one goal — stop `prune`, `copy` and
 
 The changes work, and the per-backend listing work is factored well. The
 concurrency helper below has since been applied; the remaining shapes nevertheless
-repeat often enough that a few small helpers would shorten the code further: a
-concurrent fan-out with panic capture still appears twice in two idioms, and
+repeat often enough that a few small helpers would shorten the code further:
 snapshot paths are built in six places.
 
 Ordered by payoff:
 
-1. Concurrency helper (applied) — removes ~80–100 lines and one of three competing
-   idioms.
+1. Concurrency helper (applied) — the fan-out is now one helper.
 2. Raw-chunk copy plumbing — four flags set from four call sites for one flow.
 3. Path and sequence helpers — small, local, mechanical.
 
 ## Duplicated code
 
-### Worker fan-out with panic capture — two copies left, two idioms
+### Worker fan-out with panic capture — applied
 
-The helper above now holds the pattern for the two loops that only need "first panic
-wins and is re-raised in the caller". What remains:
+`runConcurrently` now holds the pattern for every loop that only needs "first panic
+wins and is re-raised in the caller": `expandSnapshots`, `downloadSnapshots` and
+`benchmarkRun` (which used to be the channel-based variant and is now gone). What
+remains is only the prune snapshot deletion, which also needs per-index completion
+because it emits its log lines in revision order:
 
 - `src/duplicacy_snapshotmanager.go` (prune snapshot deletion) — the same pattern
-  plus the ordered-emission condition variable, so it needs per-index completion
-  rather than fire-and-forget.
-- `src/duplicacy_benchmark.go:64` (`benchmarkRun`) — the older channel-based
-  variant.
+  plus the ordered-emission condition variable.
 
 `DownloadSequence` still uses `WaitGroup` with `DownloadAsync`, which is a different
 shape: the work is submitted to the chunk operator rather than driven by counting
@@ -46,9 +44,10 @@ indices, so it is out of scope for a fan-out helper.
 
 ### `failure`/`failureLock` and the recovery block — now in one place
 
-`runConcurrently` holds the recovery block that `expandSnapshots` and
-`downloadSnapshots` both used to carry. The prune deletion loop still has its own,
-because a worker unwound by a panic must still finish its slot to wake the emitter.
+`runConcurrently` holds the recovery block that `expandSnapshots`,
+`downloadSnapshots` and `benchmarkRun` all used to carry. The prune deletion loop
+still has its own, because a worker unwound by a panic must still finish its slot to
+wake the emitter.
 
 ### Mapping the three sequences to chunk ids — three implementations
 
@@ -142,9 +141,10 @@ read as a whole; `commands.md` also overlaps the wiki table.
 ### Concurrency helper (applied)
 
 Done: `runConcurrently` in `src/duplicacy_concurrency.go` now covers the fan-out in
-`expandSnapshots` and `downloadSnapshots`, and the recovery block that both carried.
-The prune deletion loop was left alone, because it needs per-index completion rather
-than fire-and-forget. Unit tests for the helper are in
+`expandSnapshots`, `downloadSnapshots` and the benchmark command (`benchmarkRun`
+was folded in and removed). The recovery block all three carried lives in the helper
+too. The prune deletion loop was left alone, because it needs per-index completion
+rather than fire-and-forget. Unit tests for the helper are in
 `src/duplicacy_concurrency_test.go`.
 
 ### Raw-chunk copy plumbing
