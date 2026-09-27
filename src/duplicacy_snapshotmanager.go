@@ -379,54 +379,11 @@ func (manager *SnapshotManager) expandSnapshots(snapshots []*Snapshot, threads i
 
 	expanded := make([][]string, len(groups))
 
-	if threads > 1 && len(groups) > 1 {
-		if threads > len(groups) {
-			threads = len(groups)
-		}
-
-		nextGroup := int64(0)
-		var waitGroup sync.WaitGroup
-
-		// A worker that hits an error can't report it by itself, since the panic raised by LOG_ERROR would unwind its
-		// own goroutine only.  It is captured here and re-raised in the calling goroutine after all workers have
-		// finished, so the caller sees exactly what it sees in the single-threaded case.
-		var failure interface{}
-		var failureLock sync.Mutex
-
-		waitGroup.Add(threads)
-		for i := 0; i < threads; i++ {
-			go func() {
-				defer waitGroup.Done()
-				defer func() {
-					if r := recover(); r != nil {
-						failureLock.Lock()
-						if failure == nil {
-							failure = r
-						}
-						failureLock.Unlock()
-					}
-				}()
-
-				for {
-					index := int(atomic.AddInt64(&nextGroup, 1)) - 1
-					if index >= len(groups) {
-						return
-					}
-					expanded[index] = manager.expandChunkHashes(expandableSnapshot(groups[index]))
-				}
-			}()
-		}
-
-		waitGroup.Wait()
-
-		if failure != nil {
-			panic(failure)
-		}
-	} else {
-		for index, group := range groups {
-			expanded[index] = manager.expandChunkHashes(expandableSnapshot(group))
-		}
-	}
+	// The expansion of a group owns nothing the caller sees until it is written here, and each group is independent of
+	// the others, so the worker count is the only thing that decides whether the loop overlaps.
+	runConcurrently(threads, len(groups), func(threadIndex, index int) {
+		expanded[index] = manager.expandChunkHashes(expandableSnapshot(groups[index]))
+	})
 
 	// The file, chunk and length sequences only have to be turned into ids; only the chunk-hash sequence is the
 	// expansion, and its result is shared by every snapshot in the group.
@@ -866,50 +823,16 @@ func (manager *SnapshotManager) downloadSnapshots(snapshotID string, revisions [
 	for i := range chunks {
 		chunks[i] = manager.config.GetChunk()
 	}
+	defer func() {
+		for _, chunk := range chunks {
+			manager.config.PutChunk(chunk)
+		}
+	}()
 
-	nextRevision := int64(0)
-	var waitGroup sync.WaitGroup
-
-	// A worker that hits an error can't report it by itself, since the panic raised by LOG_ERROR would unwind its own
-	// goroutine only.  It is captured here and re-raised in the calling goroutine after all workers have finished, so
-	// that the caller and the top-level exception handler see exactly what they see in the single-threaded case.
-	var failure interface{}
-	var failureLock sync.Mutex
-
-	waitGroup.Add(threads)
-	for i := 0; i < threads; i++ {
-		go func(threadIndex int) {
-			defer waitGroup.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					failureLock.Lock()
-					if failure == nil {
-						failure = r
-					}
-					failureLock.Unlock()
-				}
-			}()
-
-			chunk := chunks[threadIndex]
-			for {
-				index := int(atomic.AddInt64(&nextRevision, 1)) - 1
-				if index >= len(revisions) {
-					return
-				}
-				snapshots[index] = manager.downloadSnapshot(snapshotID, revisions[index], listed, chunk, threadIndex)
-			}
-		}(i)
-	}
-
-	waitGroup.Wait()
-
-	for _, chunk := range chunks {
-		manager.config.PutChunk(chunk)
-	}
-
-	if failure != nil {
-		panic(failure)
-	}
+	runConcurrently(threads, len(revisions), func(threadIndex, index int) {
+		snapshots[index] = manager.downloadSnapshot(snapshotID, revisions[index], listed, chunks[threadIndex],
+			threadIndex)
+	})
 
 	return snapshots
 }

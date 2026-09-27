@@ -9,59 +9,46 @@ Line numbers are from the state of the tree when the review was written.
 
 ## Summary
 
-The branch is 29 commits ahead of `upstream/master`: about 7,000 added lines over
-22 non-test source files, 7 test files, and 6 new documents, plus `AGENTS.md` and
+The branch is 30 commits ahead of `upstream/master`: about 7,000 added lines over
+23 non-test source files, 8 test files, and 6 new documents, plus `AGENTS.md` and
 the module files. Almost all of it serves one goal — stop `prune`, `copy` and
 `list` paying a round trip per revision, and drop a redundant `fsync`.
 
-The changes work, and the per-backend listing work is factored well. A handful of
-shapes nevertheless repeat often enough that a few small helpers would shorten the
-code: a concurrent fan-out with panic capture appears four times in three
-different idioms, the same recovery block twice verbatim, and snapshot paths are
-built in six places.
+The changes work, and the per-backend listing work is factored well. The
+concurrency helper below has since been applied; the remaining shapes nevertheless
+repeat often enough that a few small helpers would shorten the code further: a
+concurrent fan-out with panic capture still appears twice in two idioms, and
+snapshot paths are built in six places.
 
 Ordered by payoff:
 
-1. Concurrency helper — removes ~80–100 lines and one of three competing idioms.
+1. Concurrency helper (applied) — removes ~80–100 lines and one of three competing
+   idioms.
 2. Raw-chunk copy plumbing — four flags set from four call sites for one flow.
 3. Path and sequence helpers — small, local, mechanical.
 
 ## Duplicated code
 
-### Worker fan-out with panic capture — four copies, three idioms
+### Worker fan-out with panic capture — two copies left, two idioms
 
-Four places implement "run N workers over a slice, capture the first `LOG_ERROR`
-panic, re-raise it in the caller":
+The helper above now holds the pattern for the two loops that only need "first panic
+wins and is re-raised in the caller". What remains:
 
-- `src/duplicacy_snapshotmanager.go:387-429` (`expandSnapshots`) — atomic counter,
-  `WaitGroup`, `failure`/`failureLock`, re-panic.
-- `src/duplicacy_snapshotmanager.go:870-913` (`downloadSnapshots`) — the same
-  pattern, including the same explanatory comment.
-- `src/duplicacy_snapshotmanager.go:2608-2701` (prune snapshot deletion) — the same
-  pattern plus the ordered-emission condition variable.
+- `src/duplicacy_snapshotmanager.go` (prune snapshot deletion) — the same pattern
+  plus the ordered-emission condition variable, so it needs per-index completion
+  rather than fire-and-forget.
 - `src/duplicacy_benchmark.go:64` (`benchmarkRun`) — the older channel-based
   variant.
 
-Three mechanisms coexist for one need inside a single file: `DownloadSequence`
-uses `WaitGroup` with `DownloadAsync`, the two new loops use an atomic counter,
-and `benchmarkRun` uses channels. A single unexported helper would cover the first
-two:
+`DownloadSequence` still uses `WaitGroup` with `DownloadAsync`, which is a different
+shape: the work is submitted to the chunk operator rather than driven by counting
+indices, so it is out of scope for a fan-out helper.
 
-```go
-// runConcurrently calls job(threadIndex, index) for each index in [0,count) on
-// at most 'threads' goroutines, and re-raises in the caller whatever the first
-// worker panicked with.
-func runConcurrently(threads, count int, job func(threadIndex, index int))
-```
+### `failure`/`failureLock` and the recovery block — now in one place
 
-The prune deletion loop needs per-index completion rather than fire-and-forget, so
-it should keep its own copy or use a second variant that takes a completion
-callback. The other two should not each carry a copy.
-
-### `failure`/`failureLock` and the recovery block — duplicated verbatim
-
-`src/duplicacy_snapshotmanager.go:390-408` and `:873-891` are identical, comment
-included. This block should exist once.
+`runConcurrently` holds the recovery block that `expandSnapshots` and
+`downloadSnapshots` both used to carry. The prune deletion loop still has its own,
+because a worker unwound by a panic must still finish its slot to wake the emitter.
 
 ### Mapping the three sequences to chunk ids — three implementations
 
@@ -152,12 +139,13 @@ read as a whole; `commands.md` also overlaps the wiki table.
 
 ## Refactorings, in order of payoff
 
-### Concurrency helper
+### Concurrency helper (applied)
 
-One unexported helper in `src` covers the fan-out in `expandSnapshots` and
-`downloadSnapshots`, and the recovery block that both carry. This is the largest
-single reduction and the safest, because the two call sites already behave
-identically.
+Done: `runConcurrently` in `src/duplicacy_concurrency.go` now covers the fan-out in
+`expandSnapshots` and `downloadSnapshots`, and the recovery block that both carried.
+The prune deletion loop was left alone, because it needs per-index completion rather
+than fire-and-forget. Unit tests for the helper are in
+`src/duplicacy_concurrency_test.go`.
 
 ### Raw-chunk copy plumbing
 
@@ -215,9 +203,9 @@ consumer in `duplicacy_backupmanager.go`.
 
 ## How to apply
 
-Nothing has been changed; this is a review. The recommended order is the
-concurrency helper first, then the raw-chunk copy flow, then the path and sequence
-helpers. The unit tests in `src/` are the safety net:
+The concurrency helper has been applied; the rest of this review is unchanged. The
+recommended order was the concurrency helper first, then the raw-chunk copy flow,
+then the path and sequence helpers. The unit tests in `src/` are the safety net:
 `go test ./src/ -vet=off`. Note the two tests that fail on a pristine checkout for
 unrelated reasons (`TestEntryExcludeByAttribute`, `TestPersistRestore`), and the
 pre-existing `go vet` warnings, both documented in `AGENTS.md`.
