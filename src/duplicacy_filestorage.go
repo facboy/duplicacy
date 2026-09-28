@@ -157,6 +157,11 @@ func (storage *FileStorage) UploadFile(threadIndex int, filePath string, content
 // rejected and re-fetched rather than believed; the chunk cache is the only such entry today (see
 // ChunkOperator.DownloadChunk, which re-derives the chunk id and falls back to the storage on a mismatch).  Entries
 // that are read back unverified, such as the cached snapshot files and fossil collections, must use UploadFile.
+//
+// It stays off the Storage interface because the cache is the only caller and it is always a FileStorage: see
+// BackupManager.SetupSnapshotCache, which builds the cache with CreateFileStorage, and the snapshotCache fields that
+// hold it.  The interface's UploadFile is the durable write the storages implement; the option to skip the fsync exists
+// only for the local cache.
 func (storage *FileStorage) UploadFileNoSync(threadIndex int, filePath string, content []byte) (err error) {
 	return storage.uploadFile(threadIndex, filePath, content, false)
 }

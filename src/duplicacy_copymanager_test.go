@@ -74,6 +74,39 @@ func TestIsBitIdenticalWith(t *testing.T) {
 	}
 }
 
+// TestIsCompatibleWith checks the predicate that decides whether a copy may run at all.  It is the weaker of the two:
+// a copy re-encrypts the chunks, so a destination with different keys is compatible as long as the chunks fall on the
+// same boundaries and are stored under the same hash.
+func TestIsCompatibleWith(t *testing.T) {
+
+	setTestingT(t)
+
+	base := CreateConfigFromParameters(DEFAULT_COMPRESSION_LEVEL, 64*1024, 256*1024, 16*1024, true, nil, false)
+	notBitCopy := CreateConfigFromParameters(DEFAULT_COMPRESSION_LEVEL, 64*1024, 256*1024, 16*1024, true, base, false)
+
+	if !base.IsCompatibleWith(notBitCopy) || !notBitCopy.IsCompatibleWith(base) {
+		t.Errorf("A copy with different encryption keys should still be compatible")
+	}
+
+	differentHashKey := *notBitCopy
+	differentHashKey.HashKey = []byte("a different hash key for the test")
+	if base.IsCompatibleWith(&differentHashKey) {
+		t.Errorf("Storages with different hash keys should not be reported as compatible")
+	}
+
+	differentSizes := *notBitCopy
+	differentSizes.AverageChunkSize = 32 * 1024
+	if base.IsCompatibleWith(&differentSizes) {
+		t.Errorf("Storages with different chunk sizes should not be reported as compatible")
+	}
+
+	differentSeed := *notBitCopy
+	differentSeed.ChunkSeed = []byte("a different chunk seed for the test")
+	if base.IsCompatibleWith(&differentSeed) {
+		t.Errorf("Storages with different chunk seeds should not be reported as compatible")
+	}
+}
+
 // copyCase carries the storages of one copy scenario.
 type copyCase struct {
 	name        string

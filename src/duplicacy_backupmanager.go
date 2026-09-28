@@ -396,7 +396,7 @@ func (manager *BackupManager) Backup(top string, quickMode bool, threads int, ta
 	var numberOfNewFileChunks int64        // number of new file chunks
 	var totalUploadedFileChunkLength int64 // total length of uploaded file chunks
 	var totalUploadedFileChunkBytes int64  // how many actual bytes have been uploaded
-	var addDataErr string // reason from fileChunkMaker.AddData() when it returns a negative size
+	var addDataErr string                  // cloudFileFailure when AddData skipped the file, empty otherwise
 
 	// This function is called when a chunk has been uploaded
 	uploadChunkCompletionFunc := func(chunk *Chunk, chunkIndex int, inCache bool, chunkSize int, uploadSize int) {
@@ -481,8 +481,10 @@ func (manager *BackupManager) Backup(top string, quickMode bool, threads int, ta
 			continue
 		}
 
+		// AddData reports the OneDrive denial with the sentinel and a negative size, and the sentinel is the whole
+		// condition: the file is skipped rather than uploaded with the part of it that could be read.
 		entry.Size, entry.Hash, addDataErr = fileChunkMaker.AddData(file, uploadChunkFunc)
-		if entry.Size <= 0 && addDataErr == cloudFileFailure {
+		if addDataErr == cloudFileFailure {
 			skippedFiles = append(skippedFiles, entry.Path)
 		} else if !showStatistics || IsTracing() || RunInBackground {
 			LOG_INFO("PACK_END", "Packed %s (%d)", entry.Path, entry.Size)

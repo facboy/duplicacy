@@ -169,13 +169,28 @@ func (config *Config) UnmarshalJSON(description []byte) (err error) {
 	return nil
 }
 
-func (config *Config) IsCompatibleWith(otherConfig *Config) bool {
+// sameChunkHash reports whether the two storages derive the same hash from the same chunk content, which is what makes
+// a chunk id mean the same thing on both sides.  The hash is keyed with HashKey, so this compares that key; where the
+// chunk boundaries fall is a separate condition, compared by each caller that depends on it.
+func (config *Config) sameChunkHash(otherConfig *Config) bool {
+	return bytes.Equal(config.HashKey, otherConfig.HashKey)
+}
 
+// sameChunkBoundaries reports whether the two storages split a file into chunks the same way, which takes both the size
+// thresholds and the rolling-hash seed.
+func (config *Config) sameChunkBoundaries(otherConfig *Config) bool {
 	return config.AverageChunkSize == otherConfig.AverageChunkSize &&
 		config.MaximumChunkSize == otherConfig.MaximumChunkSize &&
 		config.MinimumChunkSize == otherConfig.MinimumChunkSize &&
-		bytes.Equal(config.ChunkSeed, otherConfig.ChunkSeed) &&
-		bytes.Equal(config.HashKey, otherConfig.HashKey)
+		bytes.Equal(config.ChunkSeed, otherConfig.ChunkSeed)
+}
+
+// IsCompatibleWith reports whether the snapshots of this storage can be copied to the other one: the chunks have to
+// fall on the same boundaries and be stored under the same hash, so that the ids a snapshot references resolve
+// there.  The encryption keys are not part of this, because a copy re-encrypts the chunks.
+func (config *Config) IsCompatibleWith(otherConfig *Config) bool {
+
+	return config.sameChunkBoundaries(otherConfig) && config.sameChunkHash(otherConfig)
 }
 
 // IsBitIdenticalWith reports whether the two storages store a given chunk in exactly the same bytes.  If so, a chunk
@@ -187,7 +202,7 @@ func (config *Config) IsCompatibleWith(otherConfig *Config) bool {
 func (config *Config) IsBitIdenticalWith(otherConfig *Config) bool {
 
 	return config.CompressionLevel == otherConfig.CompressionLevel &&
-		bytes.Equal(config.HashKey, otherConfig.HashKey) &&
+		config.sameChunkHash(otherConfig) &&
 		bytes.Equal(config.IDKey, otherConfig.IDKey) &&
 		bytes.Equal(config.ChunkKey, otherConfig.ChunkKey) &&
 		config.DataShards == otherConfig.DataShards &&

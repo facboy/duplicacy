@@ -14,9 +14,9 @@ The branch is 30 commits ahead of `upstream/master`: about 7,000 added lines ove
 the module files. Almost all of it serves one goal — stop `prune`, `copy` and
 `list` paying a round trip per revision, and drop a redundant `fsync`.
 
-The changes work, and the per-backend listing work is factored well. The eight
-refactorings below have since been applied; what remains of the duplication is
-lower-value and listed in the same order.
+The changes work, and the per-backend listing work is factored well. The nine
+items below have since been applied. The only duplication left is the two entries
+under "Left alone deliberately", both judged not worth the churn.
 
 Ordered by payoff:
 
@@ -34,6 +34,9 @@ Ordered by payoff:
    live in one place, and the repeated recovery block is one deferred helper.
 8. Documents (applied) — the document set has an index and a stated skeleton, and
    the shared `strace` recipe is written once.
+9. Smaller items (applied) — the two config predicates share a chunk-hash helper,
+   the cache-only write documents its placement, and the cloud-file skip reads the
+   sentinel alone.
 
 ## Duplicated code
 
@@ -228,24 +231,22 @@ sections above.
 The sentinel is now the named `cloudFileFailure`, shared by the producer in
 `duplicacy_chunkmaker.go` and the consumer in `duplicacy_backupmanager.go`.
 
-## Smaller items
+## Smaller items — applied
 
-- `src/duplicacy_config.go:172` (`IsCompatibleWith`) and `:187`
-  (`IsBitIdenticalWith`) are adjacent predicates over overlapping fields. Both
-  compare `HashKey`; the second also compares `IDKey`, `ChunkKey`, compression and
-  erasure coding. The comments state the intent, but the two field lists can drift
-  apart. Defining one in terms of the other, or sharing a helper, removes that.
-- `src/duplicacy_filestorage.go:151`, `:160`, `:165`: `UploadFileNoSync` is a
-  `FileStorage` method called directly from `src/duplicacy_chunkoperator.go`, while
-  the `Storage` interface exposes only `UploadFile`. The cache durability policy is
-  therefore reachable only through the concrete type. That is defensible, since
-  only `FileStorage` backs the cache, but the comment explains when to use the
-  method rather than why it stays off the interface.
-- `src/duplicacy_chunkmaker.go` returns `-1` as the size on the cloud-file failure
-  path, and the `entry.Size <= 0` check at `src/duplicacy_backupmanager.go:485` is
-  what makes that work. The sentinel is now named, so the two halves agree on the
-  contract; the sign check itself still only reads as a coupling if the comment on
-  the variable is missed.
+- `IsCompatibleWith` and `IsBitIdenticalWith` compared overlapping field lists, both
+  of which re-listed `HashKey`. They now share `sameChunkHash`, and
+  `IsCompatibleWith`'s other four comparisons became `sameChunkBoundaries`, so the
+  chunk-boundary rule is stated once and `HashKey` is compared through one helper.
+  `IsCompatibleWith` reports `sameChunkBoundaries(otherConfig) && sameChunkHash(otherConfig)`.
+  Covered by `TestIsCompatibleWith` in `src/duplicacy_copymanager_test.go`.
+- `UploadFileNoSync` stays off the `Storage` interface, and its comment now says
+  why: the cache is its only caller and is always a `FileStorage`, built by
+  `BackupManager.SetupSnapshotCache` with `CreateFileStorage`. The comment states
+  the placement rather than only when to call the method.
+- The cloud-file skip no longer reads `entry.Size <= 0 && addDataErr ==
+  cloudFileFailure` at `src/duplicacy_backupmanager.go:485`; the named sentinel is
+  the whole condition, so the negative size is no longer half of a coupling that a
+  reader has to reconstruct. The size contract is documented on `cloudFileFailure`.
 
 ## Left alone deliberately
 
@@ -258,12 +259,10 @@ The sentinel is now the named `cloudFileFailure`, shared by the producer in
 
 ## How to apply
 
-The concurrency helper, the raw-chunk copy plumbing, the path and sequence helpers,
-the cloud-file detection, the empty-listing rationale, the chunk-operator shutdown,
-the test scaffolding and the documents have been applied. The recommended order was
-the concurrency helper first, then the raw-chunk copy flow, then the path and
-sequence helpers; the remaining item is the smaller items, unchanged. The unit tests
-in `src/` are the safety net:
+The nine items -- the concurrency helper, the raw-chunk copy plumbing, the path and
+sequence helpers, the cloud-file detection, the empty-listing rationale, the
+chunk-operator shutdown, the test scaffolding, the documents and the smaller items
+-- have all been applied. The unit tests in `src/` are the safety net:
 `go test ./src/ -vet=off`. Note the two tests that fail on a pristine checkout for
 unrelated reasons (`TestEntryExcludeByAttribute`, `TestPersistRestore`), and the
 pre-existing `go vet` warnings, both documented in `AGENTS.md`.
