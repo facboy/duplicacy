@@ -10,7 +10,7 @@ changed, and how to confirm the result on a given setup. The
 | `snapshot_perf.md` | Why listing snapshot revisions is slow; fixes #1-#6 and #8 applied, #7 rejected. |
 | `copy_perf.md` | Why `copy` re-encodes chunks and re-probes the destination; fixes #1-#5 applied, #6 rejected. |
 | `prune_perf.md` | Where `prune` spends its time; five fixes applied. |
-| `check_perf.md` | Where `check` spends its time; three candidate fixes, nothing changed. |
+| `check_perf.md` | Where `check` spends its time; the parallel revision loop applied, two candidates left. |
 | `init_perf.md` | Why `init` is not worth optimising; nothing changed. |
 | `highwayhash_arm64.md` | The `zipperMerge` symbol collision in `github.com/gilbertchen/highwayhash`. |
 | `branch_review.md` | Duplication and refactoring review of the branch, and the state of each item. |

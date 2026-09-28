@@ -1033,8 +1033,10 @@ func (manager *SnapshotManager) CheckSnapshots(snapshotID string, revisionsToChe
 			listed = true
 		}
 
-		for _, revision := range revisions {
-			snapshot := manager.downloadSnapshot(snapshotID, revision, listed, manager.fileChunk, 0)
+		// The revisions are independent of each other, so their snapshot files are downloaded concurrently when the
+		// user asked for more than one thread; they come back in revision order, so the tag filter and the appends
+		// below see the same sequence the serial loop produced.
+		for _, snapshot := range manager.downloadSnapshots(snapshotID, revisions, listed, threads) {
 			if tag != "" && snapshot.Tag != tag {
 				continue
 			}

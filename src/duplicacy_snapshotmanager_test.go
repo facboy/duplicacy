@@ -586,6 +586,62 @@ func TestPruneDownloadsRevisionsConcurrently(t *testing.T) {
 	}
 }
 
+// Check reads every snapshot file of every id before it can verify the chunks those revisions reference, and that loop
+// used to download them one at a time however many threads were asked for -- the same defect prune had.  The download
+// reads must overlap when -threads is greater than 1, since on a storage where a read is a round trip this is the
+// largest per-item cost of the command's first phase.
+func TestCheckDownloadsRevisionsConcurrently(t *testing.T) {
+
+	setTestingT(t)
+
+	defer recovering(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+
+	// Check creates its storage with the number of threads it was given, so the storage under test is created the same
+	// way, with four threads.
+	threadedStorage, err := CreateFileStorage(testDir, false, 4)
+	if err != nil {
+		t.Errorf("Failed to create the storage: %v", err)
+		return
+	}
+	counting := &instrumentedStorage{FileStorage: threadedStorage, downloadDelay: time.Millisecond}
+	snapshotManager.storage = counting
+
+	chunkHash := uploadRandomChunk(snapshotManager, 1024)
+	if chunkHash == "" {
+		t.Errorf("Failed to upload a chunk")
+		return
+	}
+
+	now := time.Now().Unix()
+	for revision := 1; revision <= 8; revision++ {
+		createTestSnapshot(snapshotManager, "vm1@host1", revision, now-int64(revision)*3600, now, []string{chunkHash}, "tag")
+	}
+
+	// A plain check reads the snapshot files and then compares the referenced chunk ids against the chunk tree; the
+	// per-revision reads are what must overlap, and the per-revision chunk-sequence expansions that follow are serial.
+	counting.resetDownloadStats()
+	if !snapshotManager.CheckSnapshots("vm1@host1", []int{}, "", false, false, false, false, false, false, false, 4,
+		false) {
+		t.Errorf("CheckSnapshots failed")
+		return
+	}
+
+	// A serial loop never has two revisions in flight at the same time.
+	if peak := counting.peakConcurrentDownloads(); peak < 2 {
+		t.Errorf("Check did not download the revisions concurrently, at most %d was in flight at a time", peak)
+	}
+
+	// The workers must stay within the thread indexes the storage was told to expect, since some backends index a
+	// per-thread client or nested directory with the thread index.
+	if usedThreads := counting.numberOfDownloadThreads(); usedThreads > 4 {
+		t.Errorf("The storage saw %d different thread indexes, more than the 4 threads it was created with", usedThreads)
+	}
+}
+
 // createPruneDeletionFixture creates 'revisions' snapshots, each referring to its own chunk, and returns a manager whose
 // storage tracks snapshot-file deletions.
 func createPruneDeletionFixture(t *testing.T, testDir string, revisions int) (*SnapshotManager, *instrumentedStorage) {
