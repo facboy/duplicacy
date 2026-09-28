@@ -8,13 +8,13 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -93,111 +93,6 @@ func TestIsDeletable(t *testing.T) {
 	if !isDeletable || len(newSnapshots) != 4 {
 		t.Errorf("Scenario 6: should be deletable, 4 new snapshots")
 	}
-}
-
-func createTestSnapshotManager(testDir string) *SnapshotManager {
-
-	os.RemoveAll(testDir)
-	os.MkdirAll(testDir, 0700)
-
-	storage, _ := CreateFileStorage(testDir, false, 1)
-	storage.CreateDirectory(0, "chunks")
-	storage.CreateDirectory(0, "snapshots")
-	config := CreateConfig()
-	snapshotManager := CreateSnapshotManager(config, storage)
-
-	cacheDir := path.Join(testDir, "cache")
-	snapshotCache, _ := CreateFileStorage(cacheDir, false, 1)
-	snapshotCache.CreateDirectory(0, "chunks")
-	snapshotCache.CreateDirectory(0, "snapshots")
-
-	snapshotManager.snapshotCache = snapshotCache
-
-	SetDuplicacyPreferencePath(testDir + "/.duplicacy")
-
-	return snapshotManager
-}
-
-func uploadTestChunk(manager *SnapshotManager, content []byte) string {
-
-	chunkOperator := CreateChunkOperator(manager.config, manager.storage, nil, false, false, *testThreads, false)
-	chunkOperator.UploadCompletionFunc = func(chunk *Chunk, chunkIndex int, skipped bool, chunkSize int, uploadSize int) {
-		LOG_INFO("UPLOAD_CHUNK", "Chunk %s size %d uploaded", chunk.GetID(), chunkSize)
-	}
-
-	chunk := CreateChunk(manager.config, true)
-	chunk.Reset(true)
-	chunk.Write(content)
-
-	chunkOperator.Upload(chunk, 0, false)
-	chunkOperator.WaitForCompletion()
-	chunkOperator.Stop()
-
-	return chunk.GetHash()
-}
-
-func uploadRandomChunk(manager *SnapshotManager, chunkSize int) string {
-	content := make([]byte, chunkSize)
-	_, err := rand.Read(content)
-	if err != nil {
-		LOG_ERROR("UPLOAD_RANDOM", "Error generating random content: %v", err)
-		return ""
-	}
-
-	return uploadTestChunk(manager, content)
-}
-
-func uploadRandomChunks(manager *SnapshotManager, chunkSize int, numberOfChunks int) []string {
-	chunkList := make([]string, 0)
-	for i := 0; i < numberOfChunks; i++ {
-		chunkHash := uploadRandomChunk(manager, chunkSize)
-		chunkList = append(chunkList, chunkHash)
-	}
-	return chunkList
-}
-
-func createTestSnapshot(manager *SnapshotManager, snapshotID string, revision int, startTime int64, endTime int64, chunkHashes []string, tag string) {
-
-	snapshot := &Snapshot{
-		ID:          snapshotID,
-		Revision:    revision,
-		StartTime:   startTime,
-		EndTime:     endTime,
-		ChunkHashes: chunkHashes,
-		Tag:         tag,
-	}
-
-	var chunkHashesInHex []string
-	for _, chunkHash := range chunkHashes {
-		chunkHashesInHex = append(chunkHashesInHex, hex.EncodeToString([]byte(chunkHash)))
-	}
-
-	sequence, _ := json.Marshal(chunkHashesInHex)
-	snapshot.ChunkSequence = []string{uploadTestChunk(manager, sequence)}
-
-	description, _ := snapshot.MarshalJSON()
-	path := snapshotPath(snapshotID, snapshot.Revision)
-	manager.UploadFile(path, path, description)
-}
-
-// uploadTestMetadataChunk uploads 'content' as a metadata chunk, the same way the backup code does for the sequences
-// that make up a snapshot.
-func uploadTestMetadataChunk(manager *SnapshotManager, content []byte) string {
-
-	chunkOperator := CreateChunkOperator(manager.config, manager.storage, manager.snapshotCache, false, false, 1, false)
-	defer chunkOperator.Stop()
-
-	chunkOperator.UploadCompletionFunc = func(chunk *Chunk, chunkIndex int, skipped bool, chunkSize int, uploadSize int) {
-	}
-
-	chunk := CreateChunk(manager.config, true)
-	chunk.Reset(true)
-	chunk.Write(content)
-
-	chunkOperator.Upload(chunk, 0, true)
-	chunkOperator.WaitForCompletion()
-
-	return chunk.GetHash()
 }
 
 // createTestSnapshotWithFiles uploads a snapshot that lists the given files rather than an empty one, so that the
@@ -421,84 +316,6 @@ func TestDownloadSnapshotCache(t *testing.T) {
 	}
 }
 
-// countingStorage counts the GetFileInfo calls made through the Storage interface, records the thread indexes that
-// file downloads were attributed to, and tracks how many downloads are in flight at the same time.  A small delay in
-// DownloadFile widens the window in which concurrent downloads overlap, so the peak observed here is what a test uses
-// to tell a serial loop from a parallel one.  Methods not overridden here are promoted from the embedded FileStorage,
-// so the storage behaves exactly like the real one.
-type countingStorage struct {
-	*FileStorage
-	getFileInfoCalls int
-	downloadThreads  map[int]bool
-	downloadPaths    map[string]int
-	downloadInFlight int
-	downloadPeak     int
-	downloadLock     sync.Mutex
-}
-
-func (storage *countingStorage) GetFileInfo(threadIndex int, filePath string) (exist bool, isDir bool, size int64, err error) {
-	storage.getFileInfoCalls++
-	return storage.FileStorage.GetFileInfo(threadIndex, filePath)
-}
-
-func (storage *countingStorage) DownloadFile(threadIndex int, filePath string, chunk *Chunk) (err error) {
-
-	storage.downloadLock.Lock()
-	if storage.downloadThreads == nil {
-		storage.downloadThreads = make(map[int]bool)
-	}
-	if storage.downloadPaths == nil {
-		storage.downloadPaths = make(map[string]int)
-	}
-	storage.downloadThreads[threadIndex] = true
-	storage.downloadPaths[filePath]++
-	storage.downloadInFlight++
-	if storage.downloadInFlight > storage.downloadPeak {
-		storage.downloadPeak = storage.downloadInFlight
-	}
-	storage.downloadLock.Unlock()
-
-	// Give the other workers a chance to enter this method before this download finishes.
-	time.Sleep(time.Millisecond)
-
-	err = storage.FileStorage.DownloadFile(threadIndex, filePath, chunk)
-
-	storage.downloadLock.Lock()
-	storage.downloadInFlight--
-	storage.downloadLock.Unlock()
-
-	return err
-}
-
-func (storage *countingStorage) numberOfDownloadThreads() int {
-	storage.downloadLock.Lock()
-	defer storage.downloadLock.Unlock()
-	return len(storage.downloadThreads)
-}
-
-// chunkDownloadCounts returns how many times each chunk file was read from the storage.
-func (storage *countingStorage) chunkDownloadCounts() (counts map[string]int) {
-	storage.downloadLock.Lock()
-	defer storage.downloadLock.Unlock()
-
-	counts = make(map[string]int)
-	for filePath, count := range storage.downloadPaths {
-		if strings.HasPrefix(filePath, "chunks/") {
-			counts[filePath] = count
-		}
-	}
-	return counts
-}
-
-// resetDownloadStats forgets the thread indexes and the peak number of concurrent downloads seen so far.
-func (storage *countingStorage) resetDownloadStats() {
-	storage.downloadLock.Lock()
-	defer storage.downloadLock.Unlock()
-	storage.downloadThreads = nil
-	storage.downloadPaths = nil
-	storage.downloadPeak = 0
-}
-
 // capturedLog is a single message passed to one of the logging functions.
 type capturedLog struct {
 	level   int
@@ -544,13 +361,6 @@ func (capture *logCapture) failures() (failures []string) {
 	return failures
 }
 
-// peakConcurrentDownloads returns the largest number of downloads that were in flight at the same time.
-func (storage *countingStorage) peakConcurrentDownloads() int {
-	storage.downloadLock.Lock()
-	defer storage.downloadLock.Unlock()
-	return storage.downloadPeak
-}
-
 // Listing snapshots obtains the revisions from ListSnapshotRevisions, which already enumerated the snapshot
 // directory of the storage, so checking the existence of every revision again before downloading it only repeats an
 // operation that was just performed (and costs a round trip per revision on cloud storages).  The existence check
@@ -559,16 +369,12 @@ func TestDownloadSnapshotSkipsExistenceCheck(t *testing.T) {
 
 	setTestingT(t)
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("%v", r)
-		}
-	}()
+	defer recovering(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
 
 	snapshotManager := createTestSnapshotManager(testDir)
-	storage := &countingStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
+	storage := &instrumentedStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
 	snapshotManager.storage = storage
 
 	chunkHash := uploadRandomChunk(snapshotManager, 1024)
@@ -582,27 +388,26 @@ func TestDownloadSnapshotSkipsExistenceCheck(t *testing.T) {
 	createTestSnapshot(snapshotManager, "vm1@host1", 2, now-3600, now, []string{chunkHash}, "tag")
 
 	// Listing the revisions of a snapshot id and downloading them must not check their existence individually.
-	storage.getFileInfoCalls = 0
+	atomic.StoreInt64(&storage.getFileInfoCalls, 0)
 
 	numberOfSnapshots := snapshotManager.ListSnapshots("vm1@host1", []int{}, "", false, false, 1)
 	if numberOfSnapshots != 2 {
 		t.Errorf("Expecting 2 snapshots, got %d instead", numberOfSnapshots)
 	}
-	if storage.getFileInfoCalls != 0 {
+	if checks := atomic.LoadInt64(&storage.getFileInfoCalls); checks != 0 {
 		t.Errorf("Listing the revisions should not check the existence of each snapshot, but %d checks were made",
-			storage.getFileInfoCalls)
+			checks)
 	}
 
 	// A revision given by the user wasn't listed, so it is still checked against the storage before the download.
-	storage.getFileInfoCalls = 0
+	atomic.StoreInt64(&storage.getFileInfoCalls, 0)
 
 	numberOfSnapshots = snapshotManager.ListSnapshots("vm1@host1", []int{1}, "", false, false, 1)
 	if numberOfSnapshots != 1 {
 		t.Errorf("Expecting 1 snapshot, got %d instead", numberOfSnapshots)
 	}
-	if storage.getFileInfoCalls != 1 {
-		t.Errorf("A revision specified by the user should be checked once, but %d checks were made",
-			storage.getFileInfoCalls)
+	if checks := atomic.LoadInt64(&storage.getFileInfoCalls); checks != 1 {
+		t.Errorf("A revision specified by the user should be checked once, but %d checks were made", checks)
 	}
 
 	// The existence check must still be enforced for a revision that is no longer in the storage but whose file is
@@ -659,7 +464,7 @@ func TestDownloadSnapshotsConcurrently(t *testing.T) {
 	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
 
 	snapshotManager := createTestSnapshotManager(testDir)
-	counting := &countingStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
+	counting := &instrumentedStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
 	snapshotManager.storage = counting
 
 	chunkHash := uploadRandomChunk(snapshotManager, 1024)
@@ -737,11 +542,7 @@ func TestPruneDownloadsRevisionsConcurrently(t *testing.T) {
 
 	setTestingT(t)
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("%v", r)
-		}
-	}()
+	defer recovering(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
 
@@ -754,7 +555,7 @@ func TestPruneDownloadsRevisionsConcurrently(t *testing.T) {
 		t.Errorf("Failed to create the storage: %v", err)
 		return
 	}
-	counting := &countingStorage{FileStorage: threadedStorage}
+	counting := &instrumentedStorage{FileStorage: threadedStorage, downloadDelay: time.Millisecond}
 	snapshotManager.storage = counting
 
 	chunkHash := uploadRandomChunk(snapshotManager, 1024)
@@ -785,93 +586,9 @@ func TestPruneDownloadsRevisionsConcurrently(t *testing.T) {
 	}
 }
 
-// deletionTrackingStorage isolates the snapshot-file deletions that PruneSnapshots performs after the chunk phase.  It
-// counts how many of them were in flight at the same time, records the thread index each was attributed to and the
-// order they finished in, and can hold a deletion until the test releases its gate.  Only paths under 'snapshots/' are
-// tracked: the chunk deletions of -exclusive mode go through DeleteFile as well and would otherwise be counted too.
-// Methods not overridden here are promoted from the embedded FileStorage.
-type deletionTrackingStorage struct {
-	*FileStorage
-
-	deleteLock     sync.Mutex
-	deleteInFlight int
-	deletePeak     int
-	deleteThreads  map[int]bool
-	deleteOrder    []string
-
-	// entered is signalled once when a gated deletion has started, and gate holds a deletion until it is closed.
-	entered map[string]chan struct{}
-	gates   map[string]chan struct{}
-
-	// failPaths are the paths whose deletion reports an error instead of deleting.
-	failPaths map[string]bool
-}
-
-func (storage *deletionTrackingStorage) DeleteFile(threadIndex int, filePath string) (err error) {
-
-	if !strings.HasPrefix(filePath, "snapshots/") {
-		return storage.FileStorage.DeleteFile(threadIndex, filePath)
-	}
-
-	storage.deleteLock.Lock()
-	if storage.deleteThreads == nil {
-		storage.deleteThreads = make(map[int]bool)
-	}
-	storage.deleteThreads[threadIndex] = true
-	storage.deleteInFlight++
-	if storage.deleteInFlight > storage.deletePeak {
-		storage.deletePeak = storage.deleteInFlight
-	}
-	entered := storage.entered[filePath]
-	gate := storage.gates[filePath]
-	fail := storage.failPaths[filePath]
-	storage.deleteLock.Unlock()
-
-	if entered != nil {
-		entered <- struct{}{}
-	}
-	if gate != nil {
-		<-gate
-	}
-
-	if fail {
-		err = fmt.Errorf("injected deletion failure for %s", filePath)
-	} else {
-		err = storage.FileStorage.DeleteFile(threadIndex, filePath)
-	}
-
-	storage.deleteLock.Lock()
-	storage.deleteInFlight--
-	storage.deleteOrder = append(storage.deleteOrder, filePath)
-	storage.deleteLock.Unlock()
-
-	return err
-}
-
-// peakConcurrentDeletes returns the largest number of snapshot deletions that were in flight at the same time.
-func (storage *deletionTrackingStorage) peakConcurrentDeletes() int {
-	storage.deleteLock.Lock()
-	defer storage.deleteLock.Unlock()
-	return storage.deletePeak
-}
-
-// numberOfDeleteThreads returns how many distinct thread indexes the snapshot deletions were attributed to.
-func (storage *deletionTrackingStorage) numberOfDeleteThreads() int {
-	storage.deleteLock.Lock()
-	defer storage.deleteLock.Unlock()
-	return len(storage.deleteThreads)
-}
-
-// finishedDeletes returns the snapshot paths in the order their deletions finished.
-func (storage *deletionTrackingStorage) finishedDeletes() []string {
-	storage.deleteLock.Lock()
-	defer storage.deleteLock.Unlock()
-	return append([]string{}, storage.deleteOrder...)
-}
-
 // createPruneDeletionFixture creates 'revisions' snapshots, each referring to its own chunk, and returns a manager whose
 // storage tracks snapshot-file deletions.
-func createPruneDeletionFixture(t *testing.T, testDir string, revisions int) (*SnapshotManager, *deletionTrackingStorage) {
+func createPruneDeletionFixture(t *testing.T, testDir string, revisions int) (*SnapshotManager, *instrumentedStorage) {
 
 	snapshotManager := createTestSnapshotManager(testDir)
 
@@ -880,7 +597,7 @@ func createPruneDeletionFixture(t *testing.T, testDir string, revisions int) (*S
 		t.Errorf("Failed to create the storage: %v", err)
 		return snapshotManager, nil
 	}
-	tracking := &deletionTrackingStorage{
+	tracking := &instrumentedStorage{
 		FileStorage: threadedStorage,
 		entered:     make(map[string]chan struct{}),
 		gates:       make(map[string]chan struct{}),
@@ -967,11 +684,7 @@ func TestPruneDeletesSnapshotsConcurrently(t *testing.T) {
 
 	setTestingT(t)
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("%v", r)
-		}
-	}()
+	defer recovering(t)
 
 	for _, threads := range []int{1, 4} {
 
@@ -1014,11 +727,7 @@ func TestPruneSnapshotDeletionOutputStaysInRevisionOrder(t *testing.T) {
 
 	setTestingT(t)
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("%v", r)
-		}
-	}()
+	defer recovering(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
 
@@ -1117,11 +826,7 @@ func TestPruneStreamsSnapshotDeletionOutput(t *testing.T) {
 
 	setTestingT(t)
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("%v", r)
-		}
-	}()
+	defer recovering(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
 
@@ -1221,11 +926,7 @@ func TestPruneStopsAtTheFirstFailedSnapshotDeletion(t *testing.T) {
 
 	setTestingT(t)
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("%v", r)
-		}
-	}()
+	defer recovering(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
 
@@ -1296,11 +997,7 @@ func TestPruneExpandsSequencesConcurrently(t *testing.T) {
 
 	setTestingT(t)
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("%v", r)
-		}
-	}()
+	defer recovering(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
 
@@ -1311,7 +1008,7 @@ func TestPruneExpandsSequencesConcurrently(t *testing.T) {
 		t.Errorf("Failed to create the storage: %v", err)
 		return
 	}
-	counting := &countingStorage{FileStorage: threadedStorage}
+	counting := &instrumentedStorage{FileStorage: threadedStorage, downloadDelay: time.Millisecond}
 	snapshotManager.storage = counting
 
 	// No snapshot cache, so that every metadata chunk of a sequence is fetched from the storage; otherwise the second
@@ -1404,11 +1101,7 @@ func TestSharedSequenceIsExpandedOnce(t *testing.T) {
 
 	setTestingT(t)
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("%v", r)
-		}
-	}()
+	defer recovering(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
 
@@ -1419,7 +1112,7 @@ func TestSharedSequenceIsExpandedOnce(t *testing.T) {
 		t.Errorf("Failed to create the storage: %v", err)
 		return
 	}
-	counting := &countingStorage{FileStorage: threadedStorage}
+	counting := &instrumentedStorage{FileStorage: threadedStorage, downloadDelay: time.Millisecond}
 	snapshotManager.storage = counting
 
 	// No snapshot cache: the cache would also fold the repeated reads of a shared sequence, so it has to be out of the
@@ -1494,16 +1187,12 @@ func TestDownloadSequencePreservesOrderConcurrently(t *testing.T) {
 
 	setTestingT(t)
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("%v", r)
-		}
-	}()
+	defer recovering(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
 
 	snapshotManager := createTestSnapshotManager(testDir)
-	counting := &countingStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
+	counting := &instrumentedStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
 	snapshotManager.storage = counting
 
 	// One sequence of ten chunks, each with a distinctive content, so that a swapped pair is detectable.
@@ -1532,16 +1221,12 @@ func TestListFilesWalksTheFileSequenceOnce(t *testing.T) {
 
 	setTestingT(t)
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("%v", r)
-		}
-	}()
+	defer recovering(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
 
 	snapshotManager := createTestSnapshotManager(testDir)
-	counting := &countingStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
+	counting := &instrumentedStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
 	snapshotManager.storage = counting
 
 	// The entries are deliberately not in sorted order: the order they are printed in must be the order they are

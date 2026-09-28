@@ -16,8 +16,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"runtime/debug"
 )
 
 func createRandomFile(path string, maxSize int) {
@@ -183,18 +181,7 @@ func TestBackupManager(t *testing.T) {
 	setTestingT(t)
 	SetLoggingLevel(INFO)
 
-	defer func() {
-		if r := recover(); r != nil {
-			switch e := r.(type) {
-			case Exception:
-				t.Errorf("%s %s", e.LogID, e.Message)
-				debug.PrintStack()
-			default:
-				t.Errorf("%v", e)
-				debug.PrintStack()
-			}
-		}
-	}()
+	defer recoveringWithStack(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_test")
 	os.RemoveAll(testDir)
@@ -386,37 +373,6 @@ func TestBackupManager(t *testing.T) {
 	  fmt.Printf("%s", buf)*/
 }
 
-// Create file with random file with certain seed
-func createRandomFileSeeded(path string, maxSize int, seed int64) {
-	// Use a private generator rather than rand.Seed, which is a no-op for modules that declare
-	// go 1.24 or later, so that the same seed always produces the same file.
-	rng := rand.New(rand.NewSource(seed))
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		LOG_ERROR("RANDOM_FILE", "Can't open %s for writing: %v", path, err)
-		return
-	}
-
-	defer file.Close()
-
-	size := maxSize/2 + rng.Int()%(maxSize/2)
-
-	buffer := make([]byte, 32*1024)
-	for size > 0 {
-		bytes := size
-		if bytes > cap(buffer) {
-			bytes = cap(buffer)
-		}
-		rng.Read(buffer[:bytes])
-		bytes, err = file.Write(buffer[:bytes])
-		if err != nil {
-			LOG_ERROR("RANDOM_FILE", "Failed to write to %s: %v", path, err)
-			return
-		}
-		size -= bytes
-	}
-}
-
 func corruptFile(path string, start int, length int, seed int64) {
 	rng := rand.New(rand.NewSource(seed))
 
@@ -455,18 +411,7 @@ func TestPersistRestore(t *testing.T) {
 	setTestingT(t)
 	SetLoggingLevel(INFO)
 
-	defer func() {
-		if r := recover(); r != nil {
-			switch e := r.(type) {
-			case Exception:
-				t.Errorf("%s %s", e.LogID, e.Message)
-				debug.PrintStack()
-			default:
-				t.Errorf("%v", e)
-				debug.PrintStack()
-			}
-		}
-	}()
+	defer recoveringWithStack(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_test")
 	os.RemoveAll(testDir)

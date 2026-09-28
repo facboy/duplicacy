@@ -14,7 +14,7 @@ The branch is 30 commits ahead of `upstream/master`: about 7,000 added lines ove
 the module files. Almost all of it serves one goal — stop `prune`, `copy` and
 `list` paying a round trip per revision, and drop a redundant `fsync`.
 
-The changes work, and the per-backend listing work is factored well. The six
+The changes work, and the per-backend listing work is factored well. The seven
 refactorings below have since been applied; what remains of the duplication is
 lower-value and listed in the same order.
 
@@ -30,6 +30,8 @@ Ordered by payoff:
    once.
 6. Chunk-operator shutdown (applied) — one deferred shutdown replaces the five
    copied blocks.
+7. Test scaffolding (applied) — the shared helpers and the storage doubles each
+   live in one place, and the repeated recovery block is one deferred helper.
 
 ## Duplicated code
 
@@ -131,21 +133,32 @@ command methods (`ListSnapshots`, `CheckSnapshots`, `Diff`, `ShowHistory`,
 The helper has to do the work itself rather than defer it internally, since a
 deferred call has to reach the command method's own return.
 
-### Test scaffolding and storage doubles
+### Test scaffolding and storage doubles — applied
 
-Roughly 3,000 lines of test code are added. The shared helpers are scattered by
+Roughly 3,000 lines of test code are added. The shared helpers were scattered by
 whoever needed them first: `createTestSnapshotManager`, `uploadRandomChunk`,
 `createTestSnapshot` and `uploadTestMetadataChunk` in
 `duplicacy_snapshotmanager_test.go`; `readChunkTree` and `createChunkDirectories` in
 `duplicacy_copymanager_test.go`; `createRandomFileSeeded` in
 `duplicacy_backupmanager_test.go`. The tests call across those files.
 
-Four `FileStorage` wrappers now exist — `copyTestStorage`, `countingStorage`,
-`deletionTrackingStorage`, `blockedDownloadStorage` — each overriding a different
-subset with its own mutex and counters. The `defer recover()` block that reports
-into `t.Errorf` repeats about 13 times. One shared test file and one instrumented
-storage base would cut most of it; Go embedding makes this partial, but the current
-spread is wider than needed.
+Six instrumented storages existed — `copyTestStorage`, `countingStorage`,
+`deletionTrackingStorage`, `blockedDownloadStorage`, `failingBenchmarkStorage` and
+`failingDownloadStorage` — each overriding a different subset with its own mutex and
+counters. The `defer recover()` block that reports into `t.Errorf` repeated about 13
+times.
+
+Done: the scaffolding shared by the test files now lives in
+`src/duplicacy_testutils_test.go`, which holds `readChunkTree`,
+`createChunkDirectories`, `createTestSnapshotManager`, `uploadTestChunk`,
+`uploadRandomChunk(s)`, `createTestSnapshot`, `uploadTestMetadataChunk` and
+`createRandomFileSeeded`. The six storages are one `instrumentedStorage`
+whose optional fields turn on the counting, the blocked download and the injected
+failures, and whose default behaviour is the promoted `FileStorage`. The repeated
+recovery block is `recovering(t)`/`recoveringWithStack(t)`. The tests that assert on
+a specific `Exception` (`verifyChunk`, `encryptChunk`, `downloadedSnapshotMissing`,
+`recoverPanicFrom`) keep their own recovery, since they inspect the panic rather
+than report it.
 
 ### Documents
 
@@ -236,10 +249,11 @@ The sentinel is now the named `cloudFileFailure`, shared by the producer in
 ## How to apply
 
 The concurrency helper, the raw-chunk copy plumbing, the path and sequence helpers,
-the cloud-file detection, the empty-listing rationale and the chunk-operator
-shutdown have been applied. The recommended order was the concurrency helper first,
-then the raw-chunk copy flow, then the path and sequence helpers; the remaining
-items -- the test scaffolding and the smaller items -- are unchanged. The unit tests
+the cloud-file detection, the empty-listing rationale, the chunk-operator shutdown
+and the test scaffolding have been applied. The recommended order was the
+concurrency helper first, then the raw-chunk copy flow, then the path and sequence
+helpers; the remaining items -- the documents and the smaller items -- are
+unchanged. The unit tests
 in `src/` are the safety net:
 `go test ./src/ -vet=off`. Note the two tests that fail on a pristine checkout for
 unrelated reasons (`TestEntryExcludeByAttribute`, `TestPersistRestore`), and the

@@ -8,47 +8,13 @@ import (
 	"bytes"
 	"crypto/rsa"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"path"
-	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"runtime/debug"
 )
-
-// readChunkTree reads every chunk file under '<storageDir>/chunks' into a map from its path relative to 'chunks/' to
-// its content, so that two storages can be compared byte for byte.
-func readChunkTree(t *testing.T, storageDir string) map[string][]byte {
-	tree := make(map[string][]byte)
-	root := path.Join(storageDir, "chunks")
-	err := filepath.Walk(root, func(chunkPath string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() || strings.HasSuffix(chunkPath, ".fsl") {
-			return nil
-		}
-		content, err := ioutil.ReadFile(chunkPath)
-		if err != nil {
-			return err
-		}
-		relativePath, err := filepath.Rel(root, chunkPath)
-		if err != nil {
-			return err
-		}
-		tree[relativePath] = content
-		return nil
-	})
-	if err != nil {
-		t.Errorf("Failed to read the chunk tree under %s: %v", root, err)
-	}
-	return tree
-}
 
 // TestIsBitIdenticalWith checks the predicate that decides whether a chunk may be copied without being re-encoded.  A
 // pair of storages is bit-identical only when they agree on the chunk hash, the chunk id, the chunk encryption key,
@@ -115,96 +81,6 @@ type copyCase struct {
 	seed        int64
 	bitCopy     bool
 	rawExpected bool // whether the two storages should store a chunk identically
-}
-
-// copyTestStorage is a FileStorage with a settable IsFastListing, counting the lookups, chunk and snapshot uploads,
-// chunk downloads, snapshot-file existence checks, listings and snapshot directory creations, which is how a test tells
-// how a copy discovered what the destination already held and how often it repeated an operation.
-type copyTestStorage struct {
-	*FileStorage
-
-	isFastListing     bool
-	findChunkCalls    int64
-	snapshotInfoCalls int64
-	snapshotListings  int64
-	snapshotDirCalls  int64
-	uploadedChunks    int64
-	uploadedSnapshots int64
-	chunkDownloads    int64
-}
-
-func (storage *copyTestStorage) IsFastListing() bool { return storage.isFastListing }
-
-// CreateDirectory counts the creation of a snapshot id's directory, which the copy must do once rather than once per
-// revision.  The directories created at init time are 'chunks' and 'snapshots', neither of which is under 'snapshots/'.
-func (storage *copyTestStorage) CreateDirectory(threadIndex int, dir string) (err error) {
-	if strings.HasPrefix(dir, "snapshots/") {
-		atomic.AddInt64(&storage.snapshotDirCalls, 1)
-	}
-	return storage.FileStorage.CreateDirectory(threadIndex, dir)
-}
-
-func (storage *copyTestStorage) FindChunk(threadIndex int, chunkID string, isFossil bool) (filePath string, exist bool, size int64, err error) {
-	atomic.AddInt64(&storage.findChunkCalls, 1)
-	return storage.FileStorage.FindChunk(threadIndex, chunkID, isFossil)
-}
-
-func (storage *copyTestStorage) ListFiles(threadIndex int, dir string) (files []string, sizes []int64, err error) {
-	// Only the listing of one snapshot id's directory is counted; the listing of 'snapshots/' itself enumerates the ids
-	// and is not what the copy can use to learn the destination's revisions.
-	if strings.HasPrefix(dir, "snapshots/") && dir != "snapshots/" {
-		atomic.AddInt64(&storage.snapshotListings, 1)
-	}
-	return storage.FileStorage.ListFiles(threadIndex, dir)
-}
-
-func (storage *copyTestStorage) GetFileInfo(threadIndex int, filePath string) (exist bool, isDir bool, size int64, err error) {
-	// A chunk lookup goes through FindChunk, which calls this method with a chunk path; only the snapshot paths are
-	// counted here, since they are what a per-revision check would ask about.
-	if strings.HasPrefix(filePath, "snapshots/") {
-		atomic.AddInt64(&storage.snapshotInfoCalls, 1)
-	}
-	return storage.FileStorage.GetFileInfo(threadIndex, filePath)
-}
-
-func (storage *copyTestStorage) UploadFile(threadIndex int, filePath string, content []byte) (err error) {
-	if strings.HasPrefix(filePath, "chunks/") {
-		atomic.AddInt64(&storage.uploadedChunks, 1)
-	} else if strings.HasPrefix(filePath, "snapshots/") {
-		atomic.AddInt64(&storage.uploadedSnapshots, 1)
-	}
-	return storage.FileStorage.UploadFile(threadIndex, filePath, content)
-}
-
-func (storage *copyTestStorage) DownloadFile(threadIndex int, filePath string, chunk *Chunk) (err error) {
-	// Chunk files are read both while the snapshots are read and while the chunks are copied; snapshot files are not
-	// chunk data and are not counted.
-	if strings.HasPrefix(filePath, "chunks/") {
-		atomic.AddInt64(&storage.chunkDownloads, 1)
-	}
-	return storage.FileStorage.DownloadFile(threadIndex, filePath, chunk)
-}
-
-// resetCounters clears the counters between operations.
-func (storage *copyTestStorage) resetCounters() {
-	atomic.StoreInt64(&storage.findChunkCalls, 0)
-	atomic.StoreInt64(&storage.snapshotInfoCalls, 0)
-	atomic.StoreInt64(&storage.snapshotListings, 0)
-	atomic.StoreInt64(&storage.snapshotDirCalls, 0)
-	atomic.StoreInt64(&storage.uploadedChunks, 0)
-	atomic.StoreInt64(&storage.uploadedSnapshots, 0)
-	atomic.StoreInt64(&storage.chunkDownloads, 0)
-}
-
-// createChunkDirectories creates 'numberOfDirectories' directories under 'chunks/'.
-func createChunkDirectories(t *testing.T, storageDir string, numberOfDirectories int) {
-	for i := 0; i < numberOfDirectories; i++ {
-		dir := path.Join(storageDir, "chunks", fmt.Sprintf("%02x", i))
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			t.Errorf("Failed to create the chunk directory %s: %v", dir, err)
-			return
-		}
-	}
 }
 
 // TestChunkPath checks that ChunkPath derives the path FindChunk reports for a missing chunk, and rejects an
@@ -284,18 +160,7 @@ func TestCopyChunkProbe(t *testing.T) {
 	setTestingT(t)
 	SetLoggingLevel(INFO)
 
-	defer func() {
-		if r := recover(); r != nil {
-			switch e := r.(type) {
-			case Exception:
-				t.Errorf("%s %s", e.LogID, e.Message)
-				debug.PrintStack()
-			default:
-				t.Errorf("%v", e)
-				debug.PrintStack()
-			}
-		}
-	}()
+	defer recoveringWithStack(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_copy_probe_test")
 	os.RemoveAll(testDir)
@@ -311,7 +176,7 @@ func TestCopyChunkProbe(t *testing.T) {
 		t.Errorf("Failed to create the source storage: %v", err)
 		return
 	}
-	sourceStorage := &copyTestStorage{FileStorage: innerSource.(*FileStorage)}
+	sourceStorage := &instrumentedStorage{FileStorage: innerSource.(*FileStorage)}
 	if !ConfigStorage(sourceStorage, 16384, DEFAULT_COMPRESSION_LEVEL, 64*1024, 256*1024, 16*1024, "", nil, false, "", 0, 0) {
 		t.Errorf("Failed to configure the source storage")
 		return
@@ -370,7 +235,7 @@ func TestCopyChunkProbe(t *testing.T) {
 		// The count decides whether a slow-listing storage is listed or probed; the names are not chunk ids.
 		createChunkDirectories(t, destinationDir, c.numberOfDirs)
 
-		destinationStorage := &copyTestStorage{FileStorage: innerDestination, isFastListing: c.isFastListing}
+		destinationStorage := &instrumentedStorage{FileStorage: innerDestination, isFastListing: c.isFastListing}
 		if !ConfigStorage(destinationStorage, 16384, DEFAULT_COMPRESSION_LEVEL, 64*1024, 256*1024, 16*1024,
 			"", sourceManager.config, false, "", 0, 0) {
 			t.Errorf("Failed to configure the %s destination storage", c.name)
@@ -470,18 +335,7 @@ func TestCopyDestinationRevisionCheck(t *testing.T) {
 	setTestingT(t)
 	SetLoggingLevel(INFO)
 
-	defer func() {
-		if r := recover(); r != nil {
-			switch e := r.(type) {
-			case Exception:
-				t.Errorf("%s %s", e.LogID, e.Message)
-				debug.PrintStack()
-			default:
-				t.Errorf("%v", e)
-				debug.PrintStack()
-			}
-		}
-	}()
+	defer recoveringWithStack(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_copy_revision_test")
 	os.RemoveAll(testDir)
@@ -502,7 +356,7 @@ func TestCopyDestinationRevisionCheck(t *testing.T) {
 		t.Errorf("Failed to configure the source storage")
 		return
 	}
-	sourceStorage := &copyTestStorage{FileStorage: innerSource.(*FileStorage)}
+	sourceStorage := &instrumentedStorage{FileStorage: innerSource.(*FileStorage)}
 
 	repository := path.Join(testDir, "repository")
 	os.MkdirAll(path.Join(repository, ".duplicacy"), 0700)
@@ -521,14 +375,14 @@ func TestCopyDestinationRevisionCheck(t *testing.T) {
 	}
 
 	// createDestination creates an empty storage configured like the source and its backup manager.
-	createDestination := func(name string) (*copyTestStorage, *BackupManager) {
+	createDestination := func(name string) (*instrumentedStorage, *BackupManager) {
 		destinationDir := path.Join(testDir, name+"_storage")
 		innerDestination, err := CreateFileStorage(destinationDir, false, threads)
 		if err != nil {
 			t.Errorf("Failed to create the %s destination storage: %v", name, err)
 			return nil, nil
 		}
-		destinationStorage := &copyTestStorage{FileStorage: innerDestination}
+		destinationStorage := &instrumentedStorage{FileStorage: innerDestination}
 		if !ConfigStorage(destinationStorage, 16384, DEFAULT_COMPRESSION_LEVEL, 64*1024, 256*1024, 16*1024,
 			"", sourceManager.config, false, "", 0, 0) {
 			t.Errorf("Failed to configure the %s destination storage", name)
@@ -626,18 +480,7 @@ func TestCopySnapshots(t *testing.T) {
 	setTestingT(t)
 	SetLoggingLevel(INFO)
 
-	defer func() {
-		if r := recover(); r != nil {
-			switch e := r.(type) {
-			case Exception:
-				t.Errorf("%s %s", e.LogID, e.Message)
-				debug.PrintStack()
-			default:
-				t.Errorf("%v", e)
-				debug.PrintStack()
-			}
-		}
-	}()
+	defer recoveringWithStack(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_copy_test")
 	os.RemoveAll(testDir)

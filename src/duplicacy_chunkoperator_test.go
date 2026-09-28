@@ -9,29 +9,12 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
-	"runtime/debug"
-	"sync"
 	"testing"
 	"time"
 
 	crypto_rand "crypto/rand"
 	"math/rand"
 )
-
-// blockedDownloadStorage holds every chunk download until the test releases it, so that a test can decide exactly when
-// the last outstanding task finishes.
-type blockedDownloadStorage struct {
-	*FileStorage
-	entered chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (storage *blockedDownloadStorage) DownloadFile(threadIndex int, filePath string, chunk *Chunk) (err error) {
-	storage.once.Do(func() { close(storage.entered) })
-	<-storage.release
-	return storage.FileStorage.DownloadFile(threadIndex, filePath, chunk)
-}
 
 // WaitForCompletion has to be woken by the task that finishes last.  It used to poll the task counter every
 // 100 ms, so a command whose chunk work takes a few milliseconds -- the whole run on a local storage --
@@ -42,11 +25,7 @@ func TestWaitForCompletionIsWokenNotPolled(t *testing.T) {
 
 	setTestingT(t)
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("%v", r)
-		}
-	}()
+	defer recovering(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_test", "chunk_operator_test")
 	os.RemoveAll(testDir)
@@ -77,10 +56,10 @@ func TestWaitForCompletionIsWokenNotPolled(t *testing.T) {
 	uploader.WaitForCompletion()
 	uploader.Stop()
 
-	blocked := &blockedDownloadStorage{
-		FileStorage: storage,
-		entered:     make(chan struct{}),
-		release:     make(chan struct{}),
+	blocked := &instrumentedStorage{
+		FileStorage:  storage,
+		blockEntered: make(chan struct{}),
+		blockRelease: make(chan struct{}),
 	}
 
 	// No snapshot cache, so that the download goes to the storage and reaches the blocked DownloadFile.
@@ -91,7 +70,7 @@ func TestWaitForCompletionIsWokenNotPolled(t *testing.T) {
 		config.PutChunk(downloaded)
 	})
 
-	<-blocked.entered
+	<-blocked.blockEntered
 
 	start := time.Now()
 	finished := make(chan struct{})
@@ -103,7 +82,7 @@ func TestWaitForCompletionIsWokenNotPolled(t *testing.T) {
 	// The download is still held here, so WaitForCompletion is waiting on it and the release is the only thing that can
 	// wake it up.  This sleep is well under the 100 ms poll interval that this test is against.
 	time.Sleep(20 * time.Millisecond)
-	close(blocked.release)
+	close(blocked.blockRelease)
 	<-finished
 
 	if elapsed := time.Since(start); elapsed >= 60*time.Millisecond {
@@ -119,12 +98,7 @@ func TestDownloadRawChunk(t *testing.T) {
 
 	setTestingT(t)
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("%v", r)
-			debug.PrintStack()
-		}
-	}()
+	defer recoveringWithStack(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_test", "raw_chunk_test")
 	os.RemoveAll(testDir)
@@ -193,18 +167,7 @@ func TestChunkOperator(t *testing.T) {
 	setTestingT(t)
 	SetLoggingLevel(DEBUG)
 
-	defer func() {
-		if r := recover(); r != nil {
-			switch e := r.(type) {
-			case Exception:
-				t.Errorf("%s %s", e.LogID, e.Message)
-				debug.PrintStack()
-			default:
-				t.Errorf("%v", e)
-				debug.PrintStack()
-			}
-		}
-	}()
+	defer recoveringWithStack(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_test", "storage_test")
 	os.RemoveAll(testDir)

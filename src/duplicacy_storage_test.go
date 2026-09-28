@@ -16,7 +16,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path"
-	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -323,18 +322,7 @@ func TestStorage(t *testing.T) {
 	setTestingT(t)
 	SetLoggingLevel(INFO)
 
-	defer func() {
-		if r := recover(); r != nil {
-			switch e := r.(type) {
-			case Exception:
-				t.Errorf("%s %s", e.LogID, e.Message)
-				debug.PrintStack()
-			default:
-				t.Errorf("%v", e)
-				debug.PrintStack()
-			}
-		}
-	}()
+	defer recoveringWithStack(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_test", "storage_test")
 	os.RemoveAll(testDir)
@@ -589,18 +577,7 @@ func TestCleanStorage(t *testing.T) {
 	setTestingT(t)
 	SetLoggingLevel(INFO)
 
-	defer func() {
-		if r := recover(); r != nil {
-			switch e := r.(type) {
-			case Exception:
-				t.Errorf("%s %s", e.LogID, e.Message)
-				debug.PrintStack()
-			default:
-				t.Errorf("%v", e)
-				debug.PrintStack()
-			}
-		}
-	}()
+	defer recoveringWithStack(t)
 
 	testDir := path.Join(os.TempDir(), "duplicacy_test", "storage_test")
 	os.RemoveAll(testDir)
@@ -781,11 +758,7 @@ func TestB2ListSnapshotsListsOnlyDirectChildren(t *testing.T) {
 
 	setTestingT(t)
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("%v", r)
-		}
-	}()
+	defer recovering(t)
 
 	server := newB2TestServer([]string{
 		"chunks/00/0000000000000000000000000000000000000000000000000000000000000000",
@@ -883,11 +856,7 @@ func TestAzureListSnapshotsListsOnlyDirectChildren(t *testing.T) {
 
 	setTestingT(t)
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("%v", r)
-		}
-	}()
+	defer recovering(t)
 
 	transport := &azureTestTransport{files: []string{
 		"snapshots/vm1@host1/1",

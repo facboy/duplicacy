@@ -244,7 +244,7 @@ func TestBenchmarkReraisesWorkerFailure(t *testing.T) {
 		return
 	}
 
-	failing := &failingBenchmarkStorage{Storage: storage}
+	failing := &instrumentedStorage{FileStorage: storage, uploadFailures: true}
 
 	// One chunk and one thread keep the run small, and a zero file size skips the local disk write.  The chunk size has
 	// to be a power of two, so it is the smallest valid one rather than zero.
@@ -265,34 +265,6 @@ func TestBenchmarkReraisesWorkerFailure(t *testing.T) {
 	if attempted := atomic.LoadInt64(&failing.attempted); attempted != 1 {
 		t.Errorf("Expecting the single chunk to be uploaded once, got %d attempts", attempted)
 	}
-}
-
-// failingBenchmarkStorage makes every upload fail, so that the LOG_ERROR the benchmark raises from a worker can be
-// observed from Benchmark itself.  Methods not overridden here are promoted from the embedded storage.
-type failingBenchmarkStorage struct {
-	Storage
-	attempted int64
-}
-
-func (storage *failingBenchmarkStorage) UploadFile(threadIndex int, filePath string, content []byte) (err error) {
-	atomic.AddInt64(&storage.attempted, 1)
-	return fmt.Errorf("injected benchmark failure for %s", filePath)
-}
-
-// failingDownloadStorage makes the download of one file fail, so that a test can check that the error a worker raises
-// is reported from the calling goroutine.
-type failingDownloadStorage struct {
-	*FileStorage
-	failPath  string
-	attempted int64
-}
-
-func (storage *failingDownloadStorage) DownloadFile(threadIndex int, filePath string, chunk *Chunk) (err error) {
-	atomic.AddInt64(&storage.attempted, 1)
-	if filePath == storage.failPath {
-		return fmt.Errorf("injected download failure for %s", filePath)
-	}
-	return storage.FileStorage.DownloadFile(threadIndex, filePath, chunk)
 }
 
 // The snapshot downloads run on the helper, so a failure in one of them has to surface from downloadSnapshots itself
@@ -318,9 +290,9 @@ func TestDownloadSnapshotsReraisesWorkerFailure(t *testing.T) {
 			[]string{chunkHash}, "tag")
 	}
 
-	failing := &failingDownloadStorage{
-		FileStorage: snapshotManager.storage.(*FileStorage),
-		failPath:    "snapshots/vm1@host1/3",
+	failing := &instrumentedStorage{
+		FileStorage:      snapshotManager.storage.(*FileStorage),
+		downloadFailPath: "snapshots/vm1@host1/3",
 	}
 	snapshotManager.storage = failing
 
