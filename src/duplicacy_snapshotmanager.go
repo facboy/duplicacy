@@ -901,8 +901,11 @@ func (manager *SnapshotManager) ListSnapshots(snapshotID string, revisionsToList
 				snapshotID, revision, creationTime, tagWithSpace, options)
 
 			if showFiles {
-				// We need to fill in ChunkHashes and ChunkLengths to verify that each entry is valid
-				manager.DownloadSnapshotSequences(snapshot)
+				// Only ChunkLengths is needed to verify each entry (Entry.check bounds it against the sequence),
+				// and the file walk below reads it.  The chunk hash sequence is what -chunks prints, and
+				// GetSnapshotChunks expands it itself, so fetching it here would be one metadata chunk per
+				// revision -- a round trip on cloud storage -- that nothing in this branch reads.
+				manager.DownloadSnapshotSequence(snapshot, "lengths")
 
 				if snapshot.NumberOfFiles > 0 {
 					LOG_INFO("SNAPSHOT_STATS", "Files: %d", snapshot.NumberOfFiles)

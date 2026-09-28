@@ -7,7 +7,7 @@ changed, and how to confirm the result on a given setup. The
 | Document | Subject |
 | --- | --- |
 | `commands.md` | The CLI commands with a one-line description each; flags stay in the wiki. |
-| `snapshot_perf.md` | Why listing snapshot revisions is slow; fixes #1-#6 applied, #7 rejected. |
+| `snapshot_perf.md` | Why listing snapshot revisions is slow; fixes #1-#6 and #8 applied, #7 rejected. |
 | `copy_perf.md` | Why `copy` re-encodes chunks and re-probes the destination; fixes #1-#5 applied, #6 rejected. |
 | `prune_perf.md` | Where `prune` spends its time; five fixes applied. |
 | `init_perf.md` | Why `init` is not worth optimising; nothing changed. |

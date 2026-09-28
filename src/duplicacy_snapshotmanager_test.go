@@ -1216,7 +1216,7 @@ func TestDownloadSequencePreservesOrderConcurrently(t *testing.T) {
 // 'list -files' printed the file list by walking the file sequence twice: once to compute the total size and the width
 // of the size column, and once to print the entries.  Each walk downloads every metadata chunk of the sequence again,
 // so the second one is pure overhead (and a round trip per chunk on cloud storage).  The file list must instead be
-// produced from a single walk, with the same output as before.
+// produced from a single walk, with the same output as before, and it must fetch only the metadata it reads.
 func TestListFilesWalksTheFileSequenceOnce(t *testing.T) {
 
 	setTestingT(t)
@@ -1256,18 +1256,19 @@ func TestListFilesWalksTheFileSequenceOnce(t *testing.T) {
 		return
 	}
 
-	// Every metadata chunk of the snapshot must be fetched exactly once: the file sequence, the chunk sequence and the
-	// length sequence.  A chunk that is fetched a second time is served from the snapshot cache rather than from the
-	// storage, so the downloads and the cache hits are counted together; walking the file sequence twice adds a cache
-	// hit for its chunk, which is exactly the overhead this fix removes.
+	// Printing the files reads the file sequence and the length sequence, and nothing else.  The chunk sequence is
+	// only the list of chunk hashes that -chunks prints, so fetching it here would be one metadata chunk per
+	// revision that this branch never reads.  A chunk that is fetched a second time is served from the snapshot cache
+	// rather than from the storage, so the downloads and the cache hits are counted together; a second walk of the
+	// file sequence would add a cache hit for its chunk, and fetching the chunk sequence would add one storage read.
 	fetches := len(capture.messages("CHUNK_DOWNLOAD")) + len(capture.messages("CHUNK_CACHE"))
-	if fetches != 3 {
-		t.Errorf("Expecting the 3 metadata chunks of the snapshot to be fetched once each, got %d fetches", fetches)
+	if fetches != 2 {
+		t.Errorf("Expecting the file and length sequences to be fetched once each, got %d fetches", fetches)
 	}
 
 	downloads := counting.chunkDownloadCounts()
-	if len(downloads) != 3 {
-		t.Errorf("Expecting the 3 metadata chunks of the snapshot to be downloaded, got %v", downloads)
+	if len(downloads) != 2 {
+		t.Errorf("Expecting the file and length sequences to be downloaded, got %v", downloads)
 	}
 	for chunkPath, count := range downloads {
 		if count != 1 {
@@ -1314,6 +1315,43 @@ func TestListFilesWalksTheFileSequenceOnce(t *testing.T) {
 	expectedStats := fmt.Sprintf("Total size: %d, file chunks: 4, metadata chunks: 3", expectedTotalSize)
 	if stats[1] != expectedStats {
 		t.Errorf("Expecting %q, got %q", expectedStats, stats[1])
+	}
+}
+
+// 'list -files' no longer fetches the chunk hash sequence it does not read, but 'list -chunks' does need it: the
+// chunk ids are printed from it.  This pins the other half of the change down, so that the sequence is not dropped
+// for the one mode that reads it.
+func TestListChunksStillFetchesTheChunkSequence(t *testing.T) {
+
+	setTestingT(t)
+
+	defer recovering(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+	counting := &instrumentedStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
+	snapshotManager.storage = counting
+
+	now := time.Now().Unix()
+	createTestSnapshotWithFiles(snapshotManager, "vm1@host1", 1, now-3600, now,
+		[]string{"file1", "file2"}, []int64{9, 1234}, "tag")
+
+	counting.resetDownloadStats()
+
+	if numberOfSnapshots := snapshotManager.ListSnapshots("vm1@host1", []int{}, "", true, true, 1); numberOfSnapshots != 1 {
+		t.Errorf("Expecting 1 snapshot, got %d", numberOfSnapshots)
+	}
+
+	// The file, length and chunk sequences are all needed for -files -chunks, and each is fetched once.
+	downloads := counting.chunkDownloadCounts()
+	if len(downloads) != 3 {
+		t.Errorf("Expecting the 3 metadata chunks of the snapshot to be downloaded, got %v", downloads)
+	}
+	for chunkPath, count := range downloads {
+		if count != 1 {
+			t.Errorf("The metadata chunk %s was downloaded %d times instead of once", chunkPath, count)
+		}
 	}
 }
 

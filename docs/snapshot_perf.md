@@ -2,13 +2,16 @@
 
 Investigation into the performance of `duplicacy list`. This document records
 the findings and the candidate fixes; candidate fixes #1, #2 and #3 below have
-since been implemented in `src/duplicacy_snapshotmanager.go`, and #4 (the
+since been implemented in `src/duplicacy_snapshotmanager.go`, #4 (the
 parallel `list`) in both `src/duplicacy_snapshotmanager.go` and
 `duplicacy/duplicacy_main.go`, #5 (the single `list -files` pass) in
-`src/duplicacy_snapshotmanager.go`, and #6 (the id listing) in
+`src/duplicacy_snapshotmanager.go`, #6 (the id listing) in
 `src/duplicacy_b2storage.go`, `src/duplicacy_b2client.go` and
-`src/duplicacy_azurestorage.go`. Candidate #7 (the revision index) is not going
-to be implemented, because it would change the storage format on disk.
+`src/duplicacy_azurestorage.go`, and #8 (the unread chunk sequence in
+`list -files`) in `src/duplicacy_snapshotmanager.go`. Candidate #7 (the revision
+index) is not going to be implemented, because it would change the storage
+format on disk; the candidates that were measured and rejected are recorded
+under "Deliberately not pursued".
 
 ## Summary
 
@@ -253,7 +256,7 @@ where the syscall is a few microseconds.
 
 ## `list -files` and `list -chunks`
 
-With `showFiles` (`src/duplicacy_snapshotmanager.go:713-751`) each revision gets:
+With `showFiles` (`src/duplicacy_snapshotmanager.go:903-942`) each revision gets:
 
 - `DownloadSnapshotSequences` -> `DownloadSequence` -> `chunkOperator.Download`
   per metadata chunk (`src/duplicacy_snapshotmanager.go:339-345`). The operator
@@ -270,6 +273,63 @@ With `showFiles` (`src/duplicacy_snapshotmanager.go:713-751`) each revision gets
 Against local storage these are a couple of syscalls rather than network round
 trips, so they are proportionally cheaper than in the cloud case but still
 strictly additive.
+
+### `list -files` expanded the chunk sequence it never read
+
+A snapshot names every chunk it references through three sequences — the file
+list, the chunk hashes and the chunk lengths — and `list -files` was fetching
+all three. Only two of them are read: `Entry.check`
+(`src/duplicacy_entry.go:889-907`) validates each entry against
+`snapshot.ChunkLengths`, and the entry itself carries what the file list prints.
+`ChunkHashes` is loaded by `DownloadSnapshotSequence(snapshot, "chunks")` and
+is read only by `-chunks`, which prints the chunk ids. That is fix #8.
+
+The three sequences are stored as three different chunk sets, so dropping the
+chunk sequence is one fewer `FindChunk` + `DownloadFile` per revision — a round
+trip on cloud storage, and on a local mount a `newfstatat` + `openat` on the
+storage plus the cache write and its `mkdirat`. The sequence is a separate set
+of chunks from the other two even when the file list is unchanged, so this is
+not absorbed by any sharing between revisions.
+
+The old code and the new code are one call apart:
+
+```go
+// before: loads "chunks" and "lengths"
+manager.DownloadSnapshotSequences(snapshot)
+
+// after: loads only the sequence the file walk reads
+manager.DownloadSnapshotSequence(snapshot, "lengths")
+```
+
+`-chunks` still expands the chunk sequence, through `GetSnapshotChunks`
+(`src/duplicacy_snapshotmanager.go:742-770`), which fetches it when
+`snapshot.ChunkHashes` is empty. `-files -chunks` therefore still reads all
+three sequences once each, and the output is unchanged in every mode.
+
+Measured on a 300-revision repository on the slow drvfs mount from the table
+above, `/usr/bin/time`, `list -files` cold (cache removed before each run):
+
+```
+              cold      steady state
+before   13.0-16.8 s    3.9-4.2 s
+after     7.4-7.5 s      2.7-2.9 s
+```
+
+The cache shows the same halving directly: on the same fixture `list -files -r
+1-100` leaves 227 chunk-cache entries before and 131 after, and `-r 1-200`
+leaves 427 against 231. The counts are not exactly halved because a revision
+whose file list is unchanged reuses the file and length chunks of the previous
+one, while the chunk sequence is a third, separate set that is still unique per
+revision.
+
+On native ext4 the same 300-revision fixture is unaffected by the syscall count
+and only drops with the cache write: cold `list -files` 0.19 s to 0.15 s, warm
+0.12 s to 0.10 s.
+
+`list -files`, `list -chunks`, `list -files -chunks`, `list`, `list -all`,
+`list -r 5`, `list -files -r 5-20` and `list -files -threads 4` all produce
+byte-identical output (after normalising the throughput and elapsed fields of the
+progress lines) with exit code 0 either way.
 
 ## Backend-specific amplifiers
 
@@ -311,6 +371,12 @@ strictly additive.
   and `mkdirat` calls with the `strace` recipe in `docs/README.md`. If `fsync`
   dominates, it is the write-only snapshot cache.
 - `list -r 1` versus a full `list` gives the per-revision marginal cost.
+- `list -files` fetches two metadata chunks per revision, `list -files -chunks`
+  three. `strace -f -e trace=openat duplicacy list -files -r 1-50` counts the
+  `openat` calls under `chunks/` on the storage and under
+  `.duplicacy/cache/<name>/chunks/`; on the 300-revision fixture the storage
+  count drops from 127 to 81 for the same range when the unread sequence is no
+  longer expanded.
 - `list -threads N` overlaps the per-revision downloads. The output is
   independent of `N`, so `list` and `list -threads 8` can be diffed directly to
   confirm that; the benefit only shows up when the latency of a single download
@@ -388,6 +454,19 @@ Ordered roughly by expected benefit for local storage.
   re-decoded every entry and re-fetched every metadata chunk of the file
   sequence (`chunks/` read on the first pass, snapshot cache hit on the second),
   which `list -files` paid for once per revision.
+- **Stop expanding the chunk hash sequence in `list -files`.** The `showFiles`
+  branch loaded all three sequences of every revision through
+  `DownloadSnapshotSequences`, but the file walk reads only the length sequence;
+  the chunk hash sequence is printed only by `-chunks`, which expands it itself
+  through `GetSnapshotChunks`. Dropping it removes one metadata-chunk fetch per
+  revision (`FindChunk` + `DownloadFile`, plus the cache write). **Implemented**:
+  `list -files` now calls `DownloadSnapshotSequence(snapshot, "lengths")`. See
+  the `list -files` section above for the measurements; on the 300-revision
+  drvfs fixture this halves the cold run and the chunk-cache entries. Guarded by
+  `TestListFilesWalksTheFileSequenceOnce` (now asserting the two sequences that
+  are read are fetched exactly once) and
+  `TestListChunksStillFetchesTheChunkSequence` (asserting `-files -chunks` still
+  reads all three).
 - **Let backends list only direct children of `snapshots/`** (B2 and other
   prefix-based backends) instead of scanning the whole subtree. **Implemented**:
   `B2Storage` and `AzureStorage` were the two remaining backends whose
@@ -423,3 +502,18 @@ Ordered roughly by expected benefit for local storage.
   (which is what makes the concurrent downloads of fix #4 safe without locks) for
   a shared mutable object. `list` therefore keeps paying one directory listing
   plus one download per revision.
+
+### Deliberately not pursued
+
+- **Overlap the metadata chunks inside a revision** by giving the chunk operator
+  that `-files` and `-chunks` use the `-threads` count instead of a hard-coded 1
+  (`src/duplicacy_snapshotmanager.go:850`). The sequences of a revision span
+  several chunks once a repository holds many files, so they look like the
+  `prune` sequence expansion, which is overlapped. Measured with the count wired
+  through: on a 40-revision repository whose sequences are 75+ chunks each, on
+  drvfs, `list -files` took 3.99 s / 3.87 s / 3.84 s at 1 / 4 / 8 threads before
+  and 3.85 s / 3.92 s / 3.84 s after; on the 300-revision drvfs fixture it was
+  4.26 s / 4.02 s / 4.08 s before and 4.37 s / 3.84 s / 4.15 s after; both
+  changes are inside the run-to-run spread. **Not implemented**: it adds a
+  thread-count dependency with no measured gain, so `list` keeps creating the
+  operator with one thread.
