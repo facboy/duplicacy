@@ -10,11 +10,11 @@ Line numbers are from the state of the tree when the review was written.
 ## Summary
 
 The branch is 30 commits ahead of `upstream/master`: about 7,000 added lines over
-23 non-test source files, 8 test files, and 6 new documents, plus `AGENTS.md` and
+23 non-test source files, 8 test files, and 7 new documents, plus `AGENTS.md` and
 the module files. Almost all of it serves one goal — stop `prune`, `copy` and
 `list` paying a round trip per revision, and drop a redundant `fsync`.
 
-The changes work, and the per-backend listing work is factored well. The seven
+The changes work, and the per-backend listing work is factored well. The eight
 refactorings below have since been applied; what remains of the duplication is
 lower-value and listed in the same order.
 
@@ -32,6 +32,8 @@ Ordered by payoff:
    copied blocks.
 7. Test scaffolding (applied) — the shared helpers and the storage doubles each
    live in one place, and the repeated recovery block is one deferred helper.
+8. Documents (applied) — the document set has an index and a stated skeleton, and
+   the shared `strace` recipe is written once.
 
 ## Duplicated code
 
@@ -160,13 +162,21 @@ a specific `Exception` (`verifyChunk`, `encryptChunk`, `downloadedSnapshotMissin
 `recoverPanicFrom`) keep their own recovery, since they inspect the panic rather
 than report it.
 
-### Documents
+### Documents — applied
 
 The six new documents share a fixed shape: title, `## Summary`, `## The call
 path`, `## Candidate fixes`, `### Deliberately not pursued`, `## How to confirm on
-a given setup`. One `strace` invocation is duplicated verbatim in `copy_perf.md`
-and `snapshot_perf.md`. An index page and a stated template would let the set be
-read as a whole; `commands.md` also overlaps the wiki table.
+a given setup`. One `strace` invocation was duplicated verbatim in `copy_perf.md`
+and `snapshot_perf.md`. An index page and a stated template let the set be read
+as a whole; `commands.md` also overlaps the wiki table.
+
+Done: `docs/README.md` is the index. It names each document, states the skeleton
+the per-command investigations follow, and holds the single
+`strace -f -c -T -e trace=fsync,renameat,openat,newfstatat,mkdirat` recipe that
+`copy_perf.md` and `snapshot_perf.md` now point at instead of repeating.
+`commands.md` is listed there as the command reference and stays in the repo as the
+offline copy of the wiki's command table, so that overlap is recorded rather than
+removed.
 
 ## Refactorings, in order of payoff
 
@@ -249,11 +259,10 @@ The sentinel is now the named `cloudFileFailure`, shared by the producer in
 ## How to apply
 
 The concurrency helper, the raw-chunk copy plumbing, the path and sequence helpers,
-the cloud-file detection, the empty-listing rationale, the chunk-operator shutdown
-and the test scaffolding have been applied. The recommended order was the
-concurrency helper first, then the raw-chunk copy flow, then the path and sequence
-helpers; the remaining items -- the documents and the smaller items -- are
-unchanged. The unit tests
+the cloud-file detection, the empty-listing rationale, the chunk-operator shutdown,
+the test scaffolding and the documents have been applied. The recommended order was
+the concurrency helper first, then the raw-chunk copy flow, then the path and
+sequence helpers; the remaining item is the smaller items, unchanged. The unit tests
 in `src/` are the safety net:
 `go test ./src/ -vet=off`. Note the two tests that fail on a pristine checkout for
 unrelated reasons (`TestEntryExcludeByAttribute`, `TestPersistRestore`), and the

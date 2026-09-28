@@ -1,0 +1,44 @@
+# Performance investigations
+
+Where each `duplicacy` command spends its time: what was measured, what was
+changed, and how to confirm the result on a given setup. The
+[wiki](https://github.com/gilbertchen/duplicacy/wiki) is the user reference.
+
+| Document | Subject |
+| --- | --- |
+| `commands.md` | The CLI commands with a one-line description each; flags stay in the wiki. |
+| `snapshot_perf.md` | Why listing snapshot revisions is slow; fixes #1-#6 applied, #7 rejected. |
+| `copy_perf.md` | Why `copy` re-encodes chunks and re-probes the destination; fixes #1-#5 applied, #6 rejected. |
+| `prune_perf.md` | Where `prune` spends its time; five fixes applied. |
+| `init_perf.md` | Why `init` is not worth optimising; nothing changed. |
+| `highwayhash_arm64.md` | The `zipperMerge` symbol collision in `github.com/gilbertchen/highwayhash`. |
+| `branch_review.md` | Duplication and refactoring review of the branch, and the state of each item. |
+
+## Layout of an investigation
+
+The skeleton of a per-command investigation, in order:
+
+- a title naming the command and the cost;
+- `## Summary`, with the fixes the investigation produced;
+- `## The call path`, naming the functions with their file and line references;
+- one `##` section per finding, each ending in `**Implemented**` or `**Not going
+  to be implemented**`;
+- `## Candidate fixes`, with `### Smaller items` and `### Deliberately not
+  pursued` where they apply;
+- `## How to confirm on a given setup`, the commands, log lines and tests that
+  show the cost or guard the fix.
+
+`snapshot_perf.md` keeps `## Candidate fixes` after the confirmation steps,
+`prune_perf.md` records each fix inside its finding section rather than in a
+candidate list, and `highwayhash_arm64.md` is a build diagnosis that ends at the
+decision on the dependency rather than a per-command investigation.
+
+## Tracing syscalls
+
+`strace -f -c -T -e trace=fsync,renameat,openat,newfstatat,mkdirat duplicacy
+<command>` sums the wall time of the file operations a command issues, per
+syscall; swap in the syscalls the run is suspected of issuing (`unlinkat` for
+the snapshot deletions, for instance). A dominant `fsync` is the chunk-cache
+write, and the call counts identify the loop issuing them. `strace -f -T`
+without `-c` times each call individually, which is how the drvfs attribution
+table in `snapshot_perf.md` was produced.

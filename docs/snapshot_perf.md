@@ -307,9 +307,9 @@ strictly additive.
   cost is the revision listing or the per-revision download.
 - `/usr/bin/time -v duplicacy list`: if CPU percentage is low and elapsed is
   high, the time is in syscalls or round trips, not processing.
-- `strace -f -c -T -e trace=fsync,renameat,openat,newfstatat,mkdirat duplicacy
-  list` and sum the per-call times. If `fsync` dominates, it is the write-only
-  snapshot cache.
+- Sum the per-call wall time of the `fsync`, `renameat`, `openat`, `newfstatat`
+  and `mkdirat` calls with the `strace` recipe in `docs/README.md`. If `fsync`
+  dominates, it is the write-only snapshot cache.
 - `list -r 1` versus a full `list` gives the per-revision marginal cost.
 - `list -threads N` overlaps the per-revision downloads. The output is
   independent of `N`, so `list` and `list -threads 8` can be diffed directly to

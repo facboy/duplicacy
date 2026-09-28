@@ -495,11 +495,10 @@ Ordered by expected benefit.
   time the gap between `Chunks to copy:` (`:1728`) and
   `Copied N new chunks` (`:1775`): that interval is the whole chunk-transfer
   phase and nothing else.
-- `strace -f -c -T -e trace=fsync,renameat,openat,newfstatat,mkdirat duplicacy
-  copy ...` and sum the per-call times. If `fsync` dominates, the destination is
-  a local filesystem and the re-encode is not the problem. On a local copy the
-  `fsync` count should equal the number of chunks copied plus the number of
-  snapshot files.
+- Run the `strace` recipe in `docs/README.md` as `duplicacy copy ...` and sum
+  the per-call times. If `fsync` dominates, the destination is a local filesystem
+  and the re-encode is not the problem. On a local copy the `fsync` count should
+  equal the number of chunks copied plus the number of snapshot files.
 - Compare the same copy with the destination on tmpfs: `fsync` is free there, so
   what remains is compress/decompress CPU. The difference between the two is the
   `fsync` cost.
