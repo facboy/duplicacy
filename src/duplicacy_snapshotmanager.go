@@ -329,6 +329,13 @@ func (manager *SnapshotManager) CreateChunkOperator(resurrect bool, rewriteChunk
 	}
 }
 
+// stopChunkOperator shuts the operator down and clears the field, so that the next command to need one builds it with
+// its own thread count instead of reusing this one.  It is meant to be deferred: 'defer manager.stopChunkOperator()'.
+func (manager *SnapshotManager) stopChunkOperator() {
+	manager.chunkOperator.Stop()
+	manager.chunkOperator = nil
+}
+
 // DownloadSequence returns the content represented by a sequence of chunks.  The chunks of a sequence are independent
 // of each other, so they are all submitted at once and fetched concurrently whenever the chunk operator has more than
 // one thread: prune and check create it with the user's -threads, while the read-only commands create it with one, in
@@ -841,10 +848,7 @@ func (manager *SnapshotManager) ListSnapshots(snapshotID string, revisionsToList
 		snapshotID, revisionsToList, tag, showFiles, showChunks, threads)
 
 	manager.CreateChunkOperator(false, false, 1, false)
-	defer func() {
-		manager.chunkOperator.Stop()
-		manager.chunkOperator = nil
-	}()
+	defer manager.stopChunkOperator()
 
 	var snapshotIDs []string
 	var err error
@@ -956,10 +960,7 @@ func (manager *SnapshotManager) CheckSnapshots(snapshotID string, revisionsToChe
 	checkFiles bool, checkChunks, searchFossils bool, resurrect bool, rewriteChunks bool, threads int, allowFailures bool) bool {
 
 	manager.CreateChunkOperator(resurrect, rewriteChunks, threads, allowFailures)
-	defer func() {
-		manager.chunkOperator.Stop()
-		manager.chunkOperator = nil
-	}()
+	defer manager.stopChunkOperator()
 
 	LOG_DEBUG("LIST_PARAMETERS", "id: %s, revisions: %v, tag: %s, showStatistics: %t, showTabular: %t, checkFiles: %t, searchFossils: %t, resurrect: %t",
 		snapshotID, revisionsToCheck, tag, showStatistics, showTabular, checkFiles, searchFossils, resurrect)
@@ -1684,10 +1685,7 @@ func (manager *SnapshotManager) Diff(top string, snapshotID string, revisions []
 		top, snapshotID, revisions, filePath, compareByHash)
 
 	manager.CreateChunkOperator(false, false, 1, false)
-	defer func() {
-		manager.chunkOperator.Stop()
-		manager.chunkOperator = nil
-	} ()
+	defer manager.stopChunkOperator()
 
 	var leftSnapshot *Snapshot
 	var rightSnapshot *Snapshot
@@ -1909,10 +1907,7 @@ func (manager *SnapshotManager) ShowHistory(top string, snapshotID string, revis
 		top, snapshotID, revisions, filePath, showLocalHash)
 
 	manager.CreateChunkOperator(false, false, 1, false)
-	defer func() {
-		manager.chunkOperator.Stop()
-		manager.chunkOperator = nil
-	} ()
+	defer manager.stopChunkOperator()
 
 	var err error
 
@@ -2039,10 +2034,7 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
 	}
 
 	manager.CreateChunkOperator(false, false, threads, false)
-	defer func() {
-		manager.chunkOperator.Stop()
-		manager.chunkOperator = nil
-	} ()
+	defer manager.stopChunkOperator()
 
 	prefPath := GetDuplicacyPreferencePath()
 	logDir := path.Join(prefPath, "logs")

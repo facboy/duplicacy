@@ -14,7 +14,7 @@ The branch is 30 commits ahead of `upstream/master`: about 7,000 added lines ove
 the module files. Almost all of it serves one goal — stop `prune`, `copy` and
 `list` paying a round trip per revision, and drop a redundant `fsync`.
 
-The changes work, and the per-backend listing work is factored well. The five
+The changes work, and the per-backend listing work is factored well. The six
 refactorings below have since been applied; what remains of the duplication is
 lower-value and listed in the same order.
 
@@ -28,6 +28,8 @@ Ordered by payoff:
    one definition.
 5. Empty-listing rationale (applied) — the missing-directory explanation is written
    once.
+6. Chunk-operator shutdown (applied) — one deferred shutdown replaces the five
+   copied blocks.
 
 ## Duplicated code
 
@@ -118,11 +120,16 @@ backend calls it once its own "not found" error has been matched. The assertion
 still has to stay per backend, as the per-backend file layout requires, so the win
 is only in the repeated explanation.
 
-### `chunkOperator.Stop()` and reassignment — five copies
+### `chunkOperator.Stop()` and reassignment — applied
 
-`src/duplicacy_snapshotmanager.go:926`, `:1041`, `:1769`, `:1994`, `:2124`. A
-`deferChunkOperatorStop()` would remove them while the surrounding methods are
-already being edited.
+The five commands that create an operator each carried the same two-line deferred stop
+and reassignment.
+
+Done: `stopChunkOperator()` performs the stop and the reassignment, and the five
+command methods (`ListSnapshots`, `CheckSnapshots`, `Diff`, `ShowHistory`,
+`PruneSnapshots`) register it with a single `defer manager.stopChunkOperator()`.
+The helper has to do the work itself rather than defer it internally, since a
+deferred call has to reach the command method's own return.
 
 ### Test scaffolding and storage doubles
 
@@ -229,10 +236,11 @@ The sentinel is now the named `cloudFileFailure`, shared by the producer in
 ## How to apply
 
 The concurrency helper, the raw-chunk copy plumbing, the path and sequence helpers,
-the cloud-file detection and the empty-listing rationale have been applied. The
-recommended order was the concurrency helper first, then the raw-chunk copy flow,
-then the path and sequence helpers; the remaining items -- the test scaffolding and
-the smaller items -- are unchanged. The unit tests in `src/` are the safety net:
+the cloud-file detection, the empty-listing rationale and the chunk-operator
+shutdown have been applied. The recommended order was the concurrency helper first,
+then the raw-chunk copy flow, then the path and sequence helpers; the remaining
+items -- the test scaffolding and the smaller items -- are unchanged. The unit tests
+in `src/` are the safety net:
 `go test ./src/ -vet=off`. Note the two tests that fail on a pristine checkout for
 unrelated reasons (`TestEntryExcludeByAttribute`, `TestPersistRestore`), and the
 pre-existing `go vet` warnings, both documented in `AGENTS.md`.
