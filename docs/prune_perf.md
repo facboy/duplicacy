@@ -7,8 +7,11 @@ fixing and have now been implemented: the serial revision loop
 and `src/duplicacy_chunkoperator.go`), the serial sequence expansion
 (`src/duplicacy_snapshotmanager.go`), the 100 ms poll in the chunk operator's
 completion wait (`src/duplicacy_chunkoperator.go`), and the serial snapshot-file
-deletion loop (`src/duplicacy_snapshotmanager.go`); the remaining candidates are
-recorded for a follow-up.
+deletion loop (`src/duplicacy_snapshotmanager.go`). A sixth followed later, once
+the filesystem-based cache decision in `docs/check_perf.md` removed what blocked
+it: the chunk cache is now guarded by `IsCacheNeeded()` on the read side too, so a
+local storage neither reads nor writes it (option 1 below). The remaining
+candidates are recorded for a follow-up.
 
 ## Summary
 
@@ -375,11 +378,15 @@ pristine storage and the outputs and side effects compared:
 
 The defect admits three fixes. All three leave the storage byte-identical.
 
-1. **Guard the cache with `IsCacheNeeded()`** (`src/duplicacy_chunkoperator.go:307`
-   and `:526`), matching every other cache access in the code. Fastest on a fast
-   disk. It loses badly, however, when one slow mount serves many revisions that
+1. **Guard the cache with `IsCacheNeeded()`** (`src/duplicacy_chunkoperator.go:331`
+   and `:527`), matching every other cache access in the code. Fastest on a fast
+   disk. It used to lose badly when one slow mount serves many revisions that
    share their metadata: with the cache gone, the shared chunks are re-read for
-   every revision. **Not implemented.**
+   every revision. That case was a slow mount whose storage had reported
+   `IsCacheNeeded()` false, which `docs/check_perf.md` has since fixed by asking
+   the filesystem; a network storage now reports true and keeps its cache, so the
+   guard only turns the cache off for a local storage, where it was never worth
+   having. **Implemented** (see `### Smaller items`).
 2. **Keep the cache, but don't `fsync` the chunk-cache writes.** `UploadFile`
    fsyncs every write (`src/duplicacy_filestorage.go:209`), which is the
    expensive part of the cycle; the cache write is a rename-into-place whose only
@@ -811,28 +818,40 @@ the storage was created with.
   cache's `chunks/` and 46 under the storage's. It scales with the size of the
   cache rather than with the repository, so it costs most on a cache that has
   not been cleaned before.
-- **The chunk cache is read even when the storage needs no cache.** `DownloadChunk`
-  guards the cache with `snapshotCache != nil` alone
+- **The chunk cache is read even when the storage needs no cache — now guarded.**
+  `DownloadChunk` used to guard the cache with `snapshotCache != nil` alone
   (`src/duplicacy_chunkoperator.go:331`), where every other cache access nearby
-  asks `IsCacheNeeded()` first. It is not the cheap one-line win it looks like:
-  `cachedPath` is assigned only inside that block, so gating the read gates the
-  write-back with it, and the change is option 1 above rather than a refinement
-  of option 2. On a fast local disk it wins — `list -files` 69 ms → 47 ms,
-  `check` 48 ms → 40 ms, `prune -exhaustive -dry-run` 53 ms → 40 ms on a
-  40-revision ext4 fixture — because there the cache read costs what the storage
-  read costs and only the write is saved. On a storage that is a slow mount with
-  the cache on a fast local disk — an `rclone mount`, an NFS export handed over
-  as a plain path — it loses badly, because the cache is what absorbs the
-  repeated reads of a shared sequence: a 300-revision repository whose revisions
-  all share one metadata sequence (4 chunks) goes `list -files` 605 ms →
-  2649 ms, `check` 620 ms → 1312 ms, `list -chunks` 580 ms → 1258 ms.
-  `strace -f -e trace=openat` shows why: HEAD opens 3 storage chunks and 900
-  cache files, the guard 900 storage chunks and 0 cache files. `prune` itself is
-  flat either way, because the sequence grouping above fetches a shared sequence
-  once. Not implemented: the guard needs `list` and `check` to group shared
-  sequences the way `prune` now does, or the reuse the cache provides today goes
-  with it — which is also why option 1's rejection rests on `list`/`check`
-  rather than on `prune`.
+  asks `IsCacheNeeded()` first. `cachedPath` is assigned only inside that block,
+  so gating the read gates the write-back with it, and the change is option 1
+  above rather than a refinement of option 2. On a fast local disk it wins —
+  `list -files` 69 ms → 47 ms, `check` 48 ms → 40 ms, `prune -exhaustive -dry-run`
+  53 ms → 40 ms on a 40-revision ext4 fixture — because there the cache read costs
+  what the storage read costs and only the write is saved. **Implemented**: the
+  read now asks `IsCacheNeeded()` too, so a storage that declares itself
+  cache-free neither reads nor writes the chunk cache. What used to block this is
+  gone — see below.
+
+  The guard was rejected when this document was written because it dropped the
+  reuse a slow mount relies on: a 300-revision repository whose revisions all
+  share one metadata sequence (4 chunks) went `list -files` 605 ms → 2649 ms,
+  `check` 620 ms → 1312 ms, `list -chunks` 580 ms → 1258 ms, with `strace -f -e
+  trace=openat` showing HEAD opening 3 storage chunks and 900 cache files against
+  the guard's 900 storage chunks and 0 cache files. That measurement assumed a
+  slow mount spelled as a plain path had `IsCacheNeeded()` false, so the cache it
+  was losing was one the storage had said it did not want. `docs/check_perf.md`
+  has since changed `IsCacheNeeded()` to ask the filesystem rather than the URL:
+  a network filesystem whose repository is elsewhere now reports true, so the
+  mount in that fixture keeps its cache whether or not the guard is in place.
+  What the guard turns off is the configuration the flag was always meant to
+  describe — a local storage, where a cache read is the same syscall as the read
+  it replaces and the write is pure cost.
+
+  `prune` itself is flat either way, because the sequence grouping above fetches
+  a shared sequence once. Guarded by
+  `TestChunkCacheIsGuardedByIsCacheNeeded` (`src/duplicacy_chunkoperator_test.go`),
+  which fails with "The metadata chunk was written back to the cache of a storage
+  that needs none" if the read guard is removed, and which also checks the
+  cache-enabled half still reads and writes.
 - **`prune` with a tag or a retention policy downloads every revision anyway.**
   The tag filter (`:2484`) and the retention policy (`:2433`) are applied after
   the snapshot files have been downloaded, which is unavoidable for the
@@ -881,10 +900,12 @@ the storage was created with.
   with `duplicacy -d list` on the same repository.
 - The `CHUNK_DOWNLOAD` ("Chunk ... has been downloaded") and `CHUNK_CACHE`
   ("loaded from the snapshot cache") counts show the metadata fetches. The
-  `CHUNK_CACHE` line is what the unguarded write-back leaves behind even on a
-  local path: `DownloadChunk` reads the chunk cache whenever `snapshotCache` is
-  set, without checking `IsCacheNeeded()`, so a local storage reports cache hits
-  although the cache exists only for the storages that ask for one.
+  `CHUNK_CACHE` line is what the unguarded write-back used to leave behind even
+  on a local path: `DownloadChunk` read the chunk cache whenever `snapshotCache`
+  was set, without checking `IsCacheNeeded()`, so a local storage reported cache
+  hits although the cache exists only for the storages that ask for one. A local
+  run now reports none; a storage that needs a cache still reports both the save
+  and the load.
 - `duplicacy -d prune ...` prints `SNAPSHOT_DELETE` per revision being removed
   and, for the fossils, `FOSSIL_COLLECT`/`FOSSIL_DELETABLE`. The gap between the
   last `DOWNLOAD_FILE` and the first of those is the chunk-selection phase.
@@ -906,7 +927,7 @@ the storage was created with.
   -vet=off -v` for the parallel revision reads,
   `go test ./src/ -run 'TestPruneExpandsSequencesConcurrently|TestSharedSequenceIsExpandedOnce|TestDownloadSequencePreservesOrderConcurrently'
   -vet=off -v` for the sequence expansion, and
-  `go test ./src/ -run 'TestCorruptCachedChunkIsRefetched|TestSnapshotCacheSkipsSync|TestCorruptNonChunkCacheEntries'
+  `go test ./src/ -run 'TestCorruptCachedChunkIsRefetched|TestSnapshotCacheSkipsSync|TestCorruptNonChunkCacheEntries|TestChunkCacheIsGuardedByIsCacheNeeded'
   -vet=off -v` for the cache behaviour, and
   `go test ./src/ -run 'TestWaitForCompletionIsWokenNotPolled' -vet=off -v` for
   the completion wait.

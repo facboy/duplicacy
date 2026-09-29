@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"strings"
 	"testing"
 	"time"
 
@@ -159,6 +160,140 @@ func TestDownloadRawChunk(t *testing.T) {
 		t.Errorf("The raw download lost the chunk hash: %x instead of %x", downloaded.GetHash(), chunkHash)
 	}
 	config.PutChunk(downloaded)
+}
+
+// A storage that needs no cache must not touch the chunk cache at all, on either side: reading it would trade a storage
+// read for a cache read on a filesystem where the two cost the same, and writing it would add the write cycle for an
+// entry nothing will read back.  Every other cache access is guarded by IsCacheNeeded(); the chunk operator used to be
+// the exception, so a local storage populated and reported hits against a cache it had declared it did not want.
+func TestChunkCacheIsGuardedByIsCacheNeeded(t *testing.T) {
+
+	setTestingT(t)
+
+	defer recovering(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "chunk_cache_guard_test")
+	os.RemoveAll(testDir)
+	os.MkdirAll(testDir, 0700)
+	defer os.RemoveAll(testDir)
+
+	// A storage whose IsCacheNeeded() is false, which is what a plain local path gets.
+	storage, err := CreateFileStorage(path.Join(testDir, "storage"), false, 1)
+	if err != nil {
+		t.Errorf("Failed to create the storage: %v", err)
+		return
+	}
+	storage.CreateDirectory(0, "chunks")
+	storage.CreateDirectory(0, "snapshots")
+
+	cache, err := CreateFileStorage(path.Join(testDir, "cache"), false, 1)
+	if err != nil {
+		t.Errorf("Failed to create the cache: %v", err)
+		return
+	}
+	cache.CreateDirectory(0, "chunks")
+	cache.CreateDirectory(0, "snapshots")
+
+	config := CreateConfig()
+
+	// uploadMetadataChunk uploads 'content' as a metadata chunk through its own operator and returns the chunk hash.
+	uploadMetadataChunk := func(content []byte) string {
+		uploader := CreateChunkOperator(config, storage, cache, false, false, 1, false)
+		uploader.UploadCompletionFunc = func(chunk *Chunk, chunkIndex int, inCache bool, chunkSize int, uploadSize int) {}
+		chunk := CreateChunk(config, true)
+		chunk.Reset(true)
+		chunk.Write(content)
+		uploader.Upload(chunk, 0, true)
+		uploader.WaitForCompletion()
+		uploader.Stop()
+		return chunk.GetHash()
+	}
+
+	// The write side with the cache off: the chunk must not be added to the cache.
+	content := make([]byte, 4096)
+	crypto_rand.Read(content)
+	chunkHash := uploadMetadataChunk(content)
+	chunkID := config.GetChunkIDFromHash(chunkHash)
+
+	if _, exist, _, err := cache.FindChunk(0, chunkID, false); err != nil || exist {
+		t.Errorf("The metadata chunk was written to the cache of a storage that needs none (exist=%t, err=%v)", exist, err)
+	}
+
+	// Capture the log so the read side can be observed by its CHUNK_CACHE line.
+	savedLogFunction := LogFunction
+	capture := &logCapture{}
+	LogFunction = capture.log
+	defer func() {
+		LogFunction = savedLogFunction
+	}()
+
+	// The CHUNK_CACHE id covers both halves -- the upload records that it saved the chunk and the download that it
+	// loaded it -- so only the load is what tells the read side apart.
+	cacheLoads := func() int {
+		loads := 0
+		for _, message := range capture.messages("CHUNK_CACHE") {
+			if strings.Contains(message, "loaded from the snapshot cache") {
+				loads++
+			}
+		}
+		return loads
+	}
+
+	// The read side with the cache off: the download must not consult the cache, so no CHUNK_CACHE load is produced,
+	// and it must not populate it either -- the write-back is reached through the read, so leaving the read unguarded
+	// also leaves the write unguarded.  The chunk is in the storage but absent from the cache, which is the state the
+	// download starts from.
+	operator := CreateChunkOperator(config, storage, cache, false, false, 1, false)
+	if downloaded := operator.Download(chunkHash, 0, true); downloaded == nil || downloaded.GetID() != chunkID {
+		operator.Stop()
+		t.Errorf("Failed to download the metadata chunk %s", chunkID)
+		return
+	} else {
+		config.PutChunk(downloaded)
+	}
+	operator.Stop()
+
+	if loads := cacheLoads(); loads != 0 {
+		t.Errorf("The chunk cache of a storage that needs none was read: %d loads", loads)
+	}
+	if _, exist, _, err := cache.FindChunk(0, chunkID, false); err != nil || exist {
+		t.Errorf("The metadata chunk was written back to the cache of a storage that needs none (exist=%t, err=%v)",
+			exist, err)
+	}
+
+	// A storage that does need a cache must still get both halves; otherwise the guard would have turned the cache off
+	// everywhere rather than only where it does not pay.  The same download now populates the cache, and a second one
+	// is served from it.
+	storage.isCacheNeeded = true
+
+	readOperator := CreateChunkOperator(config, storage, cache, false, false, 1, false)
+	if downloaded := readOperator.Download(chunkHash, 0, true); downloaded == nil {
+		t.Errorf("Failed to download the metadata chunk %s with the cache enabled", chunkID)
+		readOperator.Stop()
+		return
+	} else {
+		config.PutChunk(downloaded)
+	}
+	readOperator.Stop()
+
+	if _, exist, _, err := cache.FindChunk(0, chunkID, false); err != nil || !exist {
+		t.Errorf("The metadata chunk was not written to the cache of a storage that needs one (exist=%t, err=%v)",
+			exist, err)
+	}
+
+	secondOperator := CreateChunkOperator(config, storage, cache, false, false, 1, false)
+	if downloaded := secondOperator.Download(chunkHash, 0, true); downloaded == nil {
+		t.Errorf("Failed to download the cached metadata chunk %s", chunkID)
+		secondOperator.Stop()
+		return
+	} else {
+		config.PutChunk(downloaded)
+	}
+	secondOperator.Stop()
+
+	if loads := cacheLoads(); loads != 1 {
+		t.Errorf("Expecting the cache-enabled storage to read the chunk back from the cache, got %d loads", loads)
+	}
 }
 
 func TestChunkOperator(t *testing.T) {

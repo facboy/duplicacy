@@ -328,7 +328,7 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 		}
 	} ()
 
-	if task.isMetadata && operator.snapshotCache != nil {
+	if task.isMetadata && operator.snapshotCache != nil && operator.storage.IsCacheNeeded() {
 
 		var exist bool
 		var err error

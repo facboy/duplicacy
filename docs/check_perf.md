@@ -518,6 +518,17 @@ unit test has none of, so those two pin the half that must not regress.
 
 ## Smaller items
 
+- **The chunk cache is no longer consulted by a storage that needs none.** The
+  chunk operator used to read and write `.duplicacy/cache/<name>/chunks/`
+  whenever a cache existed, without asking `IsCacheNeeded()`
+  (`src/duplicacy_chunkoperator.go:331`, `:527`), which `prune_perf.md` records as
+  its option 1. It now asks first, so a local storage neither reads nor writes the
+  chunk cache. The reason option 1 used to be rejected — a slow mount whose
+  storage reported no cache lost the reuse the cache provided — is gone: the
+  filesystem-based decision above now makes that mount report true, so it keeps
+  its cache. A cache read is the same syscall as the storage read only when both
+  are local, which is exactly the case the guard turns off. Guarded by
+  `TestChunkCacheIsGuardedByIsCacheNeeded` (`src/duplicacy_chunkoperator_test.go`).
 - **The `verified_chunks` skip needs `-chunks`.** The list is read at `:1286` and
   consulted at `:1327`, and that whole block is only reached for
   `checkChunks && !checkFiles` — a plain `check` returns at `:1274` before the
@@ -583,8 +594,10 @@ unit test has none of, so those two pin the half that must not regress.
   ("loaded from the snapshot cache") counts separate the modes: a plain `check`
   fetches only the metadata chunks of the referenced sequences, `-chunks` fetches
   every referenced chunk, and `-files` fetches every chunk of every verified
-  file. The `CHUNK_CACHE` lines come from the metadata chunks, which the chunk
-  operator caches for every storage; the `DOWNLOAD_FILE_CACHE` ("Loaded file ...
+  file. The `CHUNK_CACHE` lines come from the metadata chunks, and they appear
+  only when the storage asks for a cache — a local storage reports neither the
+  save nor the load, since the chunk operator now checks `IsCacheNeeded()` like
+  every other cache access. The `DOWNLOAD_FILE_CACHE` ("Loaded file ...
   from the snapshot cache") lines are the snapshot files, and they appear only
   when `needsSnapshotCache` turned the cache on for a file storage.
 - Whether that cache was turned on is visible without a debug build: after a
