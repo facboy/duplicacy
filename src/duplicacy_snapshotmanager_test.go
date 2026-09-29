@@ -730,6 +730,81 @@ func TestCheckListsTheChunkTreeOnlyWhenItIsCheaper(t *testing.T) {
 	}
 }
 
+// 'check -files' used to walk the file sequence twice per revision: once to sanity-check the entries, and once to
+// collect the files it hashes.  Each walk re-reads and re-decodes every entry, fetching every metadata chunk of the
+// sequence again -- from the storage the first time and, when the storage has a cache, from the cache the second.  The
+// file list must instead be checked and collected in a single walk, which is what 'list -files' already does.
+func TestCheckFilesWalksTheFileSequenceOnce(t *testing.T) {
+
+	setTestingT(t)
+
+	defer recovering(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+	counting := &instrumentedStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
+	snapshotManager.storage = counting
+
+	fileNames := []string{"file1", "file2", "file3", "file4"}
+	fileSizes := []int64{9, 1234, 12345, 10}
+
+	now := time.Now().Unix()
+	createTestSnapshotWithFiles(snapshotManager, "vm1@host1", 1, now-3600, now, fileNames, fileSizes, "tag")
+
+	// Capture what the check logs instead of letting it go to the test log.
+	savedLogFunction := LogFunction
+	capture := &logCapture{}
+	LogFunction = capture.log
+	defer func() {
+		LogFunction = savedLogFunction
+	}()
+
+	counting.resetCounters()
+	counting.resetDownloadStats()
+
+	// A LOG_ERROR would be recorded by the capture rather than raised, so the check runs directly.
+	if !snapshotManager.CheckSnapshots("vm1@host1", []int{1}, "", false, false, true, false, false, false, false, 1,
+		false) {
+		t.Errorf("The file check failed")
+		return
+	}
+	if failures := capture.failures(); len(failures) > 0 {
+		t.Errorf("Checking the files of the snapshot failed: %v", failures)
+		return
+	}
+
+	// The file, chunk and length sequences and the content of each file are fetched once each, and never a second
+	// time.  A chunk that is fetched again is served from the snapshot cache rather than from the storage, so the
+	// download counts alone would not show it; the cache hits below are what the second walk leaves behind.
+	downloads := counting.chunkDownloadCounts()
+	if len(downloads) != len(fileNames)+3 {
+		t.Errorf("Expecting the 3 sequences and the content of the %d files to be downloaded once, got %v",
+			len(fileNames), downloads)
+	}
+	for chunkPath, count := range downloads {
+		if count != 1 {
+			t.Errorf("The chunk %s was downloaded %d times instead of once", chunkPath, count)
+		}
+	}
+
+	// The file sequence is the only sequence whose chunks would be fetched a second time, and the second fetch is the
+	// cache hit.  Any of them means the sequence was walked twice.
+	if hits := capture.messages("CHUNK_CACHE"); len(hits) != 0 {
+		t.Errorf("The file sequence was walked twice: %d chunks were read from the cache again", len(hits))
+	}
+
+	// The single walk must still verify every file: the hashes of the collected files are checked as before.
+	verified := capture.messages("SNAPSHOT_VERIFY")
+	success := "All files in snapshot vm1@host1 at revision 1 have been successfully verified"
+	if len(verified) == 0 || verified[len(verified)-1] != success {
+		t.Errorf("Expecting the files to be reported as verified, got %v", verified)
+	}
+	if corrupted := capture.messages("SNAPSHOT_HASH"); len(corrupted) != 0 {
+		t.Errorf("No file should have a mismatched hash, got %v", corrupted)
+	}
+}
+
 // A probed chunk whose size the check does not record would be reported as missing, so the probe has to fill in the
 // size of every chunk it finds -- and report the ones stored with a size of 0, exactly as the whole-tree listing does.
 func TestCheckProbesReportTheChunkSizes(t *testing.T) {

@@ -1,15 +1,18 @@
 # Where `check` spends its time
 
 Investigation into the performance of `duplicacy check`, in the style of
-`snapshot_perf.md`, `copy_perf.md`, `prune_perf.md` and `init_perf.md`. Two
+`snapshot_perf.md`, `copy_perf.md`, `prune_perf.md` and `init_perf.md`. Three
 defects were found and fixed. The revision loop ignored `-threads`, exactly as
 prune's did before `c651bb1`; it now reads its snapshot files through
-`downloadSnapshots`, the same helper `list` and `prune` use. And the whole chunk
-tree was listed on every run, even when a `-r` restriction had named a handful of
+`downloadSnapshots`, the same helper `list` and `prune` use. The whole chunk tree
+was listed on every run, even when a `-r` restriction had named a handful of
 revisions; the listing is now weighed against the referenced set, and a
 restricted check that references fewer chunks than the tree holds looks them up
-instead. The `check -files` mode is the expensive one, and its cost is inherent
-to what the mode promises rather than to a mistake.
+instead. And `-files` walked the file sequence twice per revision, checking it
+and then collecting from it; the check and the collection are now one walk. The
+`check -files` mode is still the expensive one, but its dominant cost — reading
+the file chunks — is inherent to what the mode promises rather than to a
+mistake.
 
 ## Summary
 
@@ -50,19 +53,20 @@ that costs seconds to minutes.
 
 ## Conclusion
 
-**Both defects were worth fixing and both are fixed.** The revision loop reads
-its snapshot files through `downloadSnapshots`, so `-threads` reaches the
-per-revision read — the change already applied to `prune` in `c651bb1` and to
+**All three defects were worth fixing and all three are fixed.** The revision
+loop reads its snapshot files through `downloadSnapshots`, so `-threads` reaches
+the per-revision read — the change already applied to `prune` in `c651bb1` and to
 `list` in `6584fb0`: a few lines, byte-identical to the serial loop at one thread
-and to HEAD's output at every thread count. And the chunk-tree listing is no
-longer unconditional: a restricted check that references fewer chunks than the
-tree holds answers the existence question with one lookup per referenced chunk
-instead of one listing per chunk directory, the same rule `copy` applies to the
-identical listing.
+and to HEAD's output at every thread count. The chunk-tree listing is no longer
+unconditional: a restricted check that references fewer chunks than the tree
+holds answers the existence question with one lookup per referenced chunk instead
+of one listing per chunk directory, the same rule `copy` applies to the identical
+listing. And `-files` checks and collects the file list in one walk instead of
+two, which is the fix `list -files` already had.
 
-Both are byte-identical to HEAD apart from the two log lines that describe the
-phase that was skipped, and both leave the unrestricted check on the walk. The
-figures are below.
+The first two are byte-identical to HEAD apart from the two log lines that
+describe the phase that was skipped, and the second leaves the unrestricted check
+on the walk; `-files` is output-identical outright. The figures are below.
 
 Nothing else is a defect:
 
@@ -71,7 +75,7 @@ Nothing else is a defect:
   loop submits through it (`:1362`). On a 20-revision, 200 MB fixture `-chunks`
   goes from 2.05 s at one thread to 0.22 s at eight.
 - `-files` is I/O-bound on the file chunks themselves, and `VerifySnapshot`
-  (`:1604`) hands those to `RetrieveFile` (`:1649`), which blocks on the calling
+  (`:1604`) hands those to `RetrieveFile` (`:1735`), which blocks on the calling
   goroutine. Raising `-threads` therefore changes nothing measurable, and neither
   does the operator's own thread count: the same fixture takes ~1.6 s per
   revision at 1, 4 and 8 threads.
@@ -82,12 +86,12 @@ Nothing else is a defect:
   storage every run; that is the same finding as `snapshot_perf.md`, and it is
   what makes the per-revision read the thing `-threads` should overlap.
 
-The `-files` cost has one removable piece: `VerifySnapshot` walks the file
+The `-files` cost had one removable piece: `VerifySnapshot` walked the file
 sequence twice per revision — once in `CheckSnapshot` and again to collect the
 files it hashes. `list -files` removed exactly this double pass
-(`snapshot_perf.md` fix #5, `38a36fc`); on a local storage the second pass is
-served from the chunk cache, so the saving is a re-decode per revision rather
-than a round trip. Recorded as candidate #3.
+(`snapshot_perf.md` fix #5, `38a36fc`), and `check -files` now shares one walk
+too; the second pass was served from the chunk cache on a storage that has one,
+so the saving was a re-decode per revision plus a cache read.
 
 ## The call path
 
@@ -347,56 +351,74 @@ fixture takes 1.54 s for one revision, 8.9 s for five and 60.9 s for twenty, so
 it is linear in the amount of data and dominated by the storage read, not by
 anything the command does per revision.
 
-### `check -files` walks the file sequence twice
+### `check -files` used to walk the file sequence twice — fixed
 
-`VerifySnapshot` (`:1604`) runs two full traversals of the file sequence per
-revision. First it calls `CheckSnapshot` (`:2952`) to sanity-check the entries,
-and `CheckSnapshot` walks the sequence through `ListRemoteFiles` (`:2963`).
-Then `VerifySnapshot` itself walks the same sequence again (`:1615`) to collect
-the files it is about to hash:
+`VerifySnapshot` (`:1604`) ran two full traversals of the file sequence per
+revision. First it called `CheckSnapshot` to sanity-check the entries, and that
+walked the sequence through `ListRemoteFiles`. Then `VerifySnapshot` itself
+walked the same sequence again to collect the files it was about to hash:
 
 ```go
 func (manager *SnapshotManager) VerifySnapshot(snapshot *Snapshot) bool {
-    err := manager.CheckSnapshot(snapshot)          // :1604  ListRemoteFiles #1
+    err := manager.CheckSnapshot(snapshot)          // ListRemoteFiles #1
     ...
-    snapshot.ListRemoteFiles(manager.config, manager.chunkOperator, func(file *Entry) bool {   // :1615  #2
+    snapshot.ListRemoteFiles(manager.config, manager.chunkOperator, func(file *Entry) bool {   // #2
         ...
     })
 ```
 
 `ListRemoteFiles` re-reads and re-decodes every entry, and it fetches every
-chunk of the file sequence through the operator as it goes (`:119`). This is the
-same double pass `list -files` removed (`snapshot_perf.md` fix #5, `38a36fc`);
-`check -files` still pays it.
+chunk of the file sequence through the operator as it goes (`:119`). That makes
+the second traversal more than a re-decode: the first traversal fetches the
+sequence from the storage and the operator writes each metadata chunk to the
+snapshot cache, so the second traversal is served from the cache instead. On a
+storage that needs no cache the sequence is not written to it at all, so there
+the second traversal reads the storage again.
 
-Measured on a 3000-file repository (one 1-chunk file sequence) with
-`-d check -files` and `-d list -files`, cold cache, counting `CHUNK_DOWNLOAD`
-against `CHUNK_CACHE`:
+This is the same double pass `list -files` removed (`snapshot_perf.md` fix #5,
+`38a36fc`); `check -files` still paid it. The fix is the one that document
+describes: `CheckSnapshot` and the file-collecting traversal are now one walk,
+`walkSnapshotEntries` (`:1645`), which checks each entry as it visits it and
+collects the files of a non-zero size on the same pass. The per-entry checks are
+unchanged — they are the body of `checkRemoteEntry` (`:1681`), called from the
+collector — so an invalid entry still stops the walk and its error is reported
+before any file is hashed, and `CheckSnapshot` (`:3039`) remains as the
+checking-only form for callers outside the package.
 
-```
-              check -files            list -files
-              downloads  hits         downloads  hits
--r 1              4       1              2       0
--r 1-3            6       9              2       4
--r 1-5            9      16              3       7
-```
+Measured on a repository of 40,000 files whose file sequence spans 415 metadata
+chunks, cold cache:
 
-`check -files` fetches all three metadata sequences per revision and then reads
-the file content chunks as it hashes them (`-r 1` is the chunk, length and file
-sequences, a cache-served second traversal of the file sequence, and the file's
-own content chunk), where `list -files` reads two metadata sequences and no
-content. Its cache hits outnumber `list -files`' because the second traversal of
-the file sequence is served from the cache. The exact counts depend on how many
-revisions share a sequence (`-r 1-5` adds fewer new downloads than `-r 1-3`
-did), so only the shape matters.
+| Command | HEAD | with the fix |
+| --- | --- | --- |
+| `check -files -r 1`, repository and cache on a slow mount | 8.23 s | 7.03 s |
+| `check -files -r 1`, repository and cache on ext4 | 1.52 s | 1.47 s |
+| chunks fetched | 419 + 415 cache reads | 419 |
 
-Unlike `list -files`, `check -files` genuinely needs all three sequences
-(`CheckSnapshot` bounds each entry against `snapshot.ChunkLengths` and
-`len(snapshot.ChunkHashes)`, and the file hash is computed from
-`ChunkHashes`), so the `list -files` fix #8 — dropping the chunk sequence —
-does not apply. The candidate here is narrower: make `CheckSnapshot` and
-`VerifySnapshot` share one traversal, so the sequence is decoded once per
-revision instead of twice. Recorded as candidate #3.
+The `-d` counts are the cleanest confirmation: the 40,000 files are 415 metadata
+chunks of file sequence plus the two short sequences and the two file-content
+chunks, so HEAD fetches all 419 and then reads 415 of them from the cache a
+second time, while the fix fetches the same 419 and makes no cache read. The win
+is the largest where a cache read is a round trip — the cache lives next to the
+repository, so a repository on a network mount is exactly that case — and it is
+small on a native filesystem, where both the re-decode and the cache read are
+cheap.
+
+The output is unchanged: `check`, `check -files`, `check -stats`, `check -stats
+-files`, `check -tabular -files`, `check -chunks`, `list -files` and the corrupt
+-file path (`check -files` after flipping bytes in a file chunk, exit 100) are
+byte-identical to HEAD.
+
+One latent defect in the checks is fixed along the way: the branch for an entry
+whose end chunk precedes its start chunk called `fmt.Errorf` without assigning
+the result, so HEAD stopped the walk but reported nothing, and the file was then
+hashed anyway. The single walk returns that error, so a snapshot malformed in
+that particular way is now reported as an error instead of as a corrupted file.
+The branch is only reachable from a snapshot whose delta-encoded chunk indexes
+decode to an inverted range.
+
+Covered by `TestCheckFilesWalksTheFileSequenceOnce`, which fails with "the file
+sequence was walked twice: 1 chunks were read from the cache again" when the
+second walk is put back.
 
 ## The snapshot cache is written but never read
 
@@ -481,6 +503,11 @@ what lets `-threads` overlap those reads.
   every referenced chunk, and `-files` fetches every chunk of every verified
   file. The `CHUNK_CACHE` lines are what the unguarded write-back leaves behind
   locally even though the storage asks for no cache.
+- `check -files` on a repository whose file sequence spans many metadata chunks
+  is the direct test of the single walk: with `-d`, count the `CHUNK_DOWNLOAD`
+  and `CHUNK_CACHE` lines. The sequence of a large file list is fetched once and
+  read from the cache no times, where a second walk would add one `CHUNK_CACHE`
+  line per chunk of the sequence.
 - `/usr/bin/time -v duplicacy check ...`: the plain mode is syscall-bound (low
   CPU, high context-switch count), `-chunks` becomes CPU-bound once `-threads` is
   raised (CPU above 100%), and `-files` stays around half the wall time in
@@ -506,6 +533,8 @@ what lets `-threads` overlap those reads.
   (`src/duplicacy_snapshotmanager_test.go:593`, `:541`, `:460`) pin the overlap
   down and fail with "at most 1 was in flight at a time" if the serial loop is
   put back. `TestCheckListsTheChunkTreeOnlyWhenItIsCheaper` (`:690`) and
-  `TestCheckProbesReportTheChunkSizes` (`:735`) pin the walk decision and the
+  `TestCheckProbesReportTheChunkSizes` (`:801`) pin the walk decision and the
   sizes the probe records, and fail if the walk is forced back or the sizes are
-  dropped.
+  dropped. `TestCheckFilesWalksTheFileSequenceOnce` (`:737`) pins the single
+  file-sequence walk and fails with "the file sequence was walked twice" if the
+  second walk is put back.

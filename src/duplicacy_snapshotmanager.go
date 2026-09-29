@@ -1603,22 +1603,16 @@ func (manager *SnapshotManager) PrintSnapshot(snapshot *Snapshot) bool {
 // and computing the whole file hash for each file.
 func (manager *SnapshotManager) VerifySnapshot(snapshot *Snapshot) bool {
 
-	err := manager.CheckSnapshot(snapshot)
+	// The file sequence is walked once, and each entry is checked as that walk visits it; the files to hash are what
+	// the same walk collected.  Walking it twice would re-read and re-decode every entry, fetching every metadata
+	// chunk of the sequence a second time.
+	files, err := manager.walkSnapshotEntries(snapshot, true)
 
 	if err != nil {
 		LOG_ERROR("SNAPSHOT_CHECK", "Snapshot %s at revision %d has an error: %v",
 			snapshot.ID, snapshot.Revision, err)
 		return false
 	}
-
-	files := make([]*Entry, 0)
-	snapshot.ListRemoteFiles(manager.config, manager.chunkOperator, func(file *Entry) bool {
-		if file.IsFile() && file.Size != 0 {
-			file.Attributes = nil
-			files = append(files, file)
-		}
-		return true
-	})
 
 	sort.Sort(ByChunk(files))
 	corruptedFiles := 0
@@ -1643,6 +1637,98 @@ func (manager *SnapshotManager) VerifySnapshot(snapshot *Snapshot) bool {
 			snapshot.ID, snapshot.Revision)
 		return true
 	}
+}
+
+// walkSnapshotEntries walks the file sequence once, checking each entry as the walk visits it and, when 'collectFiles'
+// is set, gathering the files of a non-zero size with their attributes stripped -- the set VerifySnapshot hashes.  The
+// walk stops at the first invalid entry and its error is returned, so a file the checks reject is never hashed.
+func (manager *SnapshotManager) walkSnapshotEntries(snapshot *Snapshot, collectFiles bool) (files []*Entry, err error) {
+
+	var lastEntry *Entry
+
+	numberOfChunks := len(snapshot.ChunkHashes)
+
+	if numberOfChunks != len(snapshot.ChunkLengths) {
+		return nil, fmt.Errorf("The number of chunk hashes (%d) is different from the number of chunk lengths (%d)",
+			numberOfChunks, len(snapshot.ChunkLengths))
+	}
+
+	snapshot.ListRemoteFiles(manager.config, manager.chunkOperator, func(entry *Entry) bool {
+
+		err = checkRemoteEntry(snapshot, entry, lastEntry, numberOfChunks)
+		if err != nil {
+			return false
+		}
+		lastEntry = entry
+
+		if collectFiles && entry.IsFile() && entry.Size != 0 {
+			entry.Attributes = nil
+			files = append(files, entry)
+		}
+
+		return true
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return files, nil
+}
+
+// checkRemoteEntry performs the sanity checks on one entry of a snapshot, so that the walk in
+// walkSnapshotEntries can check each entry as it visits it.  'lastEntry' is the entry visited before this one.
+func checkRemoteEntry(snapshot *Snapshot, entry *Entry, lastEntry *Entry, numberOfChunks int) error {
+
+	if lastEntry != nil && lastEntry.Compare(entry) >= 0 && !strings.Contains(lastEntry.Path, "\ufffd") {
+		return fmt.Errorf("The entry %s appears before the entry %s", lastEntry.Path, entry.Path)
+	}
+
+	if !entry.IsFile() || entry.Size == 0 {
+		return nil
+	}
+
+	if entry.StartChunk < 0 {
+		return fmt.Errorf("The file %s starts at chunk %d", entry.Path, entry.StartChunk)
+	}
+
+	if entry.EndChunk >= numberOfChunks {
+		return fmt.Errorf("The file %s ends at chunk %d while the number of chunks is %d",
+			entry.Path, entry.EndChunk, numberOfChunks)
+	}
+
+	if entry.EndChunk < entry.StartChunk {
+		return fmt.Errorf("The file %s starts at chunk %d and ends at chunk %d",
+			entry.Path, entry.StartChunk, entry.EndChunk)
+	}
+
+	if entry.StartChunk == entry.EndChunk && entry.StartOffset > entry.EndOffset {
+		return fmt.Errorf("The file %s starts at offset %d and ends at offset %d of the same chunk %d",
+			entry.Path, entry.StartOffset, entry.EndOffset, entry.StartChunk)
+	}
+
+	fileSize := int64(0)
+
+	for i := entry.StartChunk; i <= entry.EndChunk; i++ {
+
+		start := 0
+		if i == entry.StartChunk {
+			start = entry.StartOffset
+		}
+		end := snapshot.ChunkLengths[i]
+		if i == entry.EndChunk {
+			end = entry.EndOffset
+		}
+
+		fileSize += int64(end - start)
+	}
+
+	if entry.Size != fileSize {
+		return fmt.Errorf("The file %s has a size of %d but the total size of chunks is %d",
+			entry.Path, entry.Size, fileSize)
+	}
+
+	return nil
 }
 
 // RetrieveFile retrieves the file in the specified snapshot.
@@ -2948,79 +3034,13 @@ func (manager *SnapshotManager) pruneSnapshotsExhaustive(referencedFossils map[s
 	return true
 }
 
-// CheckSnapshot performs sanity checks on the given snapshot.
+// CheckSnapshot performs sanity checks on the given snapshot.  It is the checking-only form of the walk, for callers
+// outside this package; VerifySnapshot checks and collects in one walk.
 func (manager *SnapshotManager) CheckSnapshot(snapshot *Snapshot) (err error) {
 
-	var lastEntry *Entry
+	_, err = manager.walkSnapshotEntries(snapshot, false)
 
-	numberOfChunks := len(snapshot.ChunkHashes)
-
-	if numberOfChunks != len(snapshot.ChunkLengths) {
-		return fmt.Errorf("The number of chunk hashes (%d) is different from the number of chunk lengths (%d)",
-			numberOfChunks, len(snapshot.ChunkLengths))
-	}
-
-	snapshot.ListRemoteFiles(manager.config, manager.chunkOperator, func(entry *Entry) bool {
-
-		if lastEntry != nil && lastEntry.Compare(entry) >= 0 && !strings.Contains(lastEntry.Path, "\ufffd") {
-			err = fmt.Errorf("The entry %s appears before the entry %s", lastEntry.Path, entry.Path)
-			return false
-		}
-		lastEntry = entry
-
-		if !entry.IsFile() || entry.Size == 0 {
-			return true
-		}
-
-		if entry.StartChunk < 0 {
-			err = fmt.Errorf("The file %s starts at chunk %d", entry.Path, entry.StartChunk)
-			return false
-		}
-
-		if entry.EndChunk >= numberOfChunks {
-			err = fmt.Errorf("The file %s ends at chunk %d while the number of chunks is %d",
-				entry.Path, entry.EndChunk, numberOfChunks)
-			return false
-		}
-
-		if entry.EndChunk < entry.StartChunk {
-			fmt.Errorf("The file %s starts at chunk %d and ends at chunk %d",
-				entry.Path, entry.StartChunk, entry.EndChunk)
-			return false
-		}
-
-		if entry.StartChunk == entry.EndChunk && entry.StartOffset > entry.EndOffset {
-			err = fmt.Errorf("The file %s starts at offset %d and ends at offset %d of the same chunk %d",
-				entry.Path, entry.StartOffset, entry.EndOffset, entry.StartChunk)
-			return false
-		}
-
-		fileSize := int64(0)
-
-		for i := entry.StartChunk; i <= entry.EndChunk; i++ {
-
-			start := 0
-			if i == entry.StartChunk {
-				start = entry.StartOffset
-			}
-			end := snapshot.ChunkLengths[i]
-			if i == entry.EndChunk {
-				end = entry.EndOffset
-			}
-
-			fileSize += int64(end - start)
-		}
-
-		if entry.Size != fileSize {
-			err = fmt.Errorf("The file %s has a size of %d but the total size of chunks is %d",
-				entry.Path, entry.Size, fileSize)
-			return false
-		}
-
-		return true
-	})
-
-	return nil
+	return err
 }
 
 // DownloadFile downloads a non-chunk file from the storage.  The only non-chunk files in the current implementation
