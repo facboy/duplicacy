@@ -248,6 +248,7 @@ type instrumentedStorage struct {
 	findChunkCalls    int64
 	snapshotInfoCalls int64
 	snapshotListings  int64
+	chunkListings     int64
 	snapshotDirCalls  int64
 	uploadedChunks    int64
 	uploadedSnapshots int64
@@ -306,6 +307,12 @@ func (storage *instrumentedStorage) ListFiles(threadIndex int, dir string) (file
 	// and is not what the copy can use to learn the destination's revisions.
 	if strings.HasPrefix(dir, "snapshots/") && dir != "snapshots/" {
 		atomic.AddInt64(&storage.snapshotListings, 1)
+	}
+	// The listing of a nested chunk directory is what the whole-tree walk costs one call per directory; a check that
+	// probes the referenced chunks instead makes none of these.  The listing of 'chunks/' itself is made by both, so
+	// it is not counted.
+	if strings.HasPrefix(dir, "chunks/") && dir != "chunks/" {
+		atomic.AddInt64(&storage.chunkListings, 1)
 	}
 	return storage.FileStorage.ListFiles(threadIndex, dir)
 }
@@ -428,6 +435,7 @@ func (storage *instrumentedStorage) resetCounters() {
 	atomic.StoreInt64(&storage.findChunkCalls, 0)
 	atomic.StoreInt64(&storage.snapshotInfoCalls, 0)
 	atomic.StoreInt64(&storage.snapshotListings, 0)
+	atomic.StoreInt64(&storage.chunkListings, 0)
 	atomic.StoreInt64(&storage.snapshotDirCalls, 0)
 	atomic.StoreInt64(&storage.uploadedChunks, 0)
 	atomic.StoreInt64(&storage.uploadedSnapshots, 0)

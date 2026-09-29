@@ -642,6 +642,140 @@ func TestCheckDownloadsRevisionsConcurrently(t *testing.T) {
 	}
 }
 
+// checkSnapshotsProbeFixture builds a storage holding 'numberOfChunks' chunks, so that the chunk tree fills one
+// directory per chunk and a test can put the referenced set on either side of the directory count the check weighs it
+// against.  It returns the manager, the storage double and the hashes of the uploaded chunks, in the order uploaded.
+func checkSnapshotsProbeFixture(t *testing.T, testDir string,
+	numberOfChunks int) (*SnapshotManager, *instrumentedStorage, []string) {
+
+	snapshotManager := createTestSnapshotManager(testDir)
+
+	storage, err := CreateFileStorage(testDir, false, 4)
+	if err != nil {
+		t.Errorf("Failed to create the storage: %v", err)
+		return snapshotManager, nil, nil
+	}
+	counting := &instrumentedStorage{FileStorage: storage}
+	snapshotManager.storage = counting
+
+	chunkHashes := make([]string, 0, numberOfChunks)
+	for i := 0; i < numberOfChunks; i++ {
+		chunkHash := uploadRandomChunk(snapshotManager, 1024)
+		if chunkHash == "" {
+			t.Errorf("Failed to upload a chunk")
+			return snapshotManager, counting, nil
+		}
+		chunkHashes = append(chunkHashes, chunkHash)
+	}
+
+	return snapshotManager, counting, chunkHashes
+}
+
+// checkSnapshotsFailed runs a check and reports whether it failed.  A failed check raises the exception LOG_ERROR
+// panics with, so the failure is caught here rather than reported by the test's own recovering handler; the logging is
+// detached while it runs so that the expected LOG_ERROR is not also recorded against the test.
+func checkSnapshotsFailed(snapshotManager *SnapshotManager, revisions []int) (failed bool) {
+	recovered := recoverPanicFrom(func() {
+		if !snapshotManager.CheckSnapshots("vm1@host1", revisions, "", false, false, false, false, false, false, false,
+			1, false) {
+			failed = true
+		}
+	})
+	return failed || recovered != nil
+}
+
+// check -r N reads the named revisions and then answers "does this chunk exist" for the chunks those revisions
+// reference.  Listing the whole chunk tree answers that for every chunk at the cost of one listing per chunk directory,
+// which is the cost a restricted check should not have to pay when the tree is far larger than the referenced set.
+func TestCheckListsTheChunkTreeOnlyWhenItIsCheaper(t *testing.T) {
+
+	setTestingT(t)
+
+	defer recovering(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager, counting, chunkHashes := checkSnapshotsProbeFixture(t, testDir, 16)
+	if counting == nil {
+		return
+	}
+
+	// Every revision references one of the uploaded chunks, so a check of one revision references that chunk and the
+	// metadata chunk holding its sequence -- two chunks against a tree of one directory per uploaded chunk.
+	now := time.Now().Unix()
+	for revision := 1; revision <= 16; revision++ {
+		createTestSnapshot(snapshotManager, "vm1@host1", revision, now-int64(revision)*3600, now,
+			[]string{chunkHashes[revision-1]}, "tag")
+	}
+
+	counting.resetCounters()
+	if checkSnapshotsFailed(snapshotManager, []int{1}) {
+		t.Errorf("The restricted check failed")
+		return
+	}
+	if listings := atomic.LoadInt64(&counting.chunkListings); listings != 0 {
+		t.Errorf("The restricted check listed %d chunk directories; a tree larger than the referenced set is probed",
+			listings)
+	}
+
+	// A check of every revision references every chunk, so the tree is never larger than the referenced set and
+	// walking it is what the existence check and the total chunk size are then reported over.
+	counting.resetCounters()
+	if checkSnapshotsFailed(snapshotManager, []int{}) {
+		t.Errorf("The unrestricted check failed")
+		return
+	}
+	if listings := atomic.LoadInt64(&counting.chunkListings); listings == 0 {
+		t.Errorf("The unrestricted check probed the chunks instead of listing the tree")
+	}
+}
+
+// A probed chunk whose size the check does not record would be reported as missing, so the probe has to fill in the
+// size of every chunk it finds -- and report the ones stored with a size of 0, exactly as the whole-tree listing does.
+func TestCheckProbesReportTheChunkSizes(t *testing.T) {
+
+	setTestingT(t)
+
+	defer recovering(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager, counting, chunkHashes := checkSnapshotsProbeFixture(t, testDir, 3)
+	if counting == nil {
+		return
+	}
+
+	now := time.Now().Unix()
+	for revision := 1; revision <= 3; revision++ {
+		createTestSnapshot(snapshotManager, "vm1@host1", revision, now-int64(revision)*3600, now,
+			[]string{chunkHashes[revision-1]}, "tag")
+	}
+
+	// Each revision references one uploaded chunk plus the metadata chunk holding its sequence, so a check of one
+	// revision probes two chunks and must succeed.
+	if checkSnapshotsFailed(snapshotManager, []int{1}) {
+		t.Errorf("A check over chunks that all exist failed")
+		return
+	}
+
+	// Empty one of the referenced chunks: the probe must see the size of 0, which the whole-tree listing would also
+	// have seen, and the check must fail on it.
+	chunkPath, exist, _, err := counting.FileStorage.FindChunk(0,
+		snapshotManager.config.GetChunkIDFromHash(chunkHashes[1]), false)
+	if err != nil || !exist {
+		t.Errorf("Failed to find the chunk to empty: %v", err)
+		return
+	}
+	if err := os.Truncate(path.Join(testDir, chunkPath), 0); err != nil {
+		t.Errorf("Failed to empty the chunk: %v", err)
+		return
+	}
+
+	if !checkSnapshotsFailed(snapshotManager, []int{2}) {
+		t.Errorf("A check of a chunk stored with a size of 0 succeeded")
+	}
+}
+
 // createPruneDeletionFixture creates 'revisions' snapshots, each referring to its own chunk, and returns a manager whose
 // storage tracks snapshot-file deletions.
 func createPruneDeletionFixture(t *testing.T, testDir string, revisions int) (*SnapshotManager, *instrumentedStorage) {
