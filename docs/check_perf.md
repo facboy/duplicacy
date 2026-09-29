@@ -1,18 +1,19 @@
 # Where `check` spends its time
 
 Investigation into the performance of `duplicacy check`, in the style of
-`snapshot_perf.md`, `copy_perf.md`, `prune_perf.md` and `init_perf.md`. Three
+`snapshot_perf.md`, `copy_perf.md`, `prune_perf.md` and `init_perf.md`. Four
 defects were found and fixed. The revision loop ignored `-threads`, exactly as
 prune's did before `c651bb1`; it now reads its snapshot files through
 `downloadSnapshots`, the same helper `list` and `prune` use. The whole chunk tree
 was listed on every run, even when a `-r` restriction had named a handful of
 revisions; the listing is now weighed against the referenced set, and a
 restricted check that references fewer chunks than the tree holds looks them up
-instead. And `-files` walked the file sequence twice per revision, checking it
-and then collecting from it; the check and the collection are now one walk. The
-`check -files` mode is still the expensive one, but its dominant cost — reading
-the file chunks — is inherent to what the mode promises rather than to a
-mistake.
+instead. `-files` walked the file sequence twice per revision, checking it and
+then collecting from it; the check and the collection are now one walk. And the
+snapshot-file cache, which was off for every local path including a network share
+mounted at one, is now decided by the two filesystems involved. The `check
+-files` mode is still the expensive one, but its dominant cost — reading the file
+chunks — is inherent to what the mode promises rather than to a mistake.
 
 ## Summary
 
@@ -53,7 +54,7 @@ that costs seconds to minutes.
 
 ## Conclusion
 
-**All three defects were worth fixing and all three are fixed.** The revision
+**All four defects were worth fixing and all four are fixed.** The revision
 loop reads its snapshot files through `downloadSnapshots`, so `-threads` reaches
 the per-revision read — the change already applied to `prune` in `c651bb1` and to
 `list` in `6584fb0`: a few lines, byte-identical to the serial loop at one thread
@@ -61,12 +62,15 @@ and to HEAD's output at every thread count. The chunk-tree listing is no longer
 unconditional: a restricted check that references fewer chunks than the tree
 holds answers the existence question with one lookup per referenced chunk instead
 of one listing per chunk directory, the same rule `copy` applies to the identical
-listing. And `-files` checks and collects the file list in one walk instead of
-two, which is the fix `list -files` already had.
+listing. `-files` checks and collects the file list in one walk instead of two,
+which is the fix `list -files` already had. And the snapshot file is cached when
+the storage and the repository are on different filesystems, which is where the
+cache pays, instead of never being cached for a local path.
 
 The first two are byte-identical to HEAD apart from the two log lines that
 describe the phase that was skipped, and the second leaves the unrestricted check
-on the walk; `-files` is output-identical outright. The figures are below.
+on the walk; `-files` and the cache decision are output-identical outright. The
+figures are below.
 
 Nothing else is a defect:
 
@@ -81,10 +85,12 @@ Nothing else is a defect:
   revision at 1, 4 and 8 threads.
 - The plain `check` reads no chunk data at all — it only compares ids — so its
   cost is the snapshot files plus the chunk-tree walk.
-- The snapshot cache is written but never read for a local storage
-  (`IsCacheNeeded()` is false), so the snapshot files are re-read from the
-  storage every run; that is the same finding as `snapshot_perf.md`, and it is
-  what makes the per-revision read the thing `-threads` should overlap.
+- The snapshot cache is off for a local storage (`IsCacheNeeded()` is false), so
+  the snapshot files are re-read from the storage every run, and the per-revision
+  read is what `-threads` now overlaps. That is the same finding as
+  `snapshot_perf.md`; the decision is no longer tied to the URL scheme, so a
+  share mounted at a path is cached when that pays and left alone when it does
+  not.
 
 The `-files` cost had one removable piece: `VerifySnapshot` walked the file
 sequence twice per revision — once in `CheckSnapshot` and again to collect the
@@ -92,6 +98,16 @@ files it hashes. `list -files` removed exactly this double pass
 (`snapshot_perf.md` fix #5, `38a36fc`), and `check -files` now shares one walk
 too; the second pass was served from the chunk cache on a storage that has one,
 so the saving was a re-decode per revision plus a cache read.
+
+The snapshot cache itself was the last thing in the path worth changing, and it
+was changed: whether a file storage keeps one is now decided by the filesystems
+involved rather than by how the storage URL is spelled, for 0.53 s to 0.12 s on
+a 300-revision storage on a slow mount with the repository on a fast one.
+
+The phase-1 log line is also worth reading with the cache decision in mind: the
+`DOWNLOAD_FILE_CACHE` "Loaded file ... from the snapshot cache" lines are absent
+until the storage is remote and the repository is not, and present for every
+revision once it is.
 
 ## The call path
 
@@ -199,7 +215,7 @@ restrictions, and the error paths (`check -r 99`, an unknown id) exit and print
 the same way.
 
 The same overlap applies to the `-stats`/`-tabular` modes, which force the
-revision listing (`:1027`) and are otherwise identical reads.
+revision listing (`:1077`) and are otherwise identical reads.
 
 On a local filesystem the loop is two syscalls per revision, so there is nothing
 to overlap, and the helper's per-worker `Chunk` — grown to `MaximumChunkSize`,
@@ -241,7 +257,7 @@ records as the second-order cost after the sequence expansion.
 
 What the walk buys is a map from chunk id to size for the whole tree, consulted
 in two places: the existence check (`:1178`) and the "has a size of 0" report
-(`:1128`, `:1258`). Two things keep the obvious replacement from being a pure
+(`:1128`, `:1262`). Two things keep the obvious replacement from being a pure
 win, and both are why the fix is a decision rather than a deletion:
 
 - The walk answers the existence question for every chunk at the cost of one
@@ -333,9 +349,9 @@ from 47% to 161%, which is the signature of overlap rather than of a smaller
 working set.
 
 **`-files` does not.** `VerifySnapshot` (`:1604`) walks the file sequence through
-`ListRemoteFiles`, then verifies each file by calling `RetrieveFile` (`:1649`),
+`ListRemoteFiles`, then verifies each file by calling `RetrieveFile` (`:1735`),
 which blocks on `manager.chunkOperator.Download` on the calling goroutine
-(`:1677`, `:1686`). The operator's threads are used for the file *sequence*
+(`:1763`, `:1772`). The operator's threads are used for the file *sequence*
 metadata reads but not for the file *content* reads, so the dominant cost is
 serial:
 
@@ -368,12 +384,13 @@ func (manager *SnapshotManager) VerifySnapshot(snapshot *Snapshot) bool {
 ```
 
 `ListRemoteFiles` re-reads and re-decodes every entry, and it fetches every
-chunk of the file sequence through the operator as it goes (`:119`). That makes
-the second traversal more than a re-decode: the first traversal fetches the
-sequence from the storage and the operator writes each metadata chunk to the
-snapshot cache, so the second traversal is served from the cache instead. On a
-storage that needs no cache the sequence is not written to it at all, so there
-the second traversal reads the storage again.
+chunk of the file sequence through the operator as it goes
+(`src/duplicacy_snapshot.go:119`). That makes the second traversal more than a
+re-decode: the first traversal fetches the sequence from the storage and the
+operator writes each metadata chunk to the snapshot cache, so the second
+traversal is served from the cache instead. On a storage that needs no cache the
+sequence is not written to it at all, so there the second traversal reads the
+storage again.
 
 This is the same double pass `list -files` removed (`snapshot_perf.md` fix #5,
 `38a36fc`); `check -files` still paid it. The fix is the one that document
@@ -420,28 +437,93 @@ Covered by `TestCheckFilesWalksTheFileSequenceOnce`, which fails with "the file
 sequence was walked twice: 1 chunks were read from the cache again" when the
 second walk is put back.
 
-## The snapshot cache is written but never read
+## The snapshot-file cache was off for every local path — fixed
 
-Every snapshot file download goes through `downloadFile` (`:3035`), which guards
-the cache read with `IsCacheNeeded()` (`:3037`) and the write-back with the same
-predicate (`:3080`). For a local path `CreateStorage` leaves `isCacheNeeded`
-false, so both are skipped and every run re-reads each snapshot file from the
-storage.
+Every snapshot file download goes through `downloadFile` (`:3055`), which guards
+the cache read with `IsCacheNeeded()` (`:3057`) and the write-back with the same
+predicate (`:3100`). `CreateStorage` decides that flag, and it decided it from the
+URL scheme alone (`src/duplicacy_storage.go:260`): a plain path and a `flat://`
+URL got `false`, a `samba://` URL and a UNC path got `true`, and no local path was
+ever asked about. A share mounted at `/mnt/nas` or mapped to a drive letter is
+spelled like a local disk, so it got `false` too — and then every `check` re-read
+one snapshot file per revision from the share, with no cache read to replace it.
 
-That is the same behaviour `snapshot_perf.md` documented for `list`, and it is
-why an unparallelised `check` is the slowest way to read a repository: 500
-snapshot files are 500 `openat`/`read` pairs on one goroutine. It is not a
-`check`-specific defect, so it is not a candidate here; the revision-loop fix is
-what lets `-threads` overlap those reads.
+What the cache buys depends on *where it is written*, which is the repository,
+not on whether the storage is remote: a cache read replaces a storage read only
+when the two are on different filesystems, one slow and one fast. So the decision
+is now made from the two filesystems (`needsSnapshotCache`,
+`src/duplicacy_storage.go:248`):
+
+- **A local storage is not cached.** The cache read is the same syscall as the
+  storage read — both `openat`/`read` — and the write-back adds a temp file, an
+  `fsync` and a rename, so the cache is overhead. This is what `ceadc74` fixed for
+  the snapshot files and `prune_perf.md` fixed for the metadata chunks, and it is
+  preserved.
+- **A remote storage with a local repository is cached.** The cache is written to
+  the repository's preference path, which is the whole point: a cache read is a
+  local read in place of a read from the share.
+- **A remote storage whose repository is on the same remote filesystem is not
+  cached.** The write-back would then cost what the read it removes costs, and the
+  write is the larger of the two, so this run loses even though the next one would
+  win.
+
+The two halves are one probe of the filesystem type plus a comparison of the
+storage path against the preference path. The probe is per platform:
+`src/duplicacy_remotefs_linux.go` reads the `statfs` magic, the BSD and macOS file
+reads the `statfs` name, `src/duplicacy_remotefs_windows.go` asks `GetDriveTypeW`,
+and the rest assume local. A filesystem type that is not recognized is treated as
+local, because that is the direction that keeps the cache off, and an unknown
+type is more often a local one than a share. The Windows case is what the
+scheme-based rule missed most: a share mapped to `Z:` was spelled like a local
+disk and so was never cached.
+
+Measured on a 300-revision repository whose storage is on a virtiofs mount and
+whose repository is on ext4, `/usr/bin/time`, best of five, cold cache:
+
+| Command | HEAD | with the fix |
+| --- | --- | --- |
+| `list` (cold, first run) | 0.54 s | 1.46 s |
+| `list` (warm, later runs) | 0.53 s | 0.12 s |
+| `check` (warm) | 0.63 s | 0.20 s |
+| `list -files` (warm) | 0.55 s | 0.15 s |
+
+The cold column is the cache being populated on the first run: the 300 snapshot
+files are read from the share as before, and written to the repository as well.
+`strace -f -c` separates the two runs exactly — HEAD makes 321 `openat`, 622
+`read` and 4 `mkdirat` calls, and the fix makes 300 `fsync` and 300 `renameat`
+more, one per snapshot file, plus the extra `openat` and `newfstatat` that each
+write costs. The `fsync` is the regression: the 300 calls total 0.88 s on the
+ext4 repository, 2.9 ms each, which is the whole 0.9 s that the cold run adds.
+Making that one cache write non-durable, purely to attribute the time, puts the
+cold run back at 0.55 s against HEAD's 0.51 s, so the read-plus-write pair itself
+costs about nothing once the flush is out of it. The `fsync` is what makes a
+cache entry durable, so it is not skippable here: a cached snapshot file is read
+back unverified and JSON-parsed, and `prune_perf.md` documents that only the
+chunk cache can drop it, because a torn chunk fails its id check and is re-fetched
+while a torn snapshot file is reported as an error. Everything after the first run
+is served from the repository and is 4.5x faster, which is why this is a win for a
+cache that is written once and read many times; the same repository with an ext4
+storage is 0.03 s cold and warm on both builds, since the cache stays off there.
+
+The output is unchanged. `list`, `list -files`, `list -chunks`, `check`,
+`check -stats`, `check -files`, `check -r 1-5` (with and without `-files`),
+`cat -r 2`, `history`, `diff -r 1 -r 2`, `list -r 1` and `info` are byte-identical
+to HEAD on the 300-revision fixture, exit codes included.
+
+Covered by `TestCreateStorageDoesNotCacheLocalPaths` (a local path and a
+`flat://` path must not ask for a cache) and `TestRemoteFilesystemType` (the
+magic-to-answer mapping, including that a local magic and an unrecognized one are
+both local). The remote half can only be exercised through a mount, which the
+unit test has none of, so those two pin the half that must not regress.
 
 ## Smaller items
 
 - **The `verified_chunks` skip needs `-chunks`.** The list is read at `:1286` and
-  consulted at `:1327`, but `allChunkHashes` is only non-empty for
-  `checkChunks && !checkFiles` (`:1156`), so a plain `check` reads the file and
-  then has nothing to skip. Harmless, but it means two `check -chunks` runs on an
-  unchanged repository do less work the second time while two plain `check` runs
-  do not.
+  consulted at `:1327`, and that whole block is only reached for
+  `checkChunks && !checkFiles` — a plain `check` returns at `:1274` before the
+  file is read, so it has nothing to skip. Harmless, but it means two
+  `check -chunks` runs on an unchanged repository do less work the second time
+  while two plain `check` runs do not.
 - **The existence-check fallback is capped at 100 per revision.** When a
   referenced chunk is missing from `chunkSizeMap`, `check` retries it with
   `FindChunk` but only while `missingChunks < 100` (`:1186`) — a deliberate guard
@@ -501,8 +583,15 @@ what lets `-threads` overlap those reads.
   ("loaded from the snapshot cache") counts separate the modes: a plain `check`
   fetches only the metadata chunks of the referenced sequences, `-chunks` fetches
   every referenced chunk, and `-files` fetches every chunk of every verified
-  file. The `CHUNK_CACHE` lines are what the unguarded write-back leaves behind
-  locally even though the storage asks for no cache.
+  file. The `CHUNK_CACHE` lines come from the metadata chunks, which the chunk
+  operator caches for every storage; the `DOWNLOAD_FILE_CACHE` ("Loaded file ...
+  from the snapshot cache") lines are the snapshot files, and they appear only
+  when `needsSnapshotCache` turned the cache on for a file storage.
+- Whether that cache was turned on is visible without a debug build: after a
+  `list` or a `check`, count the files under `.duplicacy/cache/<name>/snapshots`.
+  None means the storage is local, or shares its filesystem with the repository;
+  one per revision means the storage is remote and the repository is not, which is
+  the only case where the cache pays.
 - `check -files` on a repository whose file sequence spans many metadata chunks
   is the direct test of the single walk: with `-d`, count the `CHUNK_DOWNLOAD`
   and `CHUNK_CACHE` lines. The sequence of a large file list is fetched once and
@@ -533,8 +622,10 @@ what lets `-threads` overlap those reads.
   (`src/duplicacy_snapshotmanager_test.go:593`, `:541`, `:460`) pin the overlap
   down and fail with "at most 1 was in flight at a time" if the serial loop is
   put back. `TestCheckListsTheChunkTreeOnlyWhenItIsCheaper` (`:690`) and
-  `TestCheckProbesReportTheChunkSizes` (`:801`) pin the walk decision and the
+  `TestCheckProbesReportTheChunkSizes` (`:810`) pin the walk decision and the
   sizes the probe records, and fail if the walk is forced back or the sizes are
   dropped. `TestCheckFilesWalksTheFileSequenceOnce` (`:737`) pins the single
   file-sequence walk and fails with "the file sequence was walked twice" if the
-  second walk is put back.
+  second walk is put back. `TestCreateStorageDoesNotCacheLocalPaths` and
+  `TestRemoteFilesystemType` (`src/duplicacy_remotefs_test.go`,
+  `src/duplicacy_remotefs_linux_test.go`) pin the cache decision.

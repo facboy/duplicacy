@@ -17,9 +17,9 @@ under "Deliberately not pursued".
 
 `duplicacy list` used to be a serial, one-operation-at-a-time loop. For every
 revision of every snapshot id it performs an existence check and a file
-download, with a chunk operator hard-coded to a single thread and a snapshot
-cache that is written but never read. Only the file downloads are now overlapped,
-and only when `-threads N` (N > 1) is given; everything else is still serial.
+download, with a chunk operator hard-coded to a single thread. Only the file
+downloads are now overlapped, and only when `-threads N` (N > 1) is given;
+everything else is still serial.
 
 Against cloud storage each of those operations is a network round trip, so the
 cost grows linearly at roughly two round trips per revision; fix #3 removed the
@@ -101,9 +101,9 @@ for why that was also a correctness fix and not only a performance one.
 At 50-100 ms RTT and a few hundred revisions this is tens of seconds. With
 `-all` it repeats for every snapshot id after a single `snapshots/` listing.
 
-## The snapshot cache is written but never read
+## The snapshot-file cache and where it is written
 
-`SnapshotManager.DownloadFile` guards the cache **read** with `IsCacheNeeded()`:
+The cache **read** is guarded with `IsCacheNeeded()`:
 
 ```go
 if manager.storage.IsCacheNeeded() {
@@ -111,31 +111,33 @@ if manager.storage.IsCacheNeeded() {
 }
 ```
 
-but the cache **write** at the end is unconditional
-(`src/duplicacy_snapshotmanager.go:2669`):
+and so is the cache **write** (`src/duplicacy_snapshotmanager.go:3101`), which
+fix #1 below turned off for the storages that never read it back. What decided
+the flag is the storage URL alone, and not the filesystem: a plain path and a
+`flat://` URL got `false`, a `samba://` URL and a Windows UNC path `true`, and no
+local path was ever asked about. The flag is still off for a local path, where a
+cache read costs what the storage read costs — but it missed the case the cache is
+actually for, because a share mounted at `/mnt/nas` or mapped to a drive letter is
+spelled like a local disk. Those paths got `false` too, so every run re-read one
+snapshot file per revision from the share.
 
-```go
-err = manager.snapshotCache.UploadFile(0, path, manager.fileChunk.GetBytes())
-```
+`docs/check_perf.md` has since changed that decision to ask the filesystem rather
+than the URL, caching a file storage only when the storage is on a network
+filesystem and the repository is not — which is the only combination where a cache
+read replaces a round trip. A local storage, and a remote storage whose repository
+shares its filesystem, are left alone exactly as before. The measurements are in
+that document.
 
-For a local path, `CreateStorage` passes `isCacheNeeded = false`
-(`src/duplicacy_storage.go:237-244`), so `FileStorage.IsCacheNeeded()` returns
-false and the cache is never read. Yet every `list` still copies each snapshot
-file into `.duplicacy/cache/<name>/snapshots/<id>/`, and
-`FileStorage.UploadFile` performs a temp-file write, an `fsync` and a `rename`
-for each one (`src/duplicacy_filestorage.go:150-220`).
+Verified directly, on the local storage of that fixture:
 
-Verified directly:
+- `list` leaves `.duplicacy/cache/default/snapshots/` empty, where before fix #1
+  it held all 301 files. Corrupting anything there changes nothing, because
+  nothing is written and nothing is read.
+- Warm and cold-cache timings are indistinguishable: there is no cache to warm.
 
-- Corrupting a cached snapshot file and running `list -r 5` still returns the
-  correct snapshot — the cache is not read.
-- Deleting `.duplicacy/cache/default` and running `list` recreates all 301
-  snapshot files.
-- Warm and cold-cache timings are indistinguishable because the cache is
-  write-only.
-
-The cache therefore does not reduce round trips on any backend; it only removes
-the payload transfer for backends where it is actually consulted.
+The cache therefore does not reduce round trips on a local backend; it only
+removes the payload transfer for the backends where it is actually consulted,
+which is the remote-storage case `docs/check_perf.md` now keys off the filesystem.
 
 ## Local storage measurements
 
@@ -369,7 +371,7 @@ progress lines) with exit code 0 either way.
   high, the time is in syscalls or round trips, not processing.
 - Sum the per-call wall time of the `fsync`, `renameat`, `openat`, `newfstatat`
   and `mkdirat` calls with the `strace` recipe in `docs/README.md`. If `fsync`
-  dominates, it is the write-only snapshot cache.
+  dominates, it is the snapshot-cache write.
 - `list -r 1` versus a full `list` gives the per-revision marginal cost.
 - `list -files` fetches two metadata chunks per revision, `list -files -chunks`
   three. `strace -f -e trace=openat duplicacy list -files -r 1-50` counts the
