@@ -11,6 +11,7 @@ changed, and how to confirm the result on a given setup. The
 | `copy_perf.md` | Why `copy` re-encodes chunks and re-probes the destination; fixes #1-#5 applied, #6 rejected. |
 | `prune_perf.md` | Where `prune` spends its time; six fixes applied, the last being the chunk cache guard. |
 | `check_perf.md` | Where `check` spends its time; the parallel revision loop, the chunk-tree walk, the double file-sequence walk and the snapshot-cache decision all fixed; the chunk cache guard followed from the decision. |
+| `restore_perf.md` | Where `restore` spends its time; five candidates, nothing changed: the per-file temporary-file probe, the duplicated existence check, the per-file parent-directory probe, the one-thread metadata expansion, and the in-place `ftruncate`; the two `Seek` calls are ruled out. |
 | `init_perf.md` | Why `init` is not worth optimising; nothing changed. |
 | `highwayhash_arm64.md` | The `zipperMerge` symbol collision in `github.com/gilbertchen/highwayhash`. |
 | `branch_review.md` | Duplication and refactoring review of the branch, and the state of each item. |

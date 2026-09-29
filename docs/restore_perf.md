@@ -1,0 +1,404 @@
+# Where `restore` spends its time
+
+Investigation into the performance of `duplicacy restore`, in the style of
+`snapshot_perf.md`, `copy_perf.md`, `prune_perf.md`, `check_perf.md` and
+`init_perf.md`. Five defects were found and are left as candidates here. The
+first three are per-file syscalls that a tree of many small files pays for every
+file and that the command does not need: the deferred cleanup of the temporary
+file probes the filesystem twice even when there is no temporary file, the
+existence of the target file is established twice, and the parent directory of
+every restored file is re-created although the directory pass has just created
+it. The metadata sequences are expanded on a one-thread operator, which is much
+smaller. The fifth is the `ftruncate` the in-place branch issues after the write
+loop has already left the file the right length. Nothing in `restore` is changed,
+so no source files are touched.
+
+## Summary
+
+`restore` is five phases:
+
+1. the local file list, walked on its own goroutine (`ListLocalFiles`);
+2. the remote file list and the snapshot description, read on the calling
+   goroutine (`DownloadSnapshot`, `DownloadSnapshotSequences`, `ListRemoteFiles`);
+3. a merge of the two sorted lists into `fileEntries` (the files to restore) and
+   `directoryEntries`, with `extraFiles` holding local files absent from the
+   snapshot;
+4. the download plan — a first-occurrence map over the snapshot's chunk list,
+   a sort of `fileEntries` by starting chunk, `AddFiles` to build the download
+   task list, and `CreateFileChunkMaker`;
+5. the per-file loop, calling `RestoreFile` for each file.
+
+Phases 1 and 2 already overlap with each other and with phase 3. Phase 5 is
+serial per file, and each file costs it a fixed handful of syscalls. Three of
+those syscalls are avoidable and are the findings below; the rest of phase 5 is
+either the chunk download itself (which already overlaps across files, see
+"Deliberately not pursued") or the metadata writes (`chmod`, `utimes`,
+`chown`) that a restore is supposed to perform.
+
+Measured on a 20,005-file, 179 MB tree, `/usr/bin/time`, best of several runs,
+the three fixes together take a fresh restore from 1.53 s to 1.30 s on ext4 and
+from 163 s to 108 s when the target is on a virtiofs mount, and take a
+re-restore of an unchanged tree from 0.28 s to 0.21 s.
+
+A second pass over the in-place branch added candidate #5, the `ftruncate` that
+the write loop has already made unnecessary for a file the restore created: 1.13x
+on ext4 and 1.04x on the virtiofs target, far less than the three syscalls of the
+first pass. The pair of `Seek` calls in the same block turned out not to be worth
+changing at all, and is recorded as ruled out.
+
+## The call path
+
+`restoreRepository` (`duplicacy/duplicacy_main.go:816`) parses the flags, creates
+the storage with `-threads` (`:843`), and calls
+`BackupManager.Restore` (`:890`), passing `true` for `inPlace` and setting
+`quickMode` by the absence of `-hash` (`:853`).
+
+`Restore` (`src/duplicacy_backupmanager.go:636`) then does, in order:
+
+```go
+chunkOperator := CreateChunkOperator(config, storage, cache, showStatistics, false, threads, allowFailures)  // :688
+go localSnapshot.ListLocalFiles(top, nobackupFile, filtersFile, excludeByAttribute, localListingChannel, ...) // :694
+remoteSnapshot := manager.SnapshotManager.DownloadSnapshot(snapshotID, revision)                             // :697
+manager.SnapshotManager.DownloadSnapshotSequences(remoteSnapshot)                                            // :698
+go remoteSnapshot.ListRemoteFiles(config, chunkOperator, func(entry) { remoteListingChannel <- entry; ... })  // :702
+for remoteEntry := range remoteListingChannel { ... merge local and remote ... }                             // :712
+chunkMap := map[string]int{}; for i, chunk := range remoteSnapshot.ChunkHashes { ... }                       // :812
+for _, file := range fileEntries { ...collapse single-chunk files onto their first chunk... }               // :820
+sort.Sort(ByChunk(fileEntries))                                                                             // :829
+chunkDownloader := CreateChunkDownloader(chunkOperator); chunkDownloader.AddFiles(remoteSnapshot, fileEntries) // :831
+chunkMaker := CreateFileChunkMaker(config, true)                                                            // :835
+for _, file := range fileEntries {                                                                          // :840
+    stat, _ := os.Stat(fullPath)                                                                            // :843
+    ... manager.RestoreFile(chunkDownloader, chunkMaker, file, top, ...)                                    // :887
+}                                                                                                           // :908
+```
+
+`RestoreFile` (`:1155`) is where phase 5 spends its syscalls:
+
+```go
+defer func() { ...; if temporaryPath != fullPath { os.Remove(temporaryPath) } }()                            // :1167
+existingFile, err = os.Open(fullPath)                                                                       // :1192
+if inPlace { ...hash the existing file in place... } else { chunkMaker.AddData(existingFile, chunkFunc) }    // :1239/:1348
+for i := entry.StartChunk; i <= entry.EndChunk; i++ { if _, found := offsetMap[...]; !found { needed = true } } // :1359
+chunkDownloader.Prefetch(entry)                                                                             // :1365
+if inPlace { ...write in place, hashing as it goes, then Truncate(offset)... } else { ...write a temporary file, remove, rename... } // :1367
+```
+
+The two modes are worth separating:
+
+- **in-place** (the only mode the CLI reaches: the call at
+  `duplicacy/duplicacy_main.go:890` passes `true` for `inPlace`, and `:646`
+  forces it when the preference path is not the default): the file is rewritten
+  at its own path, the chunks already at the right offsets are reused, and no
+  temporary file is created.
+- **non-in-place**: the old file is split with the chunk maker so that a chunk
+  found anywhere in it can be reused, a temporary file
+  (`.duplicacy/temporary`) is written, then `os.Remove(fullPath)` (`:1544`) and
+  `os.Rename(temporaryPath, fullPath)` (`:1550`) install it.
+
+The chunk downloads themselves go through `ChunkDownloader`:
+`AddFiles` (`src/duplicacy_chunkdownloader.go:67`) turns the sorted
+`fileEntries` into one task per distinct chunk and rewrites each file's
+`StartChunk`/`EndChunk` to indexes into that task list; `Prefetch` (`:102`)
+submits up to `threads` tasks ahead of the current file; `WaitForChunk` (`:168`)
+blocks until the current chunk arrives and keeps the prefetch window full. The
+tasks are submitted through the operator's `DownloadAsync`
+(`src/duplicacy_chunkoperator.go:184`) and each completes on a worker goroutine;
+`WaitForCompletion` (`:218`) and `GetLastDownloadedChunk` (`:158`) have no caller.
+
+## The temporary-file cleanup probes the filesystem for every file — candidate #1
+
+`RestoreFile` registers an unconditional cleanup (`:1176`):
+
+```go
+defer func() {
+    if existingFile != nil { existingFile.Close() }
+    if newFile != nil { newFile.Close() }
+
+    if temporaryPath != fullPath {
+        os.Remove(temporaryPath)
+    }
+}()
+```
+
+`os.Remove` cannot know whether the path is a file or a directory, so it issues
+`unlink` and, when that fails, `rmdir`. When no temporary file exists — every
+file of an in-place restore, the only mode the CLI reaches — both calls fail with
+`ENOENT`: two syscalls per file, each one a `newfstatat` on the parent directory
+plus the failing call on a network mount.
+
+The non-in-place path is barely better. The temporary file is renamed onto the
+target at `:1550`, so by the time the deferred function runs the temporary path
+no longer exists either, and the cleanup is again two failing calls. It is
+needed only when an error abandons the run between `:1463` (where the temporary
+file is created) and `:1550`.
+
+On the 20,005-file fixture a fresh restore issues 40,010 `unlinkat` calls, all
+`ENOENT`, exactly two per file; the count is the same for a re-restore, for
+`-hash`, and for a restore limited by a pattern. The fix is a boolean set at the
+point the temporary file is created (and cleared after the rename), so the
+cleanup only asks about a file it made.
+
+## The target file's existence is established twice — candidate #2
+
+`Restore` already stats each target before the per-file loop (`:843`) and uses
+the answer to choose between the quick skip, the size-0 skip, and creating the
+parent directory. `RestoreFile` then opens it again (`:1192`) to hash it in place
+or to split it, and on a fresh restore that open is guaranteed to fail:
+
+```
+newfstatat(AT_FDCWD, ".../dir000/file000", 0x..., 0) = -1 ENOENT
+openat(AT_FDCWD, ".../dir000/file000", O_RDONLY|O_CLOEXEC) = -1 ENOENT
+openat(AT_FDCWD, ".../dir000/file000", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0600) = 7
+```
+
+20014 failing `openat` calls for 20005 files, all for a file the caller has
+already been told is absent. The fix is to pass the `stat != nil` result down to
+`RestoreFile` and skip the `Open` when it is false. To stay exact, the flag
+should be derived from `os.IsNotExist`, not from a bare `stat == nil`: an `Open`
+that fails for a reason other than absence must still be reported the way it is
+today (`:1229` logs it), and an absent file must still reach the branch that
+handles it — that branch is what creates the sparse file for a large in-place
+target (`:1196`), so only the probe is dropped.
+
+## The parent directory is re-created for every file — candidate #3
+
+The same `stat != nil` test drives the parent lookup (`:861`):
+
+```go
+} else {
+    parent, _ := SplitDir(fullPath)
+    err = os.MkdirAll(parent, 0744)
+    ...
+}
+```
+
+`os.MkdirAll` stats the directory first and does nothing when it exists, so for
+the 100 files of one directory that phase 3 has already created, 99 of the calls
+are a wasted `newfstatat`. On the 20,005-file fixture the fix removes 19,804
+`newfstatat` calls — one per file after the first in each directory.
+
+Keeping the created set in a map and consulting it before the `MkdirAll` (the
+pattern `SnapshotManager.UploadFile` already uses for the per-id snapshot
+directory, `src/duplicacy_snapshotmanager.go:3121`) removes them. The map is
+bounded by the number of directories, and the first file of each directory still
+creates it.
+
+### Measured
+
+The three candidates were prototyped in sequence (each on top of the previous)
+and measured against HEAD. `/usr/bin/time`, best of four, cache warm:
+
+| Fixture | HEAD | #1 | #1+#2 | #1+#2+#3 |
+| --- | --- | --- | --- | --- |
+| fresh, 20,005 files, ext4, `-threads 1` | 1.53 s | 1.39 s | 1.34 s | 1.30 s |
+| re-restore unchanged, ext4, quick | 0.28 s | — | 0.21 s | — |
+| re-restore unchanged, ext4, `-hash` | 0.89 s | — | 0.75 s | — |
+
+On a virtiofs target, where every syscall pays the mount's path resolution
+whether or not it succeeds, the same fixture measured with a single run per
+build: 163 s at HEAD, 131 s with #1, 119 s with #1+#2, and 108 s with all three.
+
+The syscall counts separate the three cleanly. On the 20,005-file fixture:
+
+| Probe | HEAD | #1+#2 | #1+#2+#3 |
+| --- | --- | --- | --- |
+| `unlinkat` (all `ENOENT`) | 40,010 | 0 | 0 |
+| `openat` | 40,055 (20,014 errors) | 20,051 (9 errors) | 20,050 (9 errors) |
+| `newfstatat` | 60,862 (20,415 errors) | 60,862 (20,415 errors) | 41,058 (20,415 errors) |
+| total | 141,131 | 81,117 | 61,312 |
+
+Each fix is output-identical: the restored tree (`diff -r`) and the log (modulo
+the target path and the total running time) are unchanged for `restore -r 1`,
+`-hash`, `-hash -overwrite`, `-delete`, and a pattern-restricted restore, with
+the same exit codes. The three only remove failed syscalls — no file is opened,
+created, removed or renamed differently — so the only way they can change
+behaviour is by removing a cleanup that a later error path relied on, which is
+why the temporary-file flag and not the deletion itself is what changes.
+
+## The metadata sequences are expanded on a one-thread operator — candidate #4
+
+`Restore` calls `DownloadSnapshotSequences` (`:698`) to expand the three
+sequences, and each goes through `SnapshotManager.DownloadSequence`
+(`src/duplicacy_snapshotmanager.go:345`), which creates the snapshot manager's
+operator with a hard-coded one thread:
+
+```go
+func (manager *SnapshotManager) DownloadSequence(sequence []string) (content []byte) {
+    manager.CreateChunkOperator(false, false, 1, false)   // :346
+    ...
+    manager.chunkOperator.DownloadAsync(chunkHash, i, true, func(chunk *Chunk, chunkIndex int) { ... })
+    waitGroup.Wait()
+}
+```
+
+`DownloadSequence` submits every chunk of the sequence at once and waits, so the
+overlap is real — but only as wide as the operator, which is one. The user's
+`-threads` reaches `ListRemoteFiles` and the file chunks through the other
+operator (`:688`), not the sequences. This is the same shape `check` and `prune`
+have: they create the manager's operator with `-threads` before expanding
+(`check_perf.md`, "The revision loop used to be serial"), and `DownloadSequence`
+then reuses it instead of creating its own. `restore` can do the same by calling
+`manager.SnapshotManager.CreateChunkOperator(false, false, threads, allowFailures)`
+before `:698`. The first argument is named `resurrect` in the manager method but
+becomes the operator's `showStatistics`; it must stay false so that the
+per-chunk `DOWNLOAD_PROGRESS` lines `-stats` prints are not emitted for the
+metadata chunks.
+
+The value is small, because the three sequences are a handful of metadata chunks
+even for a large file list: a 250,000-file repository expands all three in 23
+metadata chunks, and a prototype took the index-only phase on a virtiofs storage
+from 2.16 s to 2.09 s (and showed no clear gain on ext4). It matters when the
+storage is remote and the file list spans many metadata chunks, and it is
+recorded as the smallest of the four.
+
+## The in-place `ftruncate` is a no-op for a file this run created — candidate #5
+
+The in-place branch issues one `ftruncate` per file, after the write loop has
+already left the file the right length (`:1447`):
+
+```go
+// Must truncate the file if the new size is smaller
+if err = existingFile.Truncate(offset); err != nil {
+    LOG_ERROR("DOWNLOAD_TRUNCATE", "Failed to truncate the file at %d: %v", offset, err)
+    return false, nil
+}
+```
+
+It is needed for a target that already existed and is being shrunk, and it is
+needed for the in-place read path, which asks for one byte past `entry.Size` so
+that a grown file is not reported unchanged (`chunkSize = 1` at `:1258`). It is
+not needed for a file this call created, which is every file of a fresh restore:
+the first branch of the in-place block opens the target with
+`os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)`, the write loop
+then writes exactly the bytes the snapshot holds — `Write` and the `io.CopyN` of
+a reused chunk each advance the descriptor by the chunk's slice — so the file is
+already `offset` bytes long and the truncate only asserts the size it has. A
+boolean set where the create happens and consulted at the truncate removes it for
+those files and leaves it in place for the two cases that need it. Verified by
+appending 150 MB of zeroes to a 150 MB target and restoring: 150,000,000 bytes
+with the truncate and 300,000,000 without it. The one byte past the end that the
+read path asks for is only a read, so it does not make the truncate necessary on
+the created path.
+
+Measured on the 20,005-file fixture, `/usr/bin/time`, best of five: ext4 1.13 s
+→ 1.02 s and virtiofs 158 s → 152 s (1.04x), and it takes the `ftruncate` count
+from 20,000 to zero. On this fixture the chunk sizes are the same as the file
+sizes, so the loop and the truncate disagree about nothing; on a tree whose files
+each span several chunks the saving is the same one call per file, which is small
+in the context of the command.
+
+Two related no-ops were looked at and are not worth changing. `existingFile.Seek(0,
+0)` at `:1387` and the per-chunk `Seek(offset, 0)` at `:1412` do issue 20,000 and
+40,000 `lseek` calls on the fixture, but `lseek` only sets a field on the open
+file description rather than making a request to the storage, so removing the
+pair is flat against HEAD on both filesystems (ext4 1.13 s → 1.12 s, virtiofs
+158 s → 158 s) while dropping the single `ftruncate` is the 1.04x above. The
+`Seek(0, 0)` is in any case not removable on its own: the read path has left the
+descriptor one byte past `entry.Size`, so without it the first `Write` would land
+there. Only the seek at `:1412` is redundant — the loop's own `Write` and
+`io.CopyN` each leave the descriptor where the next seek would put it — and the
+pair is recorded here as ruled out rather than as a candidate.
+
+A third, unrelated item in the same area is a latent nil dereference. `downloadFile`
+(`src/duplicacy_snapshotmanager.go:3083`) reads `manager.chunkOperator.rewriteChunks`
+after decrypting a file, but `restore` never calls `CreateChunkOperator` before
+`DownloadSnapshot`, so the field is nil when a *file* decrypt reports a stale hash
+version or a repaired erasure-coding shard — the operator is only created later,
+for the file chunks (`:688`). `list` and `prune` create it first, so the same code
+is guarded there. `Decrypt` only ever set `rewriteNeeded` for such a file under
+`-erasure-coding`, which is why this has not shown up; a `manager.chunkOperator !=
+nil` guard would make it unreachable.
+
+## Candidate fixes
+
+### Smaller items
+
+- **The first-occurrence map is built per restore.** `chunkMap` (`:812`) scans
+  the whole chunk list to find each chunk's first occurrence, which is what lets
+  a small file use the first copy of a chunk it shares with another file. It is a
+  local map over one revision's chunk list and costs no syscalls, so it is not
+  worth changing.
+- **`AddFiles` deduplicates by adjacency.** `AddFiles`
+  (`src/duplicacy_chunkdownloader.go:77`) emits a task only when the chunk index
+  differs from the previous file's last index; the `needed` flag on the previous
+  task is set instead. `fileEntries` is sorted by chunk, so the adjacency test is
+  what makes a chunk shared by consecutive files download once.
+- **`-hash` re-reads every existing file.** `quickMode` is false with `-hash`, so
+  every file is opened and hashed (`:1192`, `:1239`), which is what the flag
+  promises. Candidate #2 removes the *failed* open of a file that does not exist;
+  it does not, and should not, remove the read of one that does.
+- **`ChunkDownloader.WaitForCompletion` and `GetLastDownloadedChunk` are
+  unreachable.** `WaitForCompletion` (`src/duplicacy_chunkdownloader.go:218`) and
+  `GetLastDownloadedChunk` (`:158`) have no caller anywhere in the tree; only the
+  operator's own `WaitForCompletion` is used. Nothing in `restore` refers to
+  them, so they are not a cost, but they are the kind of dead code that misleads
+  a reader looking for where the download tail is awaited.
+- **The local listing walks with one goroutine.** `ListLocalFiles`
+  (`src/duplicacy_snapshot.go:66`) lists directories in a loop. It runs
+  concurrently with the remote listing and the merge, so it is on the critical
+  path only when it is the slowest of the three, which on a local repository it
+  is not.
+- **The two `Seek` calls in the in-place branch are not worth removing.** The one
+  at `:1412` before every chunk is redundant, since the loop's own `Write` and
+  `io.CopyN` leave the descriptor where the next seek would put it, and the one at
+  `:1387` is not removable on its own because the read path ends one byte past
+  `entry.Size`. Together they are 40,000 `lseek` calls on the fixture, but a
+  `lseek` is a local operation, so removing them is flat on both filesystems
+  (ext4 1.13 s → 1.12 s, virtiofs 158 s → 158 s). See candidate #5.
+
+### Deliberately not pursued
+
+- **Parallelising `RestoreFile` itself.** The obvious-looking target is the
+  per-file loop, but the chunk downloads already overlap across files:
+  `Prefetch` (`:1365`) submits the current file's chunks ahead of time and
+  `WaitForChunk` keeps the window full, so on a 40-file, 400 MB repository of
+  10 MB files a fresh restore goes from 1.74 s at one thread to 0.87 s at four.
+  What is serial per file is the local syscalls and the writes,
+  and for a tree of small files those are exactly the candidates above.
+  Overlapping them would mean a worker per file with its own descriptors and its
+  own slice of the shared chunk task list, and the task list's `Reclaim`
+  (`:132`) assumes the files are visited in chunk order.
+- **Reading the file sequence serially.** `ListRemoteFiles`
+  (`src/duplicacy_snapshot.go:107`) fetches the sequence chunks through
+  `operator.Download` (`:119`), which blocks on the calling goroutine, so the
+  sequence is read one chunk at a time even at `-threads 8`. It is the same read
+  candidate #4 addresses for the other two sequences, and it would need the
+  sequence-to-list walk to become a prefetching one rather than a blocking one.
+  On a 250,000-file repository (23 sequence chunks) it was below the noise.
+- **A chunk index.** As in `snapshot_perf.md` (candidate #7), `copy_perf.md` and
+  `prune_perf.md`, this would change the storage format on disk.
+
+## How to confirm on a given setup
+
+- `duplicacy -d restore ...` sets DEBUG logging
+  (`duplicacy/duplicacy_main.go:142-148`); `-v` sets TRACE. `RESTORE_PARAMETERS`
+  prints the effective `in-place`, `quick` and `delete` flags, `RESTORE_INDEXING`
+  "Indexing `<top>`" starts the local listing, and `RESTORE_START` "Restoring
+  `<top>` to revision N" is where phase 5 begins — the gap between the two lines
+  is phases 2-4.
+- Sum the syscalls with the recipe in `docs/README.md`. On a fresh restore of a
+  tree of N files the signature of candidate #1 is `unlinkat` at exactly 2N calls
+  and all failures; candidate #2 shows as `openat` at 2N calls with N failures;
+  candidate #3 shows as `newfstatat` at roughly one per file beyond the first in
+  each directory. A restore of an already-populated tree cuts the `openat` count
+  to the files that are actually opened, which is the difference between the two
+  candidates. Candidate #5 is the `ftruncate` count: one per file on a fresh
+  restore, zero once the create path skips it, and exactly one for a re-restore
+  that shrinks a single file.
+- Time a fresh restore against a re-restore of the same tree: on the 20,005-file
+  fixture a fresh restore is 1.5 s and an unchanged re-restore 0.3 s, and the
+  gap is the file writes and the second `openat` per file.
+- `restore -r 1 -threads 1` against `-threads 8` isolates what is left: the
+  per-file local work does not overlap at all, so the flag moves only the chunk
+  downloads. On the small-file fixture, where there is nothing to download, the
+  two thread counts are within 10% of each other; on the 10 MB-file fixture the
+  flag is worth about 2x.
+- `go test ./src/ -vet=off` is the safety net for any change to this path.
+  `TestBackupManager` (`src/duplicacy_backupmanager_test.go:178`) exercises
+  restores at 1 thread, quick and not, delete, and pattern-restricted, and
+  compares the restored files by hash; `TestPersistRestore` (`:407`) covers the
+  corrupt-chunk paths and the failure modes `allowFailures` controls. `AGENTS.md`
+  records both as failing on an unmodified checkout; on this tree they pass
+  (`go test ./src/ -vet=off -run 'TestBackupManager|TestPersistRestore'`), so if
+  one starts failing after a change, the change is the likely cause.
