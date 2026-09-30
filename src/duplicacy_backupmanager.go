@@ -836,6 +836,11 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 
 	startDownloadingTime := time.Now().Unix()
 
+	// The parent of a file is the same directory for every file under it, so the ones this pass has already created
+	// are remembered and the MkdirAll -- which stats the directory before doing nothing -- is not called again for
+	// them.  The map is bounded by the number of directories in the snapshot.
+	createdParents := make(map[string]bool)
+
 	// Now download files one by one
 	for _, file := range fileEntries {
 
@@ -859,9 +864,13 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 			}
 		} else {
 			parent, _ := SplitDir(fullPath)
-			err = os.MkdirAll(parent, 0744)
-			if err != nil {
-				LOG_ERROR("DOWNLOAD_MKDIR", "Failed to create directory: %v", err)
+			if !createdParents[parent] {
+				err = os.MkdirAll(parent, 0744)
+				if err != nil {
+					LOG_ERROR("DOWNLOAD_MKDIR", "Failed to create directory: %v", err)
+				} else {
+					createdParents[parent] = true
+				}
 			}
 		}
 

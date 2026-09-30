@@ -2,16 +2,16 @@
 
 Investigation into the performance of `duplicacy restore`, in the style of
 `snapshot_perf.md`, `copy_perf.md`, `prune_perf.md`, `check_perf.md` and
-`init_perf.md`. Five defects were found, and the two largest are fixed. The
-deferred cleanup of the temporary file probed the filesystem twice for every file
-even when there was no temporary file; a flag now records whether this call
-created one. The target file's existence was then established twice, once by
+`init_perf.md`. Five defects were found, and the three per-file syscall ones are
+fixed. The deferred cleanup of the temporary file probed the filesystem twice for
+every file even when there was no temporary file; a flag now records whether this
+call created one. The target file's existence was then established twice, once by
 `Restore` before the per-file loop and again by the `Open` in `RestoreFile`; the
-answer is now passed down. Three candidates remain: the parent directory of every
-restored file is re-created although the directory pass has just created it, the
-metadata sequences are expanded on a one-thread operator, and the in-place branch
-issues a `ftruncate` after the write loop has already left the file the right
-length.
+answer is now passed down. And the parent directory of every restored file was
+re-created although the directory pass had just created it; the parents this pass
+makes are now remembered. Two candidates remain: the metadata sequences are
+expanded on a one-thread operator, and the in-place branch issues a `ftruncate`
+after the write loop has already left the file the right length.
 
 ## Summary
 
@@ -35,14 +35,15 @@ either the chunk download itself (which already overlaps across files, see
 "Deliberately not pursued") or the metadata writes (`chmod`, `utimes`,
 `chown`) that a restore is supposed to perform.
 
-Measured on a 20,005-file tree, `/usr/bin/time`, best of several runs,
-the two per-file syscalls that are now fixed take a fresh restore from 1.53 s to
-1.30 s on ext4 and from 163 s to 108 s when the target is on a virtiofs mount, and
-take a re-restore of an unchanged tree from 0.28 s to 0.21 s. Those figures were
-taken with the two applied, before either was committed; measured separately
-afterwards on a second 20,005-file tree, #1 is 1,000 of the failing `unlinkat`
-calls per run and #2 takes `openat` from 40,028 calls with 20,009 failures to
-20,027 with 9, worth 1.12x on ext4 and 1.20x on virtiofs on its own.
+Measured on a 20,005-file tree, `/usr/bin/time`, best of several runs, the three
+per-file syscalls together take a fresh restore from 1.53 s to 1.30 s on ext4 and
+from 163 s to 108 s when the target is on a virtiofs mount, and take a re-restore
+of an unchanged tree from 0.28 s to 0.21 s. Those figures were taken with all
+three applied, before any was committed. Measured separately afterwards against
+the commit before each, the three are worth, in order, `unlinkat` 40,010 → 0;
+`openat` 40,028 calls with 20,009 failures → 20,027 with 9, 1.12x on ext4 and
+1.20x on virtiofs; and `newfstatat` 60,828 → 41,028, 1.09x on ext4 and 1.13x on
+virtiofs.
 
 A second pass over the in-place branch added candidate #5, the `ftruncate` that
 the write loop has already made unnecessary for a file the restore created: 1.13x
@@ -201,9 +202,9 @@ restore, `-stats`, `-threads 4` and `-ignore-owner`, with the same exit codes, a
 the large-file sparse path is unchanged (`-hash -overwrite` over a 150 MB target
 that was appended to and one that was grown still restores the original bytes).
 
-## The parent directory is re-created for every file — candidate #3
+## The parent directory was re-created for every file — candidate #3 — **Implemented**
 
-The same `stat != nil` test drives the parent lookup (`:861`):
+The same `stat != nil` test drives the parent lookup (`:865`):
 
 ```go
 } else {
@@ -213,24 +214,34 @@ The same `stat != nil` test drives the parent lookup (`:861`):
 }
 ```
 
-`os.MkdirAll` stats the directory first and does nothing when it exists, so for
-the 100 files of one directory that phase 3 has already created, 99 of the calls
-are a wasted `newfstatat`. On the 20,005-file fixture the fix removes 19,804
-`newfstatat` calls — one per file after the first in each directory.
+`os.MkdirAll` stats the directory first and does nothing when it exists, so for the
+100 files of one directory that the directory pass has already created, 99 of the
+calls were a wasted `newfstatat`: 19,804 on the 20,005-file fixture, one per file
+after the first in each directory.
 
-Keeping the created set in a map and consulting it before the `MkdirAll` (the
-pattern `SnapshotManager.UploadFile` already uses for the per-id snapshot
-directory, `src/duplicacy_snapshotmanager.go:3121`) removes them. The map is
-bounded by the number of directories, and the first file of each directory still
-creates it.
+`createdParents` (`:842`) now records the parents this pass has created and the
+`MkdirAll` is only called for a parent that is not in it (`:867`), the pattern
+`SnapshotManager.UploadFile` already uses for the per-id snapshot directory
+(`src/duplicacy_snapshotmanager.go:3121`). The map is bounded by the number of
+directories in the snapshot, and the first file of each directory still creates
+it. The entry is only recorded on success, so a failed `MkdirAll` is retried for
+the next file rather than silently skipped.
+
+Measured with `strace -f -c -e trace=newfstatat,mkdirat`, `newfstatat` goes from
+60,828 calls to 41,028 on the 20,005-file fixture, with `mkdirat` unchanged at
+203. On its own that is 1.11 s → 1.02 s on ext4 (1.09x) and 116.3 s → 103.1 s on a
+virtiofs target (1.13x). The restored tree and the log are identical to the
+previous commit for `restore -r 1`, `-hash`, `-hash -overwrite`, `-delete`, a
+pattern-restricted restore, `-stats`, `-threads 4` and `-ignore-owner`, including
+on a tree with nested directories (`a/b/c`), with the same exit codes.
 
 ### Measured
 
 The three candidates were prototyped in sequence (each on top of the previous)
 and measured against HEAD. `/usr/bin/time`, best of four, cache warm. These are
-the prototype figures from before any of the three was committed, and the
-per-candidate figures now in #1's and #2's sections were measured separately
-afterwards:
+the prototype figures from before any of the three was committed; the
+per-candidate figures in each section were measured separately afterwards, one
+commit at a time:
 
 | Fixture | HEAD | #1 | #1+#2 | #1+#2+#3 |
 | --- | --- | --- | --- | --- |
@@ -253,11 +264,11 @@ The syscall counts separate the three cleanly. On the 20,005-file fixture:
 
 Each fix is output-identical: the restored tree (`diff -r`) and the log (modulo
 the target path and the total running time) are unchanged for `restore -r 1`,
-`-hash`, `-hash -overwrite`, `-delete`, and a pattern-restricted restore, with
-the same exit codes. The three only remove failed syscalls — no file is opened,
-created, removed or renamed differently — so the only way they can change
-behaviour is by removing a cleanup that a later error path relied on, which is
-why the temporary-file flag and not the deletion itself is what changes.
+`-hash`, `-hash -overwrite`, `-delete`, and a pattern-restricted restore, with the
+same exit codes. The three only remove syscalls that failed or that established
+something already known — no file is opened, created, removed or renamed
+differently — and the one cleanup they touch, the temporary-file removal, is
+still reached for every file the non-in-place path creates one for.
 
 ## The metadata sequences are expanded on a one-thread operator — candidate #4
 
@@ -398,7 +409,8 @@ nil` guard would make it unreachable.
   `WaitForChunk` keeps the window full, so on a 40-file, 400 MB repository of
   10 MB files a fresh restore goes from 1.74 s at one thread to 0.87 s at four.
   What is serial per file is the local syscalls and the writes,
-  and for a tree of small files those are exactly the candidates above.
+  and for a tree of small files those are exactly the syscalls the three fixes
+  above removed.
   Overlapping them would mean a worker per file with its own descriptors and its
   own slice of the shared chunk task list, and the task list's `Reclaim`
   (`:132`) assumes the files are visited in chunk order.
@@ -423,10 +435,10 @@ nil` guard would make it unreachable.
 - Sum the syscalls with the recipe in `docs/README.md`. On a fresh restore of a
   tree of N files, candidate #1's signature was `unlinkat` at exactly 2N calls and
   all failures and is now none; candidate #2 showed as `openat` at 2N calls with N
-  failures and now shows as N+1 calls with a handful; candidate #3 shows as
-  `newfstatat` at roughly one per file beyond the first in each directory. A
-  restore of an already-populated tree cuts the `openat` count to the files that
-  are actually opened. Candidate #5 is the `ftruncate` count: one per file on a
+  failures and now shows as N+1 calls with a handful; candidate #3 showed as
+  `newfstatat` at roughly one per file beyond the first in each directory and is
+  now about one per directory. A restore of an already-populated tree cuts the
+  `openat` count to the files that are actually opened. Candidate #5 is the `ftruncate` count: one per file on a
   fresh restore, zero once the create path skips it, and exactly one for a
   re-restore that shrinks a single file.
 - Time a fresh restore against a re-restore of the same tree: on the 20,005-file
