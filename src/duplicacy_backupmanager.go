@@ -695,6 +695,11 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 	} ()
 
 	remoteSnapshot := manager.SnapshotManager.DownloadSnapshot(manager.snapshotID, revision)
+	// The sequences are expanded through the snapshot manager's own operator, which is created here with the user's
+	// -threads so that their metadata chunks are fetched concurrently; check and prune create it the same way.  The
+	// file chunks below use the operator created above, which already has that count.
+	manager.SnapshotManager.CreateChunkOperator(false, false, threads, allowFailures)
+	defer manager.SnapshotManager.stopChunkOperator()
 	manager.SnapshotManager.DownloadSnapshotSequences(remoteSnapshot)
 	go func() {
 		// List remote files

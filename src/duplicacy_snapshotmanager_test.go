@@ -2261,3 +2261,55 @@ func TestPruneGhostSnapshots(t *testing.T) {
 	checkTestSnapshots(snapshotManager, 3, 0)
 	snapshotManager.CheckSnapshots("vm1@host1", []int{2, 3, 4}, "", false, false, false, false, false, false, false, 1, false)
 }
+
+// The chunks of a sequence are submitted all at once, so the thread count of the snapshot manager's operator -- and
+// not DownloadSequence itself -- is what decides whether they overlap.  That is the property a command relies on when
+// it creates the operator with the user's -threads before expanding, as check and prune do and restore now does too:
+// the same sequence is fetched strictly serially through a one-thread operator and by several workers at once through
+// an eight-thread one.
+func TestDownloadSequencesOverlapUnderThreads(t *testing.T) {
+
+	setTestingT(t)
+
+	defer recovering(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+	counting := &instrumentedStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
+	counting.downloadDelay = time.Millisecond
+	snapshotManager.storage = counting
+
+	// Ten chunks, each downloaded exactly once by the expansion that follows.
+	var sequence []string
+	for i := 0; i < 10; i++ {
+		piece := bytes.Repeat([]byte{byte('a' + i)}, 100)
+		sequence = append(sequence, uploadTestChunk(snapshotManager, piece))
+	}
+
+	stopOperator := func() {
+		snapshotManager.chunkOperator.Stop()
+		snapshotManager.chunkOperator = nil
+	}
+
+	// One thread: the downloads cannot overlap, so the peak is one.
+	snapshotManager.CreateChunkOperator(false, false, 1, false)
+	counting.resetDownloadStats()
+	snapshotManager.DownloadSequence(sequence)
+	if peak := counting.peakConcurrentDownloads(); peak != 1 {
+		t.Errorf("Expected a single concurrent download at one thread, saw %d", peak)
+	}
+	stopOperator()
+
+	// Eight threads: with the same sequence the downloads must overlap.
+	snapshotManager.CreateChunkOperator(false, false, 8, false)
+	counting.resetDownloadStats()
+	content := snapshotManager.DownloadSequence(sequence)
+	if peak := counting.peakConcurrentDownloads(); peak < 2 {
+		t.Errorf("Expected the sequence downloads to overlap at eight threads, saw a peak of %d", peak)
+	}
+	if len(content) != 1000 {
+		t.Errorf("The sequence decoded to %d bytes instead of 1000", len(content))
+	}
+	stopOperator()
+}

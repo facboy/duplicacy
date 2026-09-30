@@ -2,16 +2,15 @@
 
 Investigation into the performance of `duplicacy restore`, in the style of
 `snapshot_perf.md`, `copy_perf.md`, `prune_perf.md`, `check_perf.md` and
-`init_perf.md`. Five defects were found, and the three per-file syscall ones are
-fixed. The deferred cleanup of the temporary file probed the filesystem twice for
-every file even when there was no temporary file; a flag now records whether this
-call created one. The target file's existence was then established twice, once by
-`Restore` before the per-file loop and again by the `Open` in `RestoreFile`; the
-answer is now passed down. And the parent directory of every restored file was
-re-created although the directory pass had just created it; the parents this pass
-makes are now remembered. Two candidates remain: the metadata sequences are
-expanded on a one-thread operator, and the in-place branch issues a `ftruncate`
-after the write loop has already left the file the right length.
+`init_perf.md`. Five defects were found, and four are fixed. The three per-file
+syscall ones come first: the deferred cleanup of the temporary file probed the
+filesystem twice for every file even when there was no temporary file; the target
+file's existence was established twice, once by `Restore` before the per-file loop
+and again by the `Open` in `RestoreFile`; and the parent directory of every
+restored file was re-created although the directory pass had just created it. The
+fourth is the metadata sequences being expanded on a one-thread operator, so that
+`-threads` did nothing for them. The fifth, the in-place `ftruncate` that the write
+loop has already made unnecessary, is the only candidate left.
 
 ## Summary
 
@@ -34,6 +33,10 @@ those syscalls are avoidable and are the findings below; the rest of phase 5 is
 either the chunk download itself (which already overlaps across files, see
 "Deliberately not pursued") or the metadata writes (`chmod`, `utimes`,
 `chown`) that a restore is supposed to perform.
+
+Candidate #4 is much smaller and is fixed on the same grounds rather than for its
+timing: `-threads` reaches the file chunks but did nothing for the metadata
+sequences, and it now does.
 
 Measured on a 20,005-file tree, `/usr/bin/time`, best of several runs, the three
 per-file syscalls together take a fresh restore from 1.53 s to 1.30 s on ext4 and
@@ -270,10 +273,10 @@ something already known — no file is opened, created, removed or renamed
 differently — and the one cleanup they touch, the temporary-file removal, is
 still reached for every file the non-in-place path creates one for.
 
-## The metadata sequences are expanded on a one-thread operator — candidate #4
+## The metadata sequences were expanded on a one-thread operator — candidate #4 — **Implemented**
 
-`Restore` calls `DownloadSnapshotSequences` (`:698`) to expand the three
-sequences, and each goes through `SnapshotManager.DownloadSequence`
+`Restore` calls `DownloadSnapshotSequences` to expand the sequences, and each goes
+through `SnapshotManager.DownloadSequence`
 (`src/duplicacy_snapshotmanager.go:345`), which creates the snapshot manager's
 operator with a hard-coded one thread:
 
@@ -287,24 +290,33 @@ func (manager *SnapshotManager) DownloadSequence(sequence []string) (content []b
 ```
 
 `DownloadSequence` submits every chunk of the sequence at once and waits, so the
-overlap is real — but only as wide as the operator, which is one. The user's
-`-threads` reaches `ListRemoteFiles` and the file chunks through the other
-operator (`:688`), not the sequences. This is the same shape `check` and `prune`
-have: they create the manager's operator with `-threads` before expanding
-(`check_perf.md`, "The revision loop used to be serial"), and `DownloadSequence`
-then reuses it instead of creating its own. `restore` can do the same by calling
-`manager.SnapshotManager.CreateChunkOperator(false, false, threads, allowFailures)`
-before `:698`. The first argument is named `resurrect` in the manager method but
-becomes the operator's `showStatistics`; it must stay false so that the
-per-chunk `DOWNLOAD_PROGRESS` lines `-stats` prints are not emitted for the
-metadata chunks.
+chunks do overlap — but only as wide as the operator, which was one. The user's
+`-threads` reached `ListRemoteFiles` and the file chunks through the other operator
+(`:688`), not the sequences. This is the same shape `check` and `prune` have: they
+create the manager's operator with `-threads` before expanding (`check_perf.md`,
+"The revision loop used to be serial"), and `DownloadSequence` then reuses it
+instead of creating its own.
 
-The value is small, because the three sequences are a handful of metadata chunks
-even for a large file list: a 250,000-file repository expands all three in 23
-metadata chunks, and a prototype took the index-only phase on a virtiofs storage
-from 2.16 s to 2.09 s (and showed no clear gain on ext4). It matters when the
-storage is remote and the file list spans many metadata chunks, and it is
-recorded as the smallest of the four.
+`Restore` now does the same (`:701`), with a deferred `stopChunkOperator` so that
+the operator is shut down when the restore returns. The first argument is named
+`resurrect` in the manager method but becomes the operator's `showStatistics`; it
+stays false so that the per-chunk `DOWNLOAD_PROGRESS` lines `-stats` prints are
+not emitted for the metadata chunks.
+
+The value is small, and the prototype that first measured it is still the right
+picture: the sequences are a handful of metadata chunks even for a large file
+list, a 250,000-file repository expanding all three in 23, and the index-only
+phase on a virtiofs storage went from 2.16 s to 2.09 s with no clear gain on ext4.
+Two things confirm the mechanism rather than the timing. `-stats` output is
+unchanged, which is the `resurrect` argument staying false. And
+`TestDownloadSequencesOverlapUnderThreads`
+(`src/duplicacy_snapshotmanager_test.go`) shows what the operator's thread count
+decides: the same ten-chunk sequence is fetched strictly serially through a
+one-thread operator and by several workers at once through an eight-thread one.
+An end-to-end assertion that `restore` passed the user's `-threads` is not
+practical, because the chunk sequence of any fixture small enough to build in a
+test is a single chunk, so there is nothing to overlap; the flag is checked by
+reading the log of a real restore instead.
 
 ## The in-place `ftruncate` is a no-op for a file this run created — candidate #5
 
@@ -438,9 +450,12 @@ nil` guard would make it unreachable.
   failures and now shows as N+1 calls with a handful; candidate #3 showed as
   `newfstatat` at roughly one per file beyond the first in each directory and is
   now about one per directory. A restore of an already-populated tree cuts the
-  `openat` count to the files that are actually opened. Candidate #5 is the `ftruncate` count: one per file on a
-  fresh restore, zero once the create path skips it, and exactly one for a
-  re-restore that shrinks a single file.
+  `openat` count to the files that are actually opened. Candidate #5 is the
+  `ftruncate` count: one per file on a fresh restore, zero once the create path
+  skips it, and exactly one for a re-restore that shrinks a single file.
+  Candidate #4 has no syscall signature: the operator's thread count decides
+  whether the metadata downloads overlap, so compare `restore -r 1 -threads 1`
+  with `-threads 8` on a storage where they are round trips.
 - Time a fresh restore against a re-restore of the same tree: on the 20,005-file
   fixture a fresh restore is 1.5 s and an unchanged re-restore 0.3 s, and the
   gap is the file writes and the `openat` per file that the fresh restore no
