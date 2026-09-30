@@ -2,15 +2,16 @@
 
 Investigation into the performance of `duplicacy restore`, in the style of
 `snapshot_perf.md`, `copy_perf.md`, `prune_perf.md`, `check_perf.md` and
-`init_perf.md`. Five defects were found. The first of them, the deferred cleanup
-of the temporary file probing the filesystem twice for every file even when there
-is no temporary file, is fixed: a flag records whether this call created the
-temporary file, so the cleanup only asks about one it made. The remaining four are
-candidates: the existence of the target file is established twice, the parent
-directory of every restored file is re-created although the directory pass has
-just created it, the metadata sequences are expanded on a one-thread operator, and
-the in-place branch issues a `ftruncate` after the write loop has already left the
-file the right length.
+`init_perf.md`. Five defects were found, and the two largest are fixed. The
+deferred cleanup of the temporary file probed the filesystem twice for every file
+even when there was no temporary file; a flag now records whether this call
+created one. The target file's existence was then established twice, once by
+`Restore` before the per-file loop and again by the `Open` in `RestoreFile`; the
+answer is now passed down. Three candidates remain: the parent directory of every
+restored file is re-created although the directory pass has just created it, the
+metadata sequences are expanded on a one-thread operator, and the in-place branch
+issues a `ftruncate` after the write loop has already left the file the right
+length.
 
 ## Summary
 
@@ -34,12 +35,14 @@ either the chunk download itself (which already overlaps across files, see
 "Deliberately not pursued") or the metadata writes (`chmod`, `utimes`,
 `chown`) that a restore is supposed to perform.
 
-Measured on a 20,005-file, 179 MB tree, `/usr/bin/time`, best of several runs,
-the three per-file syscalls together take a fresh restore from 1.53 s to 1.30 s on
-ext4 and from 163 s to 108 s when the target is on a virtiofs mount, and take a
-re-restore of an unchanged tree from 0.28 s to 0.21 s. Those figures were taken
-with all three applied; #1 alone is one of the two failing `unlinkat` calls per
-file, and the syscall counts that separate the three are in its section.
+Measured on a 20,005-file tree, `/usr/bin/time`, best of several runs,
+the two per-file syscalls that are now fixed take a fresh restore from 1.53 s to
+1.30 s on ext4 and from 163 s to 108 s when the target is on a virtiofs mount, and
+take a re-restore of an unchanged tree from 0.28 s to 0.21 s. Those figures were
+taken with the two applied, before either was committed; measured separately
+afterwards on a second 20,005-file tree, #1 is 1,000 of the failing `unlinkat`
+calls per run and #2 takes `openat` from 40,028 calls with 20,009 failures to
+20,027 with 9, worth 1.12x on ext4 and 1.20x on virtiofs on its own.
 
 A second pass over the in-place branch added candidate #5, the `ftruncate` that
 the write loop has already made unnecessary for a file the restore created: 1.13x
@@ -158,12 +161,12 @@ stopping a non-in-place restore with a missing chunk and checking that
 `.duplicacy/temporary` is gone. `TestBackupManager` and `TestPersistRestore`
 already restore both in place and not.
 
-## The target file's existence is established twice — candidate #2
+## The target file's existence was established twice — candidate #2 — **Implemented**
 
-`Restore` already stats each target before the per-file loop (`:843`) and uses
-the answer to choose between the quick skip, the size-0 skip, and creating the
-parent directory. `RestoreFile` then opens it again (`:1192`) to hash it in place
-or to split it, and on a fresh restore that open is guaranteed to fail:
+`Restore` already stats each target before the per-file loop (`:843`) and uses the
+answer to choose between the quick skip, the size-0 skip, and creating the parent
+directory. `RestoreFile` then opened it again to hash it in place or to split it,
+and on a fresh restore that open was guaranteed to fail:
 
 ```
 newfstatat(AT_FDCWD, ".../dir000/file000", 0x..., 0) = -1 ENOENT
@@ -171,14 +174,32 @@ openat(AT_FDCWD, ".../dir000/file000", O_RDONLY|O_CLOEXEC) = -1 ENOENT
 openat(AT_FDCWD, ".../dir000/file000", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0600) = 7
 ```
 
-20014 failing `openat` calls for 20005 files, all for a file the caller has
-already been told is absent. The fix is to pass the `stat != nil` result down to
-`RestoreFile` and skip the `Open` when it is false. To stay exact, the flag
-should be derived from `os.IsNotExist`, not from a bare `stat == nil`: an `Open`
-that fails for a reason other than absence must still be reported the way it is
-today (`:1229` logs it), and an absent file must still reach the branch that
-handles it — that branch is what creates the sparse file for a large in-place
-target (`:1196`), so only the probe is dropped.
+20014 failing `openat` calls for 20005 files, all for a file the caller had
+already been told is absent.
+
+`Restore` now keeps the error from its `os.Stat` (`:843`) and passes
+`os.IsNotExist(statErr)` to `RestoreFile` as `knownAbsent`, which guards the
+`Open` (`:1198`). The flag is derived from `os.IsNotExist`, not from a bare
+`stat == nil`, for the reason the probe was worth keeping: an `Open` that fails
+for a reason other than absence must still be reported the way it was, and an
+absent file must still reach the branch that handles it, because that branch is
+what creates the sparse file for a large in-place target (`:1205`). Only the
+probe is dropped, so the `DOWNLOAD_OPEN` line for a file that exists but cannot
+be read is unchanged — verified by restoring over a `chmod 000` target, which
+still logs exactly one `Can't open the existing file: ... permission denied` and
+exits with the same code as before.
+
+Measured with `strace -f -c -e trace=openat,newfstatat`, on the 20,005-file tree
+`openat` goes from 40,028 calls with 20,009 failures to 20,027 with 9, while
+`newfstatat` stays at 60,828 with 20,409 failures; on a 500-file tree it is 1,028
+and 509 down to 528 and 9. On its own that is 1.26 s → 1.13 s on ext4 (1.12x) and
+138.6 s → 115.8 s on a virtiofs target (1.20x) — a third of the first three
+candidates' combined virtiofs win, from removing one round trip per file. The
+restored tree, the file metadata and the log are identical to the previous commit
+for `restore -r 1`, `-hash`, `-hash -overwrite`, `-delete`, a pattern-restricted
+restore, `-stats`, `-threads 4` and `-ignore-owner`, with the same exit codes, and
+the large-file sparse path is unchanged (`-hash -overwrite` over a 150 MB target
+that was appended to and one that was grown still restores the original bytes).
 
 ## The parent directory is re-created for every file — candidate #3
 
@@ -207,8 +228,9 @@ creates it.
 
 The three candidates were prototyped in sequence (each on top of the previous)
 and measured against HEAD. `/usr/bin/time`, best of four, cache warm. These are
-the prototype figures for all three together; #1 has since been implemented on
-its own, so the #1 column is no longer a pending change:
+the prototype figures from before any of the three was committed, and the
+per-candidate figures now in #1's and #2's sections were measured separately
+afterwards:
 
 | Fixture | HEAD | #1 | #1+#2 | #1+#2+#3 |
 | --- | --- | --- | --- | --- |
@@ -399,17 +421,18 @@ nil` guard would make it unreachable.
   `<top>` to revision N" is where phase 5 begins — the gap between the two lines
   is phases 2-4.
 - Sum the syscalls with the recipe in `docs/README.md`. On a fresh restore of a
-  tree of N files the signature of candidate #1 is `unlinkat` at exactly 2N calls
-  and all failures; candidate #2 shows as `openat` at 2N calls with N failures;
-  candidate #3 shows as `newfstatat` at roughly one per file beyond the first in
-  each directory. A restore of an already-populated tree cuts the `openat` count
-  to the files that are actually opened, which is the difference between the two
-  candidates. Candidate #5 is the `ftruncate` count: one per file on a fresh
-  restore, zero once the create path skips it, and exactly one for a re-restore
-  that shrinks a single file.
+  tree of N files, candidate #1's signature was `unlinkat` at exactly 2N calls and
+  all failures and is now none; candidate #2 showed as `openat` at 2N calls with N
+  failures and now shows as N+1 calls with a handful; candidate #3 shows as
+  `newfstatat` at roughly one per file beyond the first in each directory. A
+  restore of an already-populated tree cuts the `openat` count to the files that
+  are actually opened. Candidate #5 is the `ftruncate` count: one per file on a
+  fresh restore, zero once the create path skips it, and exactly one for a
+  re-restore that shrinks a single file.
 - Time a fresh restore against a re-restore of the same tree: on the 20,005-file
   fixture a fresh restore is 1.5 s and an unchanged re-restore 0.3 s, and the
-  gap is the file writes and the second `openat` per file.
+  gap is the file writes and the `openat` per file that the fresh restore no
+  longer takes.
 - `restore -r 1 -threads 1` against `-threads 8` isolates what is left: the
   per-file local work does not overlap at all, so the flag moves only the chunk
   downloads. On the small-file fixture, where there is nothing to download, the

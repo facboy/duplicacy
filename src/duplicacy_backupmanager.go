@@ -840,7 +840,7 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 	for _, file := range fileEntries {
 
 		fullPath := joinPath(top, file.Path)
-		stat, _ := os.Stat(fullPath)
+		stat, statErr := os.Stat(fullPath)
 		if stat != nil {
 			if quickMode {
 				if file.IsSameAsFileInfo(stat) {
@@ -885,7 +885,7 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 		}
 
 		downloaded, err := manager.RestoreFile(chunkDownloader, chunkMaker, file, top, inPlace, overwrite, showStatistics,
-			totalFileSize, downloadedFileSize, startDownloadingTime, allowFailures)
+			totalFileSize, downloadedFileSize, startDownloadingTime, allowFailures, os.IsNotExist(statErr))
 		if err != nil {
 			// RestoreFile returned an error; if allowFailures is false RestoerFile would error out and not return so here
 			// we just need to show a warning
@@ -1153,7 +1153,7 @@ func (manager *BackupManager) UploadSnapshot(chunkOperator *ChunkOperator, top s
 //         false, nil:   Skipped file; 
 //         false, error: Failure to restore file (only if allowFailures == true)
 func (manager *BackupManager) RestoreFile(chunkDownloader *ChunkDownloader, chunkMaker *ChunkMaker, entry *Entry, top string, inPlace bool, overwrite bool,
-	showStatistics bool, totalFileSize int64, downloadedFileSize int64, startTime int64, allowFailures bool) (bool, error) {
+	showStatistics bool, totalFileSize int64, downloadedFileSize int64, startTime int64, allowFailures bool, knownAbsent bool) (bool, error) {
 
 	LOG_TRACE("DOWNLOAD_START", "Downloading %s", entry.Path)
 
@@ -1193,44 +1193,48 @@ func (manager *BackupManager) RestoreFile(chunkDownloader *ChunkDownloader, chun
 	// If the file is newly created (needed by sparse file optimization)
 	isNewFile := false
 
-	existingFile, err = os.Open(fullPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// macOS has no sparse file support
-			if inPlace && entry.Size > 100*1024*1024 && runtime.GOOS != "darwin" {
-				// Create an empty sparse file
-				existingFile, err = os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-				if err != nil {
-					LOG_ERROR("DOWNLOAD_CREATE", "Failed to create the file %s for in-place writing: %v", fullPath, err)
-					return false, nil
-				}
+	// 'knownAbsent' says the caller's stat has already established that the file is not there, so the probe below is
+	// skipped; the absent-file branch is otherwise unchanged, and a large enough target still gets its sparse file.
+	if !knownAbsent {
+		existingFile, err = os.Open(fullPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// macOS has no sparse file support
+				if inPlace && entry.Size > 100*1024*1024 && runtime.GOOS != "darwin" {
+					// Create an empty sparse file
+					existingFile, err = os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+					if err != nil {
+						LOG_ERROR("DOWNLOAD_CREATE", "Failed to create the file %s for in-place writing: %v", fullPath, err)
+						return false, nil
+					}
 
-				n := int64(1)
-				// There is a go bug on Windows (https://github.com/golang/go/issues/21681) that causes Seek to fail
-				// if the lower 32 bit of the offset argument is 0xffffffff.  Therefore we need to avoid that value by increasing n.
-				if uint32(entry.Size) == 0 && (entry.Size>>32) > 0 {
-					n = int64(2)
+					n := int64(1)
+					// There is a go bug on Windows (https://github.com/golang/go/issues/21681) that causes Seek to fail
+					// if the low 32 bits of the offset are 0xffffffff; increase n to avoid it.
+					if uint32(entry.Size) == 0 && (entry.Size>>32) > 0 {
+						n = int64(2)
+					}
+					_, err = existingFile.Seek(entry.Size-n, 0)
+					if err != nil {
+						LOG_ERROR("DOWNLOAD_CREATE", "Failed to resize the initial file %s for in-place writing: %v", fullPath, err)
+						return false, nil
+					}
+					_, err = existingFile.Write([]byte("\x00\x00")[:n])
+					if err != nil {
+						LOG_ERROR("DOWNLOAD_CREATE", "Failed to initialize the sparse file %s for in-place writing: %v", fullPath, err)
+						return false, nil
+					}
+					existingFile.Close()
+					existingFile, err = os.Open(fullPath)
+					if err != nil {
+						LOG_ERROR("DOWNLOAD_OPEN", "Can't reopen the initial file just created: %v", err)
+						return false, nil
+					}
+					isNewFile = true
 				}
-				_, err = existingFile.Seek(entry.Size-n, 0)
-				if err != nil {
-					LOG_ERROR("DOWNLOAD_CREATE", "Failed to resize the initial file %s for in-place writing: %v", fullPath, err)
-					return false, nil
-				}
-				_, err = existingFile.Write([]byte("\x00\x00")[:n])
-				if err != nil {
-					LOG_ERROR("DOWNLOAD_CREATE", "Failed to initialize the sparse file %s for in-place writing: %v", fullPath, err)
-					return false, nil
-				}
-				existingFile.Close()
-				existingFile, err = os.Open(fullPath)
-				if err != nil {
-					LOG_ERROR("DOWNLOAD_OPEN", "Can't reopen the initial file just created: %v", err)
-					return false, nil
-				}
-				isNewFile = true
+			} else {
+				LOG_TRACE("DOWNLOAD_OPEN", "Can't open the existing file: %v", err)
 			}
-		} else {
-			LOG_TRACE("DOWNLOAD_OPEN", "Can't open the existing file: %v", err)
 		}
 	}
 
