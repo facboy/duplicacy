@@ -948,3 +948,76 @@ func TestRestoreCleansUpAfterAFailure(t *testing.T) {
 		t.Errorf("The temporary file was left behind after a failed non-in-place restore: %v", err)
 	}
 }
+
+// The in-place restore skips the final truncate for a file this call created, since the write loop has already left it
+// the right length.  What must not change is the case the truncate is for: a target that was already there and is
+// longer than the snapshot's copy, which only the truncate shortens.  The file is grown past the snapshot's size and
+// restored in place over it, so a guard that skipped the truncate would leave the extra bytes behind.
+func TestInPlaceRestoreStillTruncatesALongerTarget(t *testing.T) {
+
+	setTestingT(t)
+	SetLoggingLevel(INFO)
+
+	defer recoveringWithStack(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "inplace_truncate_test")
+	os.RemoveAll(testDir)
+	os.MkdirAll(testDir, 0700)
+	defer os.RemoveAll(testDir)
+
+	os.Mkdir(testDir+"/repository1", 0700)
+	os.Mkdir(testDir+"/repository1/.duplicacy", 0700)
+	os.Mkdir(testDir+"/repository2", 0700)
+	os.Mkdir(testDir+"/repository2/.duplicacy", 0700)
+
+	threads := 1
+	fileSize := 500000
+	createRandomFileSeeded(testDir+"/repository1/file1", fileSize, 1)
+
+	storage, err := loadStorage(testDir+"/storage", threads)
+	if err != nil {
+		t.Errorf("Failed to create storage: %v", err)
+		return
+	}
+	cleanStorage(storage)
+	if !ConfigStorage(storage, 16384, 100, 64*1024, 64*1024, 64*1024, "", nil, false, "", 0, 0) {
+		t.Errorf("Failed to initialize the storage")
+		return
+	}
+
+	SetDuplicacyPreferencePath(testDir + "/repository1/.duplicacy")
+	backupManager := CreateBackupManager("host1", storage, testDir, "", "", "", false)
+	backupManager.SetupSnapshotCache("default")
+	backupManager.Backup(testDir+"/repository1", true, threads, "first", false, false, 0, false, 1024, 1024)
+
+	snapshotSize := fileSize / 2
+	original, err := os.ReadFile(testDir + "/repository1/file1")
+	if err != nil {
+		t.Errorf("Failed to read the backed-up file: %v", err)
+		return
+	}
+	// The target is longer than the copy the snapshot holds, which is the only shape that needs the truncate.  A
+	// smaller target would be grown by the write loop and would leave the truncate untested either way.
+	createRandomFileSeeded(testDir+"/repository2/file1", snapshotSize*3, 2)
+	if info, err := os.Stat(testDir + "/repository2/file1"); err != nil || info.Size() <= int64(len(original)) {
+		t.Errorf("The target was not made longer than the snapshot's copy (%v)", err)
+		return
+	}
+
+	SetDuplicacyPreferencePath(testDir + "/repository2/.duplicacy")
+	// The preference path is under the repository, so the forced in-place mode the CLI uses is what this passes
+	// explicitly; a non-in-place restore renames a temporary file over the target and never truncates.
+	failedFiles := backupManager.Restore(testDir+"/repository2", 1 /*inPlace=*/, true /*quickMode=*/, false, threads /*overwrite=*/, true,
+		/*deleteMode=*/ false /*setowner=*/, false /*showStatistics=*/, false /*patterns=*/, nil /*allowFailures=*/, false)
+	assertRestoreFailures(t, failedFiles, 0)
+
+	restored, err := os.ReadFile(testDir + "/repository2/file1")
+	if err != nil {
+		t.Errorf("Failed to read the restored file: %v", err)
+		return
+	}
+	if !bytes.Equal(restored, original) {
+		t.Errorf("The restored file is %d bytes and does not match the %d bytes of the snapshot's copy",
+			len(restored), len(original))
+	}
+}

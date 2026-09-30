@@ -1178,6 +1178,11 @@ func (manager *BackupManager) RestoreFile(chunkDownloader *ChunkDownloader, chun
 	// deferred cleanup only asks about a file this call made
 	temporaryFileCreated := false
 
+	// Set when the in-place branch creates the target, so that the truncate at the end of the write loop can be
+	// skipped for it: the loop writes exactly the bytes the snapshot holds, so the file is already the right length.
+	// A target that was already there may be longer, which is the case the truncate is for.
+	fileCreated := false
+
 	preferencePath := GetDuplicacyPreferencePath()
 	temporaryPath := path.Join(preferencePath, "temporary")
 	fullPath := joinPath(top, entry.Path)
@@ -1221,6 +1226,7 @@ func (manager *BackupManager) RestoreFile(chunkDownloader *ChunkDownloader, chun
 						LOG_ERROR("DOWNLOAD_CREATE", "Failed to create the file %s for in-place writing: %v", fullPath, err)
 						return false, nil
 					}
+					fileCreated = true
 
 					n := int64(1)
 					// There is a go bug on Windows (https://github.com/golang/go/issues/21681) that causes Seek to fail
@@ -1396,6 +1402,7 @@ func (manager *BackupManager) RestoreFile(chunkDownloader *ChunkDownloader, chun
 			if err != nil {
 				LOG_ERROR("DOWNLOAD_CREATE", "Failed to create the file %s for in-place writing", fullPath)
 			}
+			fileCreated = true
 		} else {
 			// Close and reopen in a different mode
 			existingFile.Close()
@@ -1465,10 +1472,14 @@ func (manager *BackupManager) RestoreFile(chunkDownloader *ChunkDownloader, chun
 			offset += int64(end - start)
 		}
 
-		// Must truncate the file if the new size is smaller
-		if err = existingFile.Truncate(offset); err != nil {
-			LOG_ERROR("DOWNLOAD_TRUNCATE", "Failed to truncate the file at %d: %v", offset, err)
-			return false, nil
+		// Must truncate the file if the new size is smaller.  A file this call created is already exactly the size
+		// the write loop produced, so the truncate only asserts it; it is the pre-existing target, which may be
+		// longer than the snapshot's copy, that needs it.
+		if !fileCreated {
+			if err = existingFile.Truncate(offset); err != nil {
+				LOG_ERROR("DOWNLOAD_TRUNCATE", "Failed to truncate the file at %d: %v", offset, err)
+				return false, nil
+			}
 		}
 
 		// Verify the download by hash

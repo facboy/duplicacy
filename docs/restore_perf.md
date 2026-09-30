@@ -2,15 +2,15 @@
 
 Investigation into the performance of `duplicacy restore`, in the style of
 `snapshot_perf.md`, `copy_perf.md`, `prune_perf.md`, `check_perf.md` and
-`init_perf.md`. Five defects were found, and four are fixed. The three per-file
+`init_perf.md`. Five defects were found, and all five are fixed. The three per-file
 syscall ones come first: the deferred cleanup of the temporary file probed the
 filesystem twice for every file even when there was no temporary file; the target
 file's existence was established twice, once by `Restore` before the per-file loop
 and again by the `Open` in `RestoreFile`; and the parent directory of every
 restored file was re-created although the directory pass had just created it. The
 fourth is the metadata sequences being expanded on a one-thread operator, so that
-`-threads` did nothing for them. The fifth, the in-place `ftruncate` that the write
-loop has already made unnecessary, is the only candidate left.
+`-threads` did nothing for them. The fifth is the in-place `ftruncate`, which the
+write loop has already made unnecessary for a file this run created.
 
 ## Summary
 
@@ -29,9 +29,10 @@ loop has already made unnecessary, is the only candidate left.
 
 Phases 1 and 2 already overlap with each other and with phase 3. Phase 5 is
 serial per file, and each file costs it a fixed handful of syscalls. Three of
-those syscalls are avoidable and are the findings below; the rest of phase 5 is
-either the chunk download itself (which already overlaps across files, see
-"Deliberately not pursued") or the metadata writes (`chmod`, `utimes`,
+those are avoidable and are the per-file findings below, and a fourth — the
+in-place `ftruncate` — is avoidable for every file a fresh restore creates. The
+rest of phase 5 is either the chunk download itself (which already overlaps across
+files, see "Deliberately not pursued") or the metadata writes (`chmod`, `utimes`,
 `chown`) that a restore is supposed to perform.
 
 Candidate #4 is much smaller and is fixed on the same grounds rather than for its
@@ -53,6 +54,10 @@ the write loop has already made unnecessary for a file the restore created: 1.13
 on ext4 and 1.04x on the virtiofs target, far less than the three syscalls of the
 first pass. The pair of `Seek` calls in the same block turned out not to be worth
 changing at all, and is recorded as ruled out.
+
+That completes the five: the three per-file syscalls, the metadata sequences and
+the in-place truncate are all implemented. What is left below is recorded as
+looked at and not worth changing rather than as an open candidate.
 
 ## The call path
 
@@ -318,9 +323,9 @@ practical, because the chunk sequence of any fixture small enough to build in a
 test is a single chunk, so there is nothing to overlap; the flag is checked by
 reading the log of a real restore instead.
 
-## The in-place `ftruncate` is a no-op for a file this run created — candidate #5
+## The in-place `ftruncate` is a no-op for a file this run created — candidate #5 — **Implemented**
 
-The in-place branch issues one `ftruncate` per file, after the write loop has
+The in-place branch issued one `ftruncate` per file, after the write loop had
 already left the file the right length (`:1447`):
 
 ```go
@@ -353,6 +358,18 @@ from 20,000 to zero. On this fixture the chunk sizes are the same as the file
 sizes, so the loop and the truncate disagree about nothing; on a tree whose files
 each span several chunks the saving is the same one call per file, which is small
 in the context of the command.
+
+**Implemented**: `fileCreated` (`:1184`) is set at both places the in-place branch
+creates the target — the sparse-file path at `:1229` and the empty-file path at
+`:1405` — and the truncate runs only when it is false (`:1478`). On a 20-file,
+300 KB-per-file fresh restore, `strace -c -e trace=ftruncate` counts 20 calls
+before and none after, and the restored tree is byte-identical (`cmp` on every
+file). The shrink case is the one the guard must not break: a target grown to
+150 MB and restored over goes back to its 300,000 bytes, which
+`TestInPlaceRestoreStillTruncatesALongerTarget`
+(`src/duplicacy_backupmanager_test.go`) pins down — it fails with "The restored
+file is 483511 bytes and does not match the 279410 bytes of the snapshot's copy"
+if the truncate is skipped for a file that already existed.
 
 Two related no-ops were looked at and are not worth changing. `existingFile.Seek(0,
 0)` at `:1387` and the per-chunk `Seek(offset, 0)` at `:1412` do issue 20,000 and
@@ -473,3 +490,8 @@ nil` guard would make it unreachable.
   records both as failing on an unmodified checkout; on this tree they pass
   (`go test ./src/ -vet=off -run 'TestBackupManager|TestPersistRestore'`), so if
   one starts failing after a change, the change is the likely cause.
+  `TestInPlaceRestoreStillTruncatesALongerTarget` (`src/duplicacy_backupmanager_test.go`)
+  pins the case candidate #5 must not break: a target longer than the snapshot's
+  copy is shrunk back to the snapshot's size by the truncate, so the test fails
+  with "The restored file is ... bytes and does not match ..." if the guard skips
+  it for a file that already existed.
