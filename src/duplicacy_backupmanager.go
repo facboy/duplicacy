@@ -1160,6 +1160,10 @@ func (manager *BackupManager) RestoreFile(chunkDownloader *ChunkDownloader, chun
 	var existingFile, newFile *os.File
 	var err error
 
+	// Set when the temporary file below is created and cleared once it has been renamed onto the target, so that the
+	// deferred cleanup only asks about a file this call made
+	temporaryFileCreated := false
+
 	preferencePath := GetDuplicacyPreferencePath()
 	temporaryPath := path.Join(preferencePath, "temporary")
 	fullPath := joinPath(top, entry.Path)
@@ -1172,7 +1176,7 @@ func (manager *BackupManager) RestoreFile(chunkDownloader *ChunkDownloader, chun
 			newFile.Close()
 		}
 
-		if temporaryPath != fullPath {
+		if temporaryPath != fullPath && temporaryFileCreated {
 			os.Remove(temporaryPath)
 		}
 	}()
@@ -1465,6 +1469,7 @@ func (manager *BackupManager) RestoreFile(chunkDownloader *ChunkDownloader, chun
 			LOG_ERROR("DOWNLOAD_OPEN", "Failed to open file for writing: %v", err)
 			return false, nil
 		}
+		temporaryFileCreated = true
 
 		hasher := manager.config.NewFileHasher()
 
@@ -1552,6 +1557,7 @@ func (manager *BackupManager) RestoreFile(chunkDownloader *ChunkDownloader, chun
 			LOG_ERROR("DOWNLOAD_RENAME", "Failed to rename the file %s to %s: %v", temporaryPath, fullPath, err)
 			return false, nil
 		}
+		temporaryFileCreated = false
 	}
 
 	if !showStatistics {

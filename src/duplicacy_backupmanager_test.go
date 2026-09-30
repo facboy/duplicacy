@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -872,5 +873,78 @@ func TestCorruptCachedChunkIsRefetched(t *testing.T) {
 	if _, exist, _, err := cache.FindChunk(0, chunkID, false); err != nil || !exist {
 		t.Errorf("The cache entry for the chunk %s was not rebuilt after it was removed (exist=%t, err=%v)",
 			chunkID, exist, err)
+	}
+}
+
+// The in-place restore never creates the temporary file, so the deferred cleanup that removes it is skipped when this
+// call did not make one.  What must not change is that a non-in-place restore, which does create it, still removes it
+// after a failure: the run is stopped by a missing chunk, and the file left under .duplicacy/temporary must be gone.
+func TestRestoreCleansUpAfterAFailure(t *testing.T) {
+
+	setTestingT(t)
+	SetLoggingLevel(INFO)
+
+	defer recoveringWithStack(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "temporary_file_test")
+	os.RemoveAll(testDir)
+	os.MkdirAll(testDir, 0700)
+	defer os.RemoveAll(testDir)
+
+	os.Mkdir(testDir+"/repository1", 0700)
+	os.Mkdir(testDir+"/repository1/.duplicacy", 0700)
+	os.Mkdir(testDir+"/repository2", 0700)
+	os.Mkdir(testDir+"/repository2/.duplicacy", 0700)
+
+	createRandomFileSeeded(testDir+"/repository1/file1", 500000, 1)
+
+	threads := 1
+
+	storage, err := loadStorage(testDir+"/storage", threads)
+	if err != nil {
+		t.Errorf("Failed to create storage: %v", err)
+		return
+	}
+	cleanStorage(storage)
+	// A fixed 64 KB maximum chunk size keeps the data chunks at a known size, well above the metadata chunks that
+	// hold the sequences for a single file, so the largest chunk in chunks/ is the one holding the file's content.
+	if !ConfigStorage(storage, 16384, 100, 64*1024, 64*1024, 64*1024, "", nil, false, "", 0, 0) {
+		t.Errorf("Failed to initialize the storage")
+		return
+	}
+
+	SetDuplicacyPreferencePath(testDir + "/repository1/.duplicacy")
+	backupManager := CreateBackupManager("host1", storage, testDir, "", "", "", false)
+	backupManager.SetupSnapshotCache("default")
+	backupManager.Backup(testDir+"/repository1", true, threads, "first", false, false, 0, false, 1024, 1024)
+
+	// Removing the data chunk stops the restore with a per-file failure once the temporary file has been created,
+	// which is the path that must still clean it up.  Only chunks/ is walked: the config and the snapshot file live
+	// elsewhere in the storage, and removing one of those would fail the restore before it downloaded anything.
+	dataChunk := ""
+	dataChunkSize := int64(0)
+	filepath.Walk(testDir+"/storage/chunks", func(p string, info os.FileInfo, err error) error {
+		if err == nil && info.Mode().IsRegular() && info.Size() > dataChunkSize {
+			dataChunk, dataChunkSize = p, info.Size()
+		}
+		return nil
+	})
+	if dataChunk == "" {
+		t.Errorf("The backup produced no chunk to remove")
+		return
+	}
+	if err := os.Remove(dataChunk); err != nil {
+		t.Errorf("Failed to remove the data chunk %s: %v", dataChunk, err)
+		return
+	}
+
+	SetDuplicacyPreferencePath(testDir + "/repository2/.duplicacy")
+	temporaryPath := testDir + "/repository2/.duplicacy/temporary"
+	failedFiles := backupManager.Restore(testDir+"/repository2", 1 /*revision*/, false /*inPlace*/, false /*quickMode*/,
+		threads, true /*overwrite*/, false /*deleteMode*/, false /*setOwner=*/, false /*showStatistics*/, nil, true)
+	assertRestoreFailures(t, failedFiles, 1)
+
+	if _, err := os.Stat(temporaryPath); !os.IsNotExist(err) {
+		t.Errorf("The temporary file was left behind after a failed non-in-place restore: %v", err)
 	}
 }

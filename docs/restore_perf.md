@@ -2,16 +2,15 @@
 
 Investigation into the performance of `duplicacy restore`, in the style of
 `snapshot_perf.md`, `copy_perf.md`, `prune_perf.md`, `check_perf.md` and
-`init_perf.md`. Five defects were found and are left as candidates here. The
-first three are per-file syscalls that a tree of many small files pays for every
-file and that the command does not need: the deferred cleanup of the temporary
-file probes the filesystem twice even when there is no temporary file, the
-existence of the target file is established twice, and the parent directory of
-every restored file is re-created although the directory pass has just created
-it. The metadata sequences are expanded on a one-thread operator, which is much
-smaller. The fifth is the `ftruncate` the in-place branch issues after the write
-loop has already left the file the right length. Nothing in `restore` is changed,
-so no source files are touched.
+`init_perf.md`. Five defects were found. The first of them, the deferred cleanup
+of the temporary file probing the filesystem twice for every file even when there
+is no temporary file, is fixed: a flag records whether this call created the
+temporary file, so the cleanup only asks about one it made. The remaining four are
+candidates: the existence of the target file is established twice, the parent
+directory of every restored file is re-created although the directory pass has
+just created it, the metadata sequences are expanded on a one-thread operator, and
+the in-place branch issues a `ftruncate` after the write loop has already left the
+file the right length.
 
 ## Summary
 
@@ -36,9 +35,11 @@ either the chunk download itself (which already overlaps across files, see
 `chown`) that a restore is supposed to perform.
 
 Measured on a 20,005-file, 179 MB tree, `/usr/bin/time`, best of several runs,
-the three fixes together take a fresh restore from 1.53 s to 1.30 s on ext4 and
-from 163 s to 108 s when the target is on a virtiofs mount, and take a
-re-restore of an unchanged tree from 0.28 s to 0.21 s.
+the three per-file syscalls together take a fresh restore from 1.53 s to 1.30 s on
+ext4 and from 163 s to 108 s when the target is on a virtiofs mount, and take a
+re-restore of an unchanged tree from 0.28 s to 0.21 s. Those figures were taken
+with all three applied; #1 alone is one of the two failing `unlinkat` calls per
+file, and the syscall counts that separate the three are in its section.
 
 A second pass over the in-place branch added candidate #5, the `ftruncate` that
 the write loop has already made unnecessary for a file the restore created: 1.13x
@@ -106,9 +107,9 @@ tasks are submitted through the operator's `DownloadAsync`
 (`src/duplicacy_chunkoperator.go:184`) and each completes on a worker goroutine;
 `WaitForCompletion` (`:218`) and `GetLastDownloadedChunk` (`:158`) have no caller.
 
-## The temporary-file cleanup probes the filesystem for every file — candidate #1
+## The temporary-file cleanup probed the filesystem for every file — candidate #1 — **Implemented**
 
-`RestoreFile` registers an unconditional cleanup (`:1176`):
+`RestoreFile` used to register an unconditional cleanup:
 
 ```go
 defer func() {
@@ -127,17 +128,35 @@ file of an in-place restore, the only mode the CLI reaches — both calls fail w
 `ENOENT`: two syscalls per file, each one a `newfstatat` on the parent directory
 plus the failing call on a network mount.
 
-The non-in-place path is barely better. The temporary file is renamed onto the
-target at `:1550`, so by the time the deferred function runs the temporary path
-no longer exists either, and the cleanup is again two failing calls. It is
-needed only when an error abandons the run between `:1463` (where the temporary
-file is created) and `:1550`.
+The non-in-place path was barely better. The temporary file is renamed onto the
+target (`:1555`), so by the time the deferred function runs the temporary path no
+longer exists either, and the cleanup was again two failing calls. It is needed
+only when an error abandons the run between `:1467` (where the temporary file is
+created) and `:1555`.
 
-On the 20,005-file fixture a fresh restore issues 40,010 `unlinkat` calls, all
-`ENOENT`, exactly two per file; the count is the same for a re-restore, for
-`-hash`, and for a restore limited by a pattern. The fix is a boolean set at the
-point the temporary file is created (and cleared after the rename), so the
-cleanup only asks about a file it made.
+On the 20,005-file fixture a fresh restore issued 40,010 `unlinkat` calls, all
+`ENOENT`, exactly two per file; the count was the same for a re-restore, for
+`-hash`, and for a restore limited by a pattern.
+
+`temporaryFileCreated` (`:1165`) is now set where the temporary file is created
+(`:1472`) and cleared once it has been renamed onto the target (`:1560`), and the
+deferred cleanup (`:1179`) only asks about a file it made. Nothing else moves:
+the same `os.Remove` is still reached for every file the non-in-place path
+actually creates one for, which is what an abandoned run relies on.
+
+Measured with `strace -f -c -e trace=unlinkat,openat,newfstatat`, the `unlinkat`
+count goes to 0 while `openat` and `newfstatat` are unchanged: 40,010 → 0 on the
+20,005-file fixture, and 1,000 → 0 on a 500-file one, where `openat` stays at
+1,027 and `newfstatat` at 1,568. On a virtiofs target, where each failed call is
+a path resolution, the fix is part of the 158 s → 100 s the first three
+candidates give together. The restored tree (`diff -r`) and the log are identical
+across `restore -r 1`, `-hash`,
+`-hash -overwrite`, `-delete`, a pattern-restricted restore, `-stats` and
+`-threads 4`, with the same exit codes, and `TestRestoreCleansUpAfterAFailure`
+(`src/duplicacy_backupmanager_test.go`) guards the abandoned-run cleanup by
+stopping a non-in-place restore with a missing chunk and checking that
+`.duplicacy/temporary` is gone. `TestBackupManager` and `TestPersistRestore`
+already restore both in place and not.
 
 ## The target file's existence is established twice — candidate #2
 
@@ -187,7 +206,9 @@ creates it.
 ### Measured
 
 The three candidates were prototyped in sequence (each on top of the previous)
-and measured against HEAD. `/usr/bin/time`, best of four, cache warm:
+and measured against HEAD. `/usr/bin/time`, best of four, cache warm. These are
+the prototype figures for all three together; #1 has since been implemented on
+its own, so the #1 column is no longer a pending change:
 
 | Fixture | HEAD | #1 | #1+#2 | #1+#2+#3 |
 | --- | --- | --- | --- | --- |
