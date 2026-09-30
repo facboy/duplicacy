@@ -2,15 +2,17 @@
 
 Investigation into the performance of `duplicacy restore`, in the style of
 `snapshot_perf.md`, `copy_perf.md`, `prune_perf.md`, `check_perf.md` and
-`init_perf.md`. Five defects were found, and all five are fixed. The three per-file
-syscall ones come first: the deferred cleanup of the temporary file probed the
-filesystem twice for every file even when there was no temporary file; the target
-file's existence was established twice, once by `Restore` before the per-file loop
-and again by the `Open` in `RestoreFile`; and the parent directory of every
-restored file was re-created although the directory pass had just created it. The
-fourth is the metadata sequences being expanded on a one-thread operator, so that
-`-threads` did nothing for them. The fifth is the in-place `ftruncate`, which the
-write loop has already made unnecessary for a file this run created.
+`init_perf.md`. Five performance defects were found, and all five are fixed. The
+three per-file syscall ones come first: the deferred cleanup of the temporary file
+probed the filesystem twice for every file even when there was no temporary file;
+the target file's existence was established twice, once by `Restore` before the
+per-file loop and again by the `Open` in `RestoreFile`; and the parent directory of
+every restored file was re-created although the directory pass had just created
+it. The fourth is the metadata sequences being expanded on a one-thread operator,
+so that `-threads` did nothing for them. The fifth is the in-place `ftruncate`,
+which the write loop has already made unnecessary for a file this run created. A
+sixth defect, a latent nil dereference rather than a cost, is fixed on the same
+pass and is recorded at the end of the in-place section.
 
 ## Summary
 
@@ -56,8 +58,9 @@ first pass. The pair of `Seek` calls in the same block turned out not to be wort
 changing at all, and is recorded as ruled out.
 
 That completes the five: the three per-file syscalls, the metadata sequences and
-the in-place truncate are all implemented. What is left below is recorded as
-looked at and not worth changing rather than as an open candidate.
+the in-place truncate are all implemented. The latent nil dereference found in the
+same pass is fixed as well. What is left below is recorded as looked at and not
+worth changing rather than as an open candidate.
 
 ## The call path
 
@@ -393,6 +396,19 @@ is guarded there. `Decrypt` only ever set `rewriteNeeded` for such a file under
 `-erasure-coding`, which is why this has not shown up; a `manager.chunkOperator !=
 nil` guard would make it unreachable.
 
+**Implemented**: the read now requires the operator to exist (`:3086`). Both
+commands that reach it with a nil operator — `backup` reads the snapshot file at
+`src/duplicacy_backupmanager.go:160` and `restore` at `:697`, ahead of the
+`CreateChunkOperator` at `:232` and `:701` — now skip the rewrite, which is what
+`list` already does through an operator created with `rewriteChunks` false. The
+reconstruction itself is unaffected: `Decrypt` repairs the chunk in memory
+regardless, so only the re-upload is skipped. `TestDownloadFileWithoutChunkOperatorDoesNotPanic`
+(`src/duplicacy_snapshotmanager_test.go`) stores an erasure-coded snapshot file,
+corrupts one data shard so that `Decrypt` has to reconstruct it, and downloads it
+with no operator (must not panic, must return the original bytes) and then with
+one that asks for rewrites (must re-upload once); it fails with "invalid memory
+address or nil pointer dereference" when the guard is removed.
+
 ## Candidate fixes
 
 ### Smaller items
@@ -411,12 +427,15 @@ nil` guard would make it unreachable.
   every file is opened and hashed (`:1192`, `:1239`), which is what the flag
   promises. Candidate #2 removes the *failed* open of a file that does not exist;
   it does not, and should not, remove the read of one that does.
-- **`ChunkDownloader.WaitForCompletion` and `GetLastDownloadedChunk` are
+- **`ChunkDownloader.WaitForCompletion` and `GetLastDownloadedChunk` were
   unreachable.** `WaitForCompletion` (`src/duplicacy_chunkdownloader.go:218`) and
-  `GetLastDownloadedChunk` (`:158`) have no caller anywhere in the tree; only the
-  operator's own `WaitForCompletion` is used. Nothing in `restore` refers to
-  them, so they are not a cost, but they are the kind of dead code that misleads
-  a reader looking for where the download tail is awaited.
+  `GetLastDownloadedChunk` (`:158`) had no caller anywhere in the tree; only the
+  operator's own `WaitForCompletion` is used. Nothing in `restore` referred to
+  them, so they were not a cost, but they were the kind of dead code that misleads
+  a reader looking for where the download tail is awaited. Along with them
+  `AddFiles` computed `maximumChunks` (`:71`, updated at `:94-96`) and never read
+  it. **Removed**: the two methods and the variable are gone, and the download
+  path is unchanged, since neither was reachable.
 - **The local listing walks with one goroutine.** `ListLocalFiles`
   (`src/duplicacy_snapshot.go:66`) lists directories in a loop. It runs
   concurrently with the remote listing and the merge, so it is on the critical
@@ -495,3 +514,9 @@ nil` guard would make it unreachable.
   copy is shrunk back to the snapshot's size by the truncate, so the test fails
   with "The restored file is ... bytes and does not match ..." if the guard skips
   it for a file that already existed.
+- `TestDownloadFileWithoutChunkOperatorDoesNotPanic`
+  (`src/duplicacy_snapshotmanager_test.go`) guards the nil dereference: it stores
+  an erasure-coded snapshot file, corrupts one data shard, and downloads it with no
+  operator and then with one that asks for rewrites. It fails with "invalid memory
+  address or nil pointer dereference" if the `manager.chunkOperator != nil` guard is
+  removed.

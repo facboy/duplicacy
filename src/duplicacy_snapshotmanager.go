@@ -3080,7 +3080,10 @@ func (manager *SnapshotManager) downloadFile(path string, derivationKey string, 
 		return nil
 	}
 
-	if rewriteNeeded && manager.chunkOperator.rewriteChunks {
+	// The chunk operator may not exist yet: backup and restore read the snapshot file before creating it, and a file
+	// whose erasure-coded shard had to be reconstructed still asks for a rewrite.  Those two commands skip the rewrite,
+	// exactly as list does, whose operator is created with rewriteChunks false.
+	if rewriteNeeded && manager.chunkOperator != nil && manager.chunkOperator.rewriteChunks {
 
 		newChunk := manager.config.GetChunk()
 		newChunk.Reset(true)

@@ -2313,3 +2313,86 @@ func TestDownloadSequencesOverlapUnderThreads(t *testing.T) {
 	}
 	stopOperator()
 }
+
+// A snapshot file whose erasure-coded shard had to be reconstructed comes back from Decrypt asking for a rewrite, but
+// backup and restore read the snapshot file before they create the chunk operator, so that field is nil when it
+// happens.  Reading rewriteChunks through the nil operator used to crash; the guard makes the two commands skip the
+// rewrite, exactly as list does, whose operator is created with rewriteChunks false.  An operator that does exist must
+// still get the rewrite, or the guard would have disabled it everywhere rather than only where there is no operator.
+func TestDownloadFileWithoutChunkOperatorDoesNotPanic(t *testing.T) {
+
+	setTestingT(t)
+
+	defer recovering(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+	snapshotManager.config.DataShards = 5
+	snapshotManager.config.ParityShards = 2
+
+	storage := snapshotManager.storage.(*FileStorage)
+
+	// Uploaded the same way the snapshot file is, so that it is compressed and erasure coded the way Decrypt expects.
+	snapshotFile := snapshotPath("test", 1)
+	content := bytes.Repeat([]byte("snapshot description"), 8)
+	if !snapshotManager.UploadFile(snapshotFile, snapshotFile, content) {
+		t.Errorf("Failed to upload the snapshot file")
+		return
+	}
+
+	// Corrupt one data shard, so that it no longer matches its hash and Decrypt has to reconstruct it, which is what
+	// makes it report rewriteNeeded.  The remaining data and parity shards are untouched, so there are still enough of
+	// them to recover from.
+	storedFile := path.Join(storage.storageDir, snapshotFile)
+	stored, err := ioutil.ReadFile(storedFile)
+	if err != nil {
+		t.Errorf("Failed to read the stored snapshot file: %v", err)
+		return
+	}
+	dataOffset := len(ERASURE_CODING_BANNER) + 14 + (snapshotManager.config.DataShards+snapshotManager.config.ParityShards)*32
+	stored[dataOffset] ^= 0xff
+	if err := ioutil.WriteFile(storedFile, stored, 0644); err != nil {
+		t.Errorf("Failed to write the corrupted snapshot file: %v", err)
+		return
+	}
+
+	// No chunk operator exists here, as it does not yet when backup and restore read the snapshot file.
+	var downloaded []byte
+	recovered := recoverPanicFrom(func() {
+		downloaded = snapshotManager.DownloadFile(snapshotFile, snapshotFile)
+	})
+	if recovered != nil {
+		t.Errorf("Downloading a snapshot file with a reconstructed shard without a chunk operator failed: %v", recovered)
+		return
+	}
+	if !bytes.Equal(downloaded, content) {
+		t.Errorf("The recovered snapshot file does not hold the original content")
+	}
+
+	// With an operator asking for rewrites, the reconstructed file must be uploaded back.
+	savedLogFunction := LogFunction
+	capture := &logCapture{}
+	LogFunction = capture.log
+	defer func() {
+		LogFunction = savedLogFunction
+	}()
+
+	snapshotManager.chunkOperator = CreateChunkOperator(snapshotManager.config, storage, nil, false, true, 1, false)
+	defer func() {
+		snapshotManager.chunkOperator.Stop()
+		snapshotManager.chunkOperator = nil
+	}()
+
+	snapshotManager.DownloadFile(snapshotFile, snapshotFile)
+
+	rewrites := 0
+	for _, message := range capture.messages("DOWNLOAD_REWRITE") {
+		if strings.Contains(message, "has been re-uploaded") {
+			rewrites++
+		}
+	}
+	if rewrites != 1 {
+		t.Errorf("Expected the reconstructed snapshot file to be re-uploaded once, saw %d rewrites", rewrites)
+	}
+}
