@@ -60,7 +60,11 @@ changing at all, and is recorded as ruled out.
 That completes the five: the three per-file syscalls, the metadata sequences and
 the in-place truncate are all implemented. The latent nil dereference found in the
 same pass is fixed as well. What is left below is recorded as looked at and not
-worth changing rather than as an open candidate.
+worth changing rather than as an open candidate. The one item that came close is
+the per-file `Lstat` in `RestoreMetadata`: it is genuinely dead on a fresh restore
+and measures 1.12x on a slow target, but it is the `-o` comparison and the
+already-matching check of a re-restore, so removing it is a design change rather
+than a deletion; it is recorded as examined and retained.
 
 ## The call path
 
@@ -471,6 +475,27 @@ address or nil pointer dereference" when the guard is removed.
   On a 250,000-file repository (23 sequence chunks) it was below the noise.
 - **A chunk index.** As in `snapshot_perf.md` (candidate #7), `copy_perf.md` and
   `prune_perf.md`, this would change the storage format on disk.
+- **Removing the per-file `Lstat` in `RestoreMetadata`.** `RestoreMetadata`
+  (`src/duplicacy_entry.go:526`) begins with an `os.Lstat` whenever its `fileInfo`
+  argument is nil, and all five call sites pass nil (`:761`, `:774`, `:891`,
+  `:921`, `:936`), so every restored file and directory costs one `newfstatat`:
+  41,044 → 20,839 on the 20,005-file fixture, 20,205 calls. On a fresh restore the
+  answer cannot change a decision — the file was created `0600` moments ago with
+  `Now` as its mtime, so `Chmod` and `Chtimes` run whatever the stat reports — and
+  a prototype that dropped it measured a fresh restore at 117.5 s → 105.3 s on the
+  virtiofs target (1.12x) and 0.953 s → 0.924 s on ext4 (1.03x), with `fchmodat`
+  and `utimensat` unchanged. It is nevertheless **Not going to be implemented**, on
+  two counts. `setOwner` is true by default (`duplicacy/duplicacy_main.go:856`) and
+  `SetOwner` (`src/duplicacy_utils_others.go:37`) dereferences the `FileInfo`
+  immediately, so the naive removal crashes a default restore with "invalid memory
+  address or nil pointer dereference"; and on a re-restore of an unchanged file
+  `RestoreFile` writes nothing, which leaves this stat as the only thing that
+  reports the metadata already matches. On an unchanged re-restore of 20 files it
+  is 84 `newfstatat` with none of `fchmodat`/`utimensat`, against 64 `newfstatat`
+  but 20 of each without it, so removing it literally adds two metadata writes per
+  file. A fix has to keep the "is it already right?" answer while losing the probe,
+  which is a design change rather than a deletion, for a saving that only shows on
+  a slow target. Recorded here as examined and retained, like the `Seek` pair.
 
 ## How to confirm on a given setup
 
@@ -492,6 +517,12 @@ address or nil pointer dereference" when the guard is removed.
   Candidate #4 has no syscall signature: the operator's thread count decides
   whether the metadata downloads overlap, so compare `restore -r 1 -threads 1`
   with `-threads 8` on a storage where they are round trips.
+  The retained `Lstat` in `RestoreMetadata` is what is left of the `newfstatat`
+  count: one successful call per restored file and directory, with no failures, so
+  on the 20,005-file fixture the count is 41,044 and 20,205 of those are this
+  probe. A re-restore of an unchanged tree is the case it pays for: it shows no
+  `fchmodat` or `utimensat` at all, because the stat says the metadata already
+  matches.
 - Time a fresh restore against a re-restore of the same tree: on the 20,005-file
   fixture a fresh restore is 1.5 s and an unchanged re-restore 0.3 s, and the
   gap is the file writes and the `openat` per file that the fresh restore no
