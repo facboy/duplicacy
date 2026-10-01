@@ -195,15 +195,24 @@ already been told is absent.
 
 `Restore` now keeps the error from its `os.Stat` (`:843`) and passes
 `os.IsNotExist(statErr)` to `RestoreFile` as `knownAbsent`, which guards the
-`Open` (`:1198`). The flag is derived from `os.IsNotExist`, not from a bare
-`stat == nil`, for the reason the probe was worth keeping: an `Open` that fails
-for a reason other than absence must still be reported the way it was, and an
-absent file must still reach the branch that handles it, because that branch is
-what creates the sparse file for a large in-place target (`:1205`). Only the
-probe is dropped, so the `DOWNLOAD_OPEN` line for a file that exists but cannot
-be read is unchanged — verified by restoring over a `chmod 000` target, which
-still logs exactly one `Can't open the existing file: ... permission denied` and
-exits with the same code as before.
+`Open` (`:1219`). The flag is derived from `os.IsNotExist`, not from a bare
+`stat == nil`, so that an `Open` that fails for a reason other than absence is
+still reported the way it was. Only the probe is dropped, so the `DOWNLOAD_OPEN`
+line for a file that exists but cannot be read is unchanged — verified by
+restoring over a `chmod 000` target, which still logs exactly one `Can't open the
+existing file: ... permission denied` and exits with the same code as before.
+
+The absent-file branch, which creates the sparse file for a large in-place
+target, was the one thing not unchanged. It used to be reached from the failed
+`Open`'s `os.IsNotExist`, and that test cannot fire when the probe is skipped, so
+a file the caller had already reported absent never got its sparse file: a fresh
+in-place restore of a 145 MB file allocated 294,928 blocks instead of 2,064, and
+the same hole was written for every absent file over 100 MB — `sparse_test.sh`'s
+955 MB fixture went from 22 MB to 955 MB allocated. The branch now tests
+`targetAbsent`, which is the caller's `knownAbsent` when the probe is skipped and
+the probe's `os.IsNotExist` when it is not, so both paths reach it. The
+rest of the absence handling is otherwise untouched, and a large target still gets
+its sparse file on either path.
 
 Measured with `strace -f -c -e trace=openat,newfstatat`, on the 20,005-file tree
 `openat` goes from 40,028 calls with 20,009 failures to 20,027 with 9, while
@@ -213,9 +222,14 @@ and 509 down to 528 and 9. On its own that is 1.26 s → 1.13 s on ext4 (1.12x) 
 candidates' combined virtiofs win, from removing one round trip per file. The
 restored tree, the file metadata and the log are identical to the previous commit
 for `restore -r 1`, `-hash`, `-hash -overwrite`, `-delete`, a pattern-restricted
-restore, `-stats`, `-threads 4` and `-ignore-owner`, with the same exit codes, and
-the large-file sparse path is unchanged (`-hash -overwrite` over a 150 MB target
-that was appended to and one that was grown still restores the original bytes).
+restore, `-stats`, `-threads 4` and `-ignore-owner`, with the same exit codes.
+
+`TestInPlaceRestoreOfAnAbsentLargeFileStaysSparse`
+(`src/duplicacy_backupmanager_sparse_test.go`) pins the sparse-file path: it backs
+up a 105 MB file whose data is at the end of a hole, restores it in place into an
+empty repository, and fails with "The restored file has 110100480 bytes allocated,
+so the hole was written rather than left sparse" if the branch is reached only
+from the skipped probe.
 
 ## The parent directory was re-created for every file — candidate #3 — **Implemented**
 
@@ -551,3 +565,13 @@ address or nil pointer dereference" when the guard is removed.
   operator and then with one that asks for rewrites. It fails with "invalid memory
   address or nil pointer dereference" if the `manager.chunkOperator != nil` guard is
   removed.
+- `TestInPlaceRestoreOfAnAbsentLargeFileStaysSparse`
+  (`src/duplicacy_backupmanager_sparse_test.go`) guards candidate #2's sparse-file
+  path: a 105 MB file whose data is at the end of a hole is restored in place into
+  an empty repository, and the test reads `syscall.Stat_t.Blocks` to fail with "The
+  restored file has ... bytes allocated, so the hole was written rather than left
+  sparse" if the absence no longer reaches the branch that creates the sparse file.
+  It is in its own `!windows` file because `Stat_t` is not portable.
+`integration_tests/sparse_test.sh` covers the same path end to end on a 955 MB
+fixture, where the difference is 22 MB against 955 MB allocated; `ls -lsh` prints
+it directly.

@@ -1213,48 +1213,54 @@ func (manager *BackupManager) RestoreFile(chunkDownloader *ChunkDownloader, chun
 	isNewFile := false
 
 	// 'knownAbsent' says the caller's stat has already established that the file is not there, so the probe below is
-	// skipped; the absent-file branch is otherwise unchanged, and a large enough target still gets its sparse file.
+	// skipped.  The sparse-file branch tests 'targetAbsent' rather than the skipped probe's error, because a skipped
+	// probe cannot report the absence itself, and without that the hole of a large in-place target is written in full.
+	targetAbsent := knownAbsent
 	if !knownAbsent {
 		existingFile, err = os.Open(fullPath)
 		if err != nil {
 			if os.IsNotExist(err) {
-				// macOS has no sparse file support
-				if inPlace && entry.Size > 100*1024*1024 && runtime.GOOS != "darwin" {
-					// Create an empty sparse file
-					existingFile, err = os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-					if err != nil {
-						LOG_ERROR("DOWNLOAD_CREATE", "Failed to create the file %s for in-place writing: %v", fullPath, err)
-						return false, nil
-					}
-					fileCreated = true
-
-					n := int64(1)
-					// There is a go bug on Windows (https://github.com/golang/go/issues/21681) that causes Seek to fail
-					// if the low 32 bits of the offset are 0xffffffff; increase n to avoid it.
-					if uint32(entry.Size) == 0 && (entry.Size>>32) > 0 {
-						n = int64(2)
-					}
-					_, err = existingFile.Seek(entry.Size-n, 0)
-					if err != nil {
-						LOG_ERROR("DOWNLOAD_CREATE", "Failed to resize the initial file %s for in-place writing: %v", fullPath, err)
-						return false, nil
-					}
-					_, err = existingFile.Write([]byte("\x00\x00")[:n])
-					if err != nil {
-						LOG_ERROR("DOWNLOAD_CREATE", "Failed to initialize the sparse file %s for in-place writing: %v", fullPath, err)
-						return false, nil
-					}
-					existingFile.Close()
-					existingFile, err = os.Open(fullPath)
-					if err != nil {
-						LOG_ERROR("DOWNLOAD_OPEN", "Can't reopen the initial file just created: %v", err)
-						return false, nil
-					}
-					isNewFile = true
-				}
+				targetAbsent = true
 			} else {
 				LOG_TRACE("DOWNLOAD_OPEN", "Can't open the existing file: %v", err)
 			}
+		}
+	}
+
+	if targetAbsent {
+		// macOS has no sparse file support
+		if inPlace && entry.Size > 100*1024*1024 && runtime.GOOS != "darwin" {
+			// Create an empty sparse file
+			existingFile, err = os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+			if err != nil {
+				LOG_ERROR("DOWNLOAD_CREATE", "Failed to create the file %s for in-place writing: %v", fullPath, err)
+				return false, nil
+			}
+			fileCreated = true
+
+			n := int64(1)
+			// There is a go bug on Windows (https://github.com/golang/go/issues/21681) that causes Seek to fail
+			// if the low 32 bits of the offset are 0xffffffff; increase n to avoid it.
+			if uint32(entry.Size) == 0 && (entry.Size>>32) > 0 {
+				n = int64(2)
+			}
+			_, err = existingFile.Seek(entry.Size-n, 0)
+			if err != nil {
+				LOG_ERROR("DOWNLOAD_CREATE", "Failed to resize the initial file %s for in-place writing: %v", fullPath, err)
+				return false, nil
+			}
+			_, err = existingFile.Write([]byte("\x00\x00")[:n])
+			if err != nil {
+				LOG_ERROR("DOWNLOAD_CREATE", "Failed to initialize the sparse file %s for in-place writing: %v", fullPath, err)
+				return false, nil
+			}
+			existingFile.Close()
+			existingFile, err = os.Open(fullPath)
+			if err != nil {
+				LOG_ERROR("DOWNLOAD_OPEN", "Can't reopen the initial file just created: %v", err)
+				return false, nil
+			}
+			isNewFile = true
 		}
 	}
 
