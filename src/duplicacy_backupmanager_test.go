@@ -15,6 +15,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1019,5 +1020,121 @@ func TestInPlaceRestoreStillTruncatesALongerTarget(t *testing.T) {
 	if !bytes.Equal(restored, original) {
 		t.Errorf("The restored file is %d bytes and does not match the %d bytes of the snapshot's copy",
 			len(restored), len(original))
+	}
+}
+
+// threadRecordingStorage records the thread count of the snapshot manager's chunk operator as each chunk is read
+// through it, which is how TestBackupExpandsSequencesUnderThreads tells which operator the expansion ran on.  It
+// assumes the manager it was given is the one issuing the reads, so it is used within a single test.
+type threadRecordingStorage struct {
+	*FileStorage
+
+	manager *BackupManager
+
+	lock    sync.Mutex
+	threads map[int]bool
+}
+
+func (storage *threadRecordingStorage) DownloadFile(threadIndex int, filePath string, chunk *Chunk) error {
+
+	if strings.HasPrefix(filePath, "chunks/") {
+		operator := storage.manager.SnapshotManager.chunkOperator
+		if operator == nil {
+			storage.lock.Lock()
+			storage.threads[0] = true
+			storage.lock.Unlock()
+		} else {
+			storage.lock.Lock()
+			storage.threads[operator.threads] = true
+			storage.lock.Unlock()
+		}
+	}
+
+	return storage.FileStorage.DownloadFile(threadIndex, filePath, chunk)
+}
+
+func (storage *threadRecordingStorage) operatorThreadCounts() map[int]bool {
+	storage.lock.Lock()
+	defer storage.lock.Unlock()
+
+	counts := make(map[int]bool)
+	for threads := range storage.threads {
+		counts[threads] = true
+	}
+	return counts
+}
+
+// A backup of an existing revision expands the previous revision's chunk and length sequences, and those go through
+// the snapshot manager's own operator.  DownloadSequence creates that operator itself, but with a hard-coded single
+// thread, so unless the caller has created it first the expansion runs one metadata chunk at a time however many
+// -threads were given.  Backup now creates it first, the way check, prune and restore do, and stops it on the way
+// out; this pins both halves.
+func TestBackupExpandsSequencesUnderThreads(t *testing.T) {
+
+	setTestingT(t)
+
+	defer recovering(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "backup_threads_test")
+	os.RemoveAll(testDir)
+	os.MkdirAll(testDir, 0700)
+	defer os.RemoveAll(testDir)
+
+	repository := path.Join(testDir, "repository")
+	os.MkdirAll(path.Join(repository, ".duplicacy"), 0700)
+	createRandomFileSeeded(path.Join(repository, "file1"), 300000, 5)
+
+	innerStorage, err := loadStorage(path.Join(testDir, "storage"), 1)
+	if err != nil {
+		t.Errorf("Failed to create the storage: %v", err)
+		return
+	}
+	fileStorage, ok := innerStorage.(*FileStorage)
+	if !ok {
+		t.Skipf("This test requires a file storage, got %T", innerStorage)
+		return
+	}
+	if !ConfigStorage(innerStorage, 16384, DEFAULT_COMPRESSION_LEVEL, 64*1024, 256*1024, 16*1024, "", nil, false, "", 0, 0) {
+		t.Errorf("Failed to configure the storage")
+		return
+	}
+
+	SetDuplicacyPreferencePath(path.Join(repository, ".duplicacy"))
+	manager := CreateBackupManager("host1", innerStorage, repository, "", "", "", false)
+	manager.SetupSnapshotCache("default")
+
+	// The first backup has no previous revision, so there is nothing to expand and no operator should be created.
+	if !manager.Backup(repository, true, 1, "first", false, false, 0, false, 1024, 1024) {
+		t.Errorf("Failed to back the repository up")
+		return
+	}
+	if manager.SnapshotManager.chunkOperator != nil {
+		t.Errorf("A first backup left the snapshot manager's chunk operator behind")
+	}
+
+	// Every later backup expands the previous revision's sequences, so this is the run whose operator is observed.
+	if err := os.WriteFile(path.Join(repository, "file2"), []byte("second"), 0644); err != nil {
+		t.Errorf("Failed to add a file for the second backup: %v", err)
+		return
+	}
+
+	recording := &threadRecordingStorage{FileStorage: fileStorage, manager: manager, threads: make(map[int]bool)}
+	manager.SnapshotManager.storage = recording
+	manager.storage = recording
+
+	if !manager.Backup(repository, true, 8, "second", false, false, 0, false, 1024, 1024) {
+		t.Errorf("Failed to back the repository up a second time")
+		return
+	}
+
+	// The expansion must have run on an operator created with the user's thread count, not on the one-thread
+	// operator DownloadSequence would have built for itself.
+	if counts := recording.operatorThreadCounts(); len(counts) != 1 || !counts[8] {
+		t.Errorf("Expected the sequences to be expanded on an eight-thread operator, saw %v", counts)
+	}
+
+	// And it must have been stopped on the way out, or the next command would inherit its thread count.
+	if manager.SnapshotManager.chunkOperator != nil {
+		t.Errorf("Backup left the snapshot manager's chunk operator running")
 	}
 }

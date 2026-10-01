@@ -173,6 +173,13 @@ func (manager *BackupManager) Backup(top string, quickMode bool, threads int, ta
 
 	// A revision number of 0 means this is the initial backup
 	if remoteSnapshot.Revision > 0 {
+		// The sequences are expanded through the snapshot manager's own operator, which is created here with the
+		// user's -threads so that their metadata chunks are fetched concurrently; check, prune and restore create it
+		// the same way.  It is stopped when Backup returns, so that the operator the packing loop uses below with the
+		// same count is a separate one and the two do not have to agree on anything but the thread count.
+		manager.SnapshotManager.CreateChunkOperator(false, false, threads, false)
+		defer manager.SnapshotManager.stopChunkOperator()
+
 		manager.SnapshotManager.DownloadSnapshotSequences(remoteSnapshot)
 		// Add all chunks in the last snapshot to the cache
 		for _, chunkID := range manager.SnapshotManager.GetSnapshotChunks(remoteSnapshot, true) {

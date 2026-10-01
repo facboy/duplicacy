@@ -5,12 +5,13 @@ Investigation into the performance of `duplicacy backup`, in the style of
 `restore_perf.md` and `init_perf.md`. `backup` is the only heavy command without
 a document of its own.
 
-Four defects were found and none is implemented, so no source files are touched.
-Two are the serial loops the command is built around — the local file walk and
-the packing loop — and two are smaller: the snapshot-cache clean that runs at the
-end of every successful backup, and the one-thread operator the previous
-revision's metadata sequences are expanded on. Several smaller items were
-measured and are recorded as examined and retained.
+Four defects were found and one is implemented. The implemented one is the
+smallest: the previous revision's metadata sequences were expanded on a one-thread
+operator, so `-threads` did nothing for them, and `backup` was the last command
+still shaped that way. The two the command is built around — the serial local
+file walk and the serial packing loop — and the snapshot-cache clean that runs at
+the end of every successful backup are recorded as not going to be implemented.
+Several smaller items were measured and are recorded as examined and retained.
 
 ## Summary
 
@@ -283,7 +284,7 @@ decided by — clean only when the cache is worth keeping, and only when the
 snapshot set has actually changed — and that decision belongs with whichever
 document owns the cache rather than with `backup`.
 
-## The previous revision's sequences are expanded on a one-thread operator — candidate #4 — **Not going to be implemented**
+## The previous revision's sequences are expanded on a one-thread operator — candidate #4 — **Implemented**
 
 `backup` expands the previous revision's chunk and length sequences before the
 walk starts (`:176`). Each goes through `SnapshotManager.DownloadSequence`
@@ -298,28 +299,60 @@ func (manager *SnapshotManager) DownloadSequence(sequence []string) (content []b
 ```
 
 This is the same defect `restore_perf.md` candidate #4 records and `prune` and
-`check` avoid: the user's flag reaches the chunk operator that `Backup` creates
-at `:232` for the file chunks, but the manager's operator — the one the sequences
-go through — is created with one thread. `DownloadSequence` submits every chunk
+`check` avoid: the user's flag reached the chunk operator that `Backup` creates
+at `:238` for the file chunks, but the manager's operator — the one the sequences
+go through — was created with one thread. `DownloadSequence` submits every chunk
 of the sequence at once and waits, so they overlap only as wide as that operator.
 
-The value is small and the fix is the same few lines `restore` needed: create the
-manager's operator with `-threads` before expanding, and let `DownloadSequence`
-reuse it. Even on the 100,000-file fixture the expansion is 2 chunks, and a
-250,000-file repository expands all three sequences in 23 (`restore_perf.md`). It
-is on a slow mount that the per-chunk round trips show, which is the same place
-candidate #1 is worst.
+`backup` was the only command left with this shape. Every other command creates
+the manager's operator itself before it expands, so that the thread count of the
+expansion is a decision the command makes rather than the `1` in
+`DownloadSequence`:
 
-It is recorded rather than proposed because it is not `backup`'s own defect:
-`DownloadSequence` is shared by every read-only command, and the place to fix it
-is where `restore` did — in the command that creates the manager's operator,
-with the operator's lifetime to go with it. The operator at `:232` does not help
-here: it is a local variable that `Backup` hands to the listing goroutine and the
-packing loop, while `DownloadSequence` goes through
-`manager.SnapshotManager.chunkOperator`, which only `CreateChunkOperator` ever
-sets. The fix is `manager.SnapshotManager.CreateChunkOperator(false, false,
-threads, false)` before `:176` with a deferred `manager.SnapshotManager.
-stopChunkOperator()`, which is the pair `restore` added.
+| Command | Who creates the manager's operator | Threads |
+| --- | --- | --- |
+| `restore` | `Restore` before the expansion (`src/duplicacy_backupmanager.go:701`) | `-threads` |
+| `check` | `CheckSnapshots` (`src/duplicacy_snapshotmanager.go:1036`) | `-threads` |
+| `prune` | `PruneSnapshots` (`:2224`) | `-threads` |
+| `list` | `ListSnapshots` (`:921`) | 1 |
+| `diff` | `Diff` (`:1875`) | 1 |
+| `history` | `ShowHistory` (`:2097`) | 1 |
+| `cat` | `RetrieveFile` (`:1741`) | 1 |
+| **`backup`** | **nobody** — `DownloadSequence` created it at `:346` | 1 |
+
+`list`, `diff`, `history` and `cat` create a one-thread operator deliberately:
+they either take no `-threads` or read a single file, so the operator is there
+for the sequence walk's `ListRemoteFiles` to have one. `backup` has no such
+reason — the flag is documented as its "number of uploading threads" and the flag
+value was already reaching the file chunks — so the one-thread expansion was the
+defect `restore` had, and it was the only remaining instance.
+
+The `1` in `DownloadSequence` is load-bearing and stays: it is what builds an
+operator for a caller that did not, which is how `list -files`' walk gets a
+non-nil `manager.chunkOperator` to hand to `ListRemoteFiles`. That is why the fix
+belongs at the command, where `restore` put it, and not in `DownloadSequence`.
+
+**Implemented** (`src/duplicacy_backupmanager.go:174-188`): `Backup` creates the
+manager's operator with the user's `-threads` before expanding, with a deferred
+`stopChunkOperator`, so `DownloadSequence` reuses it. The operator is created
+inside the `remoteSnapshot.Revision > 0` branch, which is the only branch that
+expands anything; a first backup has no previous revision, so it neither creates
+nor stops an operator.
+
+The value is small and it is fixed because the flag did nothing rather than for
+the timing. A sequence is a single metadata chunk for any repository small enough
+to build in a test — 2,000 files produce 168 file-sequence chunks but a
+one-chunk `ChunkSequence` — so the expansion is 2 chunks even on the 100,000-file
+fixture, and a 250,000-file repository expands all three sequences in 23
+(`restore_perf.md`). It is on a slow mount that the per-chunk round trips show,
+which is the same place candidate #1 is worst.
+
+`TestBackupExpandsSequencesUnderThreads` (`src/duplicacy_backupmanager_test.go`)
+pins it: a recording storage notes the thread count of the operator each chunk
+download ran on, and the test fails with "Expected the sequences to be expanded
+on an eight-thread operator, saw map[1:true]" when the `CreateChunkOperator` call
+is removed. It also checks that a first backup creates no operator and that
+`Backup` stops and clears the one it made.
 
 ## Candidate fixes
 
@@ -391,10 +424,10 @@ stopChunkOperator()`, which is the pair `restore` added.
   read, not a defect. Candidate #3's signature is the `newfstatat` count under
   the cache's `chunks/` and `snapshots/` directories on a run that uploads
   nothing: 66 and 7 on the 10,000-file fixture above, against 8 operations on the
-  storage. Candidate #4 has no syscall signature: the operator's thread count
-  decides whether the metadata downloads overlap, so compare `backup -threads 1`
-  with `-threads 8` on a storage where a metadata read is a round trip and a
-  repository whose sequences are more than one chunk.
+  storage. Candidate #4's fix has no syscall signature either: the operator's
+  thread count decides whether the metadata downloads overlap, so compare
+  `backup -threads 1` with `-threads 8` on a storage where a metadata read is a
+  round trip and a repository whose sequences are more than one chunk.
 - `duplicacy -profile 127.0.0.1:6060 backup` serves a Go pprof endpoint
   (`duplicacy/duplicacy_main.go:159-164`); `curl
   'http://127.0.0.1:6060/debug/pprof/profile?seconds=1'` and
@@ -414,8 +447,21 @@ stopChunkOperator()`, which is the pair `restore` added.
   `TestBackupManager` (`src/duplicacy_backupmanager_test.go:179`) exercises
   backup and restore at one and several threads, quick and `-hash`;
   `TestSnapshotCacheSkipsSync` (`:690`) and `TestCorruptCachedChunkIsRefetched`
-  (`:766`) cover the snapshot cache candidate #3 touches; and
-  `TestDownloadSequencesOverlapUnderThreads`
-  (`src/duplicacy_snapshotmanager_test.go:2270`) covers the mechanism candidate #4
-  names. `AGENTS.md` records `TestPersistRestore` as failing on an unmodified
+  (`:766`) cover the snapshot cache candidate #3 touches;
+  `TestBackupExpandsSequencesUnderThreads` (`:1071`) covers candidate #4's fix,
+  and `TestDownloadSequencesOverlapUnderThreads`
+  (`src/duplicacy_snapshotmanager_test.go:2270`) covers the mechanism it relies
+  on. `AGENTS.md` records `TestPersistRestore` as failing on an unmodified
   checkout for an unrelated reason.
+
+## Implemented
+
+| Candidate | Change | Files |
+| --- | --- | --- |
+| #4 | `Backup` creates the snapshot manager's chunk operator with `-threads` before expanding the previous revision's sequences, and stops it on the way out | `src/duplicacy_backupmanager.go` |
+
+Covered by `TestBackupExpandsSequencesUnderThreads`
+(`src/duplicacy_backupmanager_test.go`); it fails when the `CreateChunkOperator`
+call is removed. `go test ./src/ -vet=off` passes, and the chunk tree, the
+revision set, the `BACKUP_STATS` output and a `restore` from the resulting
+storage are identical to the same run before the change.
