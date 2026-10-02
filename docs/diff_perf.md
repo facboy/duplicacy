@@ -8,8 +8,9 @@ revisions, so its metadata cost is bounded by that pair, but the `diff <file>`
 form runs a third-party line diff whose cost is quadratic in the length of the
 file, the only cost in the command that grows with the payload rather than with
 the revision count. Candidate #1 is fixed by a guard that compares the two
-revisions by hash above a configurable limit, and says why; candidates #2, #3
-and #4 are the three shapes already fixed in `history`, and each is bounded to at
+revisions by hash above a configurable limit, and says why; candidate #2 is fixed
+by reading only the length sequence the whole-snapshot comparison needs.
+Candidates #3 and #4 are the two shapes already fixed in `history`, bounded to at
 most two revisions here, so they are recorded and not implemented.
 
 ## Summary
@@ -22,9 +23,9 @@ properties cost it work:
    memory and time — and the path also holds both whole files in memory
    (candidate #1) — **Implemented**: above `-max-diff-size` the two revisions are
    compared by hash and the reason is printed;
-2. with two revisions and no file argument, both sides expand the chunk-hash
-   sequence, which the comparison never reads (candidate #2) — the defect
-   `snapshot_perf.md` fix #8 fixed for `list -files`;
+2. with two revisions and no file argument, both sides used to expand the
+   chunk-hash sequence, which the comparison never reads (candidate #2) — the
+   defect `snapshot_perf.md` fix #8 fixed for `list -files`. **Implemented**;
 3. an explicit `-r` pays the per-revision existence check (candidate #3) — the
    `snapshot_perf.md` fix #3 shape;
 4. the two snapshots and their sequences are read one after the other on a
@@ -39,10 +40,11 @@ the resident set tracks `lines × lines × intBytes` exactly. It is fixed by a
 guard, not by changing the diff algorithm: above `-max-diff-size` the two
 revisions are compared by hash and the reason is printed, so the anchoring of
 every diff below the limit is unchanged. Candidates #2, #3 and #4 are each a
-small change, but they are the same three shapes `history` fixed and each is
-bounded to at most two revisions here — on a cloud storage the whole of candidate
-#3 is two round trips and the whole of candidate #4 is one overlap — so they are
-recorded and left alone.
+small change, but they are the two shapes `history` fixed that `diff` still has,
+and each is bounded to at most two revisions here — on a cloud storage the whole
+of candidate #3 is two round trips and the whole of candidate #4 is one overlap —
+so they are recorded and left alone. Candidate #2 was fixed because it is the
+same sequence defect `list -files` and `history` no longer have.
 
 ## The call path
 
@@ -62,7 +64,7 @@ if len(revisions) <= 1 {
     ... collect rightSnapshotFiles ...
 } else {
     rightSnapshot = manager.DownloadSnapshot(snapshotID, revisions[1])  // :1971  listed=false
-    manager.DownloadSnapshotSequences(rightSnapshot)                    // :1972  chunks + lengths
+    manager.DownloadSnapshotSequence(rightSnapshot, "lengths")          // :1972  lengths
 }
 
 if len(revisions) < 1 {
@@ -70,27 +72,31 @@ if len(revisions) < 1 {
 } else {
     leftSnapshot = manager.DownloadSnapshot(snapshotID, revisions[0])   // :1983  listed=false
 }
-manager.DownloadSnapshotSequences(leftSnapshot)                     // :1986  chunks + lengths
+manager.DownloadSnapshotSequence(leftSnapshot, "lengths")           // :1989  lengths
 
 if len(filePath) > 0 {
-    RetrieveFile(leftSnapshot, FindFile(leftSnapshot, filePath, false))  // :1990
-    RetrieveFile(rightSnapshot, ...) or ioutil.ReadFile(...)             // :2000 / :2009
-    ... the guard of candidate #1 ...                                    // :2023-2035
-    for _, diff := range difflib.Diff(leftLines, rightLines) { ... }     // :2039
+    manager.DownloadSnapshotSequence(leftSnapshot, "chunks")        // :1993  per-file only
+    manager.DownloadSnapshotSequence(rightSnapshot, "chunks")       // :1995  per-file only
+    RetrieveFile(leftSnapshot, FindFile(leftSnapshot, filePath, false))    // :1999
+    RetrieveFile(rightSnapshot, ...) or ioutil.ReadFile(...)               // :2010 / :2018
+    ... the guard of candidate #1 ...                                      // :2032-2040
+    for _, diff := range difflib.Diff(leftLines, rightLines) { ... }       // :2048
     return true
 }
 
-leftSnapshot.ListRemoteFiles(manager.config, manager.chunkOperator, ...)   // :2075
-rightSnapshot.ListRemoteFiles(manager.config, manager.chunkOperator, ...)  // :2082
-... merge the two sorted lists, comparing Hash ...                        // :2149
+leftSnapshot.ListRemoteFiles(manager.config, manager.chunkOperator, ...)   // :2084
+rightSnapshot.ListRemoteFiles(manager.config, manager.chunkOperator, ...)  // :2091
+... merge the two sorted lists, comparing Hash ...                        // :2146
 ```
 
 `DownloadSnapshot` (`:235`) delegates to `downloadSnapshot` with `listed=false`,
-which runs `GetFileInfo` before the download (`:254-265`), so the two
+which runs `GetFileInfo` before the download (`:255-265`), so the two
 `DownloadSnapshot` calls above each pay an existence check. The plural
 `DownloadSnapshotSequences` (`:509`) is the pair of `"chunks"` and `"lengths"`
-calls, and the singular `DownloadSnapshotSequence(snapshot, "lengths")` (`:479`)
-is one of them. `ListRemoteFiles` (`src/duplicacy_snapshot.go:107`) validates each
+calls and is no longer used here; the singular
+`DownloadSnapshotSequence(snapshot, "lengths")` (`:479`) is the call each side
+makes for the sequences the comparison reads. `ListRemoteFiles`
+(`src/duplicacy_snapshot.go:107`) validates each
 entry against `snapshot.ChunkLengths` (`:189`) and never reads `ChunkHashes`;
 `RetrieveFile` (`src/duplicacy_snapshotmanager.go:1736`) is the only reader,
 indexing `snapshot.ChunkHashes[i]` at `:1762`.
@@ -101,12 +107,12 @@ indexing `snapshot.ChunkHashes[i]` at `:1762`.
 
 ```go
 var leftFile []byte
-manager.RetrieveFile(leftSnapshot, ..., func(content []byte) { leftFile = append(leftFile, content...) })   // :1991
+manager.RetrieveFile(leftSnapshot, ..., func(content []byte) { leftFile = append(leftFile, content...) })   // :2000
 var rightFile []byte
-manager.RetrieveFile(rightSnapshot, ..., func(content []byte) { rightFile = append(rightFile, content...) })  // :2001
-leftLines := strings.Split(string(leftFile), "\n")     // :2016
-rightLines := strings.Split(string(rightFile), "\n")   // :2017
-for _, diff := range difflib.Diff(leftLines, rightLines) { ... }   // :2039
+manager.RetrieveFile(rightSnapshot, ..., func(content []byte) { rightFile = append(rightFile, content...) })  // :2010
+leftLines := strings.Split(string(leftFile), "\n")     // :2025
+rightLines := strings.Split(string(rightFile), "\n")   // :2026
+for _, diff := range difflib.Diff(leftLines, rightLines) { ... }   // :2048
 ```
 
 `difflib.Diff` trims the common head and tail, and then hands what is left to
@@ -205,45 +211,51 @@ a one-line change is diffed line by line under the same 4 KB limit.
 `Diff` fails the first with "Diffing a large file should have printed the reason
 it was compared by hash".
 
-## The whole-snapshot form expands the chunk-hash sequence it never reads — candidate #2
+## The whole-snapshot form expands the chunk-hash sequence it never reads — candidate #2 — **Implemented**
 
-With two revisions and no file argument, `Diff` calls
-`DownloadSnapshotSequences` on both sides (`:1972`, `:1986`), and the comparison
-that follows reads only what `ListRemoteFiles` needs: `Entry.check` validates each
-entry against `snapshot.ChunkLengths` (`src/duplicacy_snapshot.go:189`), the merge
-compares `Hash`, `Size` and `Compare` (`src/duplicacy_snapshotmanager.go:2137`,
-`:2149`), and the printed line is `Entry.String` (`src/duplicacy_entry.go:521`).
-None of them touches `snapshot.ChunkHashes`. This is `snapshot_perf.md` fix #8,
-except that it runs twice — once per side — instead of once per revision.
+With two revisions and no file argument, `Diff` used to call
+`DownloadSnapshotSequences` on both sides, and the comparison that follows reads
+only what `ListRemoteFiles` needs: `Entry.check` validates each entry against
+`snapshot.ChunkLengths` (`src/duplicacy_snapshot.go:189`), the merge compares
+`Hash`, `Size` and `Compare` (`src/duplicacy_snapshotmanager.go:2146`, `:2157`),
+and the printed line is `Entry.String` (`src/duplicacy_entry.go:521`). None of
+them touches `snapshot.ChunkHashes`. This is `snapshot_perf.md` fix #8, except
+that it ran twice — once per side — instead of once per revision.
 
-The per-file branch is not affected: `RetrieveFile` indexes
-`snapshot.ChunkHashes[i]` at `:1762`, so `diff <file>` genuinely needs both
-sequences.
-
-Measured with `strace -f -e trace=openat`, counting opens under `chunks/` on a
-local storage:
+The per-file form does need the chunk sequence: `RetrieveFile` indexes
+`snapshot.ChunkHashes[i]` at `:1762`. Measured with `strace -f -e trace=openat`,
+counting opens under `chunks/` on a local storage, before the change:
 
 ```
-diff -r 1 -r 5                    6
-list -files -r 1 -r 5             4
-diff -r 1 -r 5 bigfile.txt        8
+diff -r 1 -r 2 <file>    8
+diff -r 1 -r 2           6
+list -files -r 1 -r 2    4
 ```
 
-The two extra opens for the no-file form are the chunk-hash chunk of each side —
-one metadata chunk per revision, one round trip on cloud storage and a
-`newfstatat` plus `openat` plus the cache write on a local mount, the same
-per-chunk saving fix #8 measured for `list -files` (`docs/snapshot_perf.md:311-325`).
+**Implemented** (`src/duplicacy_snapshotmanager.go:1989`): the length sequence is
+read on each side (`:1972`, `:1989`), and the chunk sequence only in the per-file
+branch (`:1993`, `:1995`). The two extra opens for the no-file form were the
+chunk-hash chunk of each side — one metadata chunk per revision, one round trip on
+cloud storage and a `newfstatat` plus `openat` plus the cache write on a local
+mount, the same per-chunk saving fix #8 measured for `list -files`
+(`docs/snapshot_perf.md:311-325`). After the change the no-file form opens four
+metadata chunks (the file and length sequences, two sides) and the per-file form
+still opens eight.
 
-The fix is the one `list -files` took, applied to the `filePath == ""` case:
-`DownloadSnapshotSequence(snapshot, "lengths")` on each side in place of
-`DownloadSnapshotSequences`. The two calls are at the top of the same function, so
-the change is two lines and a condition on `filePath`. Recorded; the absolute
-saving is two metadata chunks.
+`TestDiffWholeSnapshotFetchesOnlyTheLengthSequence`
+(`src/duplicacy_diff_perf_test.go`) pins it: the whole-snapshot form downloads
+four metadata chunks and the per-file form more than four. Reverting the two calls
+to the plural `DownloadSnapshotSequences` fails it with "Expecting the file and
+length sequences of the two revisions (4 metadata chunks), got ...".
+
+The saving is two metadata chunks; it was fixed because it is the same defect
+`list -files` (fix #8) and `history` (candidate #1) no longer have, and `diff`
+was the last command reading a sequence nothing reads.
 
 ## Explicit `-r` pays the existence check — candidate #3
 
 Both `DownloadSnapshot` calls pass `listed=false` (`:1971`, `:1983`), so
-`downloadSnapshot` runs `GetFileInfo` before `downloadFile` (`:254-265`). Neither
+`downloadSnapshot` runs `GetFileInfo` before `downloadFile` (`:255-265`). Neither
 side was enumerated by a directory listing, so this is not the pure deletion that
 `snapshot_perf.md` fix #3 was for `list`: the check is also what reports a named
 revision that does not exist as `SNAPSHOT_NOT_EXIST` rather than as a failed
@@ -271,7 +283,7 @@ a single round trip. Recorded; the smallest of the four.
 
 `Diff` creates its operator with one thread (`:1944`) and calls
 `manager.DownloadSnapshot` twice in sequence (`:1971`, `:1983`), then expands the
-sequences in sequence (`:1972`, `:1986`). There is no `-threads` flag on the
+sequences in sequence (`:1972`, `:1989`). There is no `-threads` flag on the
 command, and the storage is created with one thread (`duplicacy_main.go:1087`).
 Each snapshot download and each metadata chunk is a round trip on cloud storage,
 and on a slow mount each is syscalls; `list` overlaps the first of those with
@@ -301,10 +313,10 @@ default and maximum are the same.
 - **`-hash` hashes the working tree, not the snapshots.** On the same fixture,
   `diff -r 2 -hash` took 2.80 s against 0.26 s for `diff -r 2`: `ComputeFileHash`
   reads and hashes every file for which the revision comparison needs a hash
-  (`:2147-2149`). That is what the flag promises, as in `history`.
+  (`:2157`). That is what the flag promises, as in `history`.
 - **The merge itself is linear.** Once both sides are in memory, the two-way
-  merge over the sorted entry lists (`:2110-2169`) is one pass, and the
-  `maxSize` pre-pass (`:2089-2105`) is two more; neither depends on the file
+  merge over the sorted entry lists (`:2119-2178`) is one pass, and the
+  `maxSize` pre-pass (`:2098-2114`) is two more; neither depends on the file
   contents.
 - **The chunk-cache and snapshot-cache decisions are already handled.**
   `prune_perf.md` (option 2) removed the per-write `fsync` from the chunk cache
@@ -312,7 +324,9 @@ default and maximum are the same.
   creates its operator with `rewriteChunks` false, like `list` — already benefits.
 - **`diff <file>` with a local right side never expands the right sequences.**
   `CreateEmptySnapshot` (`:1957`) has no sequences to expand, and the file is read
-  with `ioutil.ReadFile` (`:2009`). Only the left side pays metadata.
+  with `ioutil.ReadFile` (`:2018`). Only the left side pays metadata.
+  The per-file form reads the chunk sequence of both sides (`:1993`, `:1995`); the
+  whole-snapshot form reads only the length sequence (`:1989`).
 
 ### Deliberately not pursued
 
@@ -341,10 +355,10 @@ default and maximum are the same.
   before the table is built. The guard is visible as the reason line above the two
   hashes; `-max-diff-size 0` restores the line diff for the same two revisions.
 - Candidate #2: `strace -f -e trace=openat duplicacy diff -r A -r B` and count the
-  opens under `chunks/` (6 on the fixture), against `duplicacy list -files -r A
-  -r B` (4). The difference is the chunk sequence of each side, one chunk per
-  revision. The per-file form reads both sequences by design and its count is
-  higher for that reason.
+  opens under `chunks/`: four for the whole-snapshot form (the file and length
+  sequences of the two sides), the same count `list -files -r A -r B` makes.
+  Before the fix it was six, the two extra being the chunk sequence of each side.
+  The per-file form still reads both sequences and opens more.
 - Candidate #3: `strace -f -e trace=newfstatat duplicacy diff -r A -r B` and
   count the calls under `snapshots/<id>/`: two for two named revisions, one for a
   single named revision, none when both revisions were resolved from a listing.

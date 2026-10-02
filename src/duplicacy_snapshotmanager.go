@@ -1969,7 +1969,7 @@ func (manager *SnapshotManager) Diff(top string, snapshotID string, revisions []
 		}
 	} else {
 		rightSnapshot = manager.DownloadSnapshot(snapshotID, revisions[1])
-		manager.DownloadSnapshotSequences(rightSnapshot)
+		manager.DownloadSnapshotSequence(rightSnapshot, "lengths")
 	}
 
 	// If no revision is specified, use the latest revision as the left-hand side.
@@ -1983,8 +1983,17 @@ func (manager *SnapshotManager) Diff(top string, snapshotID string, revisions []
 		leftSnapshot = manager.DownloadSnapshot(snapshotID, revisions[0])
 	}
 
-	manager.DownloadSnapshotSequences(leftSnapshot)
+	// Both forms read the length sequence: ListRemoteFiles validates each entry against ChunkLengths.  Only the per-file
+	// form reads the chunk-hash sequence, because RetrieveFile is its only reader; the whole-snapshot comparison would
+	// fetch one metadata chunk per side that nothing reads -- a round trip each on cloud storage.
+	manager.DownloadSnapshotSequence(leftSnapshot, "lengths")
+
 	if len(filePath) > 0 {
+
+		manager.DownloadSnapshotSequence(leftSnapshot, "chunks")
+		if rightSnapshot != nil {
+			manager.DownloadSnapshotSequence(rightSnapshot, "chunks")
+		}
 
 		var leftFile []byte
 		if !manager.RetrieveFile(leftSnapshot, manager.FindFile(leftSnapshot, filePath, false), nil, func(content []byte) {

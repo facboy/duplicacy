@@ -154,3 +154,67 @@ func TestDiffWithoutLimitUsesLineDiff(t *testing.T) {
 		}
 	}
 }
+
+// The two-revision comparison reads each entry and validates it against the length sequence; it never reads the chunk
+// hash sequence, which only RetrieveFile indexes.  Expanding both sequences fetched one metadata chunk per side that no
+// output depended on, so the whole-snapshot form now reads the length sequence alone, and the per-file form -- which
+// RetrieveFile serves from ChunkHashes -- still reads the chunk sequence.
+func TestDiffWholeSnapshotFetchesOnlyTheLengthSequence(t *testing.T) {
+
+	setTestingT(t)
+
+	defer recovering(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+	counting := &instrumentedStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
+	snapshotManager.storage = counting
+
+	now := time.Now().Unix()
+	// The two revisions hold different content, so every sequence chunk is its own and none is shared between them.
+	left := diffLineContent(5, "left")
+	right := diffLineContent(5, "right")
+	createTestSnapshotWithContent(snapshotManager, "vm1@host1", 1, now-3600, now, []string{"f.txt"}, [][]byte{left}, "tag")
+	createTestSnapshotWithContent(snapshotManager, "vm1@host1", 2, now, now+3600, []string{"f.txt"}, [][]byte{right}, "tag")
+
+	savedLogFunction := LogFunction
+	capture := &logCapture{}
+	LogFunction = capture.log
+	defer func() {
+		LogFunction = savedLogFunction
+	}()
+
+	counting.resetDownloadStats()
+
+	if !snapshotManager.Diff(testDir, "vm1@host1", []int{1, 2}, "", false, "", "", false, 0) {
+		t.Errorf("Diffing two revisions failed: %v", capture.failures())
+		return
+	}
+
+	// Each side reads its file sequence (through ListRemoteFiles) and its length sequence (through the sequence call):
+	// two metadata chunks per side, four in all.  The chunk sequence of each side would be a fifth and sixth.
+	downloads := counting.chunkDownloadCounts()
+	if len(downloads) != 4 {
+		t.Errorf("Expecting the file and length sequences of the two revisions (4 metadata chunks), got %v", downloads)
+	}
+	for chunkPath, count := range downloads {
+		if count != 1 {
+			t.Errorf("The metadata chunk %s was downloaded %d times instead of once", chunkPath, count)
+		}
+	}
+
+	// The per-file form does read the chunk sequence, because RetrieveFile indexes ChunkHashes; dropping it there would
+	// make the file retrieval fail.  Both sequences are read on each side, so there are strictly more chunks than the
+	// whole-snapshot form reads.
+	counting.resetDownloadStats()
+
+	if !snapshotManager.Diff(testDir, "vm1@host1", []int{1, 2}, "f.txt", false, "", "", false, 0) {
+		t.Errorf("Diffing two revisions of a file failed: %v", capture.failures())
+		return
+	}
+
+	if downloads := counting.chunkDownloadCounts(); len(downloads) <= 4 {
+		t.Errorf("The per-file form should still read the chunk sequence as well, got %v", downloads)
+	}
+}
