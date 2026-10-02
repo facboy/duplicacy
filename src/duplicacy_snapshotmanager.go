@@ -12,6 +12,7 @@ import (
 	"io"
 	"io/ioutil"
 	"math"
+	"math/bits"
 	"os"
 	"path"
 	"regexp"
@@ -1865,12 +1866,80 @@ func (manager *SnapshotManager) PrintFile(snapshotID string, revision int, path 
 	return true
 }
 
-// Diff compares two snapshots, or two revision of a file if the file argument is given.
-func (manager *SnapshotManager) Diff(top string, snapshotID string, revisions []int,
-	filePath string, compareByHash bool, nobackupFile string, filtersFile string, excludeByAttribute bool) bool {
+// commonLineRange returns the number of equal lines at the start and at the end of the two files, the trim difflib
+// performs itself before it builds the quadratic table that compares the remaining lines.
+func commonLineRange(leftLines []string, rightLines []string) (commonStart int, commonEnd int) {
+	for commonStart < len(leftLines) && commonStart < len(rightLines) &&
+		leftLines[commonStart] == rightLines[commonStart] {
+		commonStart++
+	}
+	left, right := len(leftLines)-1, len(rightLines)-1
+	for left > commonStart && right > commonStart && leftLines[left] == rightLines[right] {
+		left--
+		right--
+		commonEnd++
+	}
+	return commonStart, commonEnd
+}
 
-	LOG_DEBUG("DIFF_PARAMETERS", "top: %s, id: %s, revision: %v, path: %s, compareByHash: %t",
-		top, snapshotID, revisions, filePath, compareByHash)
+// lineMatrixExceeds reports whether the line diff of two files would allocate more than 'maxDiffBytes' for the table
+// difflib builds, which holds one int for every pair of the lines that differ.  The product is not computed directly,
+// because it overflows an int64 for files large enough to be measured in billions of lines.
+func lineMatrixExceeds(leftLines int64, rightLines int64, maxDiffBytes int64) bool {
+	intBytes := int64(bits.UintSize / 8)
+	if leftLines == 0 || rightLines == 0 {
+		return false
+	}
+	// The int matrix and its row slices are both allocated; the cells are the dominant term.
+	if leftLines > maxDiffBytes/intBytes/rightLines {
+		return true
+	}
+	return leftLines*rightLines*intBytes > maxDiffBytes
+}
+
+// hashBytes returns the file hash of an in-memory buffer, the same hash a file entry of the same content carries.
+func hashBytes(config *Config, content []byte) string {
+	hasher := config.NewFileHasher()
+	hasher.Write(content)
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+// printHashDiff reports how a file differs between two revisions when the line diff was skipped: the two hashes are
+// compared instead, which is the comparison the whole-snapshot diff makes.  'diffLines' and 'otherDiffLines' are the
+// lines the line diff would have compared, printed so the size of the difference is still visible.
+func (manager *SnapshotManager) printHashDiff(leftSnapshot *Snapshot, rightSnapshot *Snapshot, filePath string,
+	rightFile []byte, diffLines int64, otherDiffLines int64) {
+
+	leftHash := ""
+	if file := manager.FindFile(leftSnapshot, filePath, false); file != nil {
+		leftHash = file.Hash
+	}
+
+	rightHash := ""
+	if rightSnapshot != nil {
+		if file := manager.FindFile(rightSnapshot, filePath, false); file != nil {
+			rightHash = file.Hash
+		}
+	} else {
+		rightHash = hashBytes(manager.config, rightFile)
+	}
+
+	LOG_INFO("SNAPSHOT_DIFF",
+		"The line diff of %s would need too much memory (%d vs %d lines differ), so the two revisions are compared by hash instead",
+		filePath, diffLines, otherDiffLines)
+
+	LOG_INFO("SNAPSHOT_DIFF", "- %s", leftHash)
+	LOG_INFO("SNAPSHOT_DIFF", "+ %s", rightHash)
+}
+
+// Diff compares two snapshots, or two revision of a file if the file argument is given.  'maxDiffBytes' is the most
+// memory the line diff of a file may use before it is replaced by a hash comparison; zero means no limit.
+func (manager *SnapshotManager) Diff(top string, snapshotID string, revisions []int,
+	filePath string, compareByHash bool, nobackupFile string, filtersFile string, excludeByAttribute bool,
+	maxDiffBytes int64) bool {
+
+	LOG_DEBUG("DIFF_PARAMETERS", "top: %s, id: %s, revision: %v, path: %s, compareByHash: %t, maxDiffBytes: %d",
+		top, snapshotID, revisions, filePath, compareByHash, maxDiffBytes)
 
 	manager.CreateChunkOperator(false, false, 1, false)
 	defer manager.stopChunkOperator()
@@ -1946,6 +2015,20 @@ func (manager *SnapshotManager) Diff(top string, snapshotID string, revisions []
 
 		leftLines := strings.Split(string(leftFile), "\n")
 		rightLines := strings.Split(string(rightFile), "\n")
+
+		// The line diff is quadratic: difflib allocates one int for every pair of lines it compares.  A pair of large
+		// files therefore costs gigabytes, so above 'maxDiffBytes' the diff is replaced by a hash comparison.  The
+		// limit is applied to the lines that actually differ, because difflib trims the common head and tail first and
+		// so a large file with a small change stays on the exact diff.
+		if maxDiffBytes > 0 {
+			commonStart, commonEnd := commonLineRange(leftLines, rightLines)
+			diffLines := int64(len(leftLines) - commonStart - commonEnd)
+			otherDiffLines := int64(len(rightLines) - commonStart - commonEnd)
+			if lineMatrixExceeds(diffLines, otherDiffLines, maxDiffBytes) {
+				manager.printHashDiff(leftSnapshot, rightSnapshot, filePath, rightFile, diffLines, otherDiffLines)
+				return true
+			}
+		}
 
 		after := 10
 		before := 10

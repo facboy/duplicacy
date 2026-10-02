@@ -103,18 +103,33 @@ func createTestSnapshotWithFiles(manager *SnapshotManager, snapshotID string, re
 	endTime int64, fileNames []string, fileSizes []int64, tag string) (fileHashes []string) {
 
 	// One chunk per file, with one byte of content per byte of file size.
-	chunkHashes := make([]string, len(fileNames))
-	chunkLengths := make([]int, len(fileNames))
-	fileHashes = make([]string, len(fileNames))
-
+	contents := make([][]byte, len(fileNames))
 	for i, fileSize := range fileSizes {
 		content := make([]byte, fileSize)
 		if _, err := rand.Read(content); err != nil {
 			LOG_ERROR("SNAPSHOT_UPLOAD", "Failed to generate the content of the file %s: %v", fileNames[i], err)
 			return nil
 		}
+		contents[i] = content
+	}
+
+	return createTestSnapshotWithContent(manager, snapshotID, revision, startTime, endTime, fileNames, contents, tag)
+}
+
+// createTestSnapshotWithContent uploads a snapshot whose files carry the given content, so that a test that needs a
+// file to diff can control exactly what its lines are.  Each file is stored in its own chunk, and the entries are
+// encoded the same way BackupManager.UploadSnapshot writes them.  The file hashes the entries carry are returned.
+func createTestSnapshotWithContent(manager *SnapshotManager, snapshotID string, revision int, startTime int64,
+	endTime int64, fileNames []string, contents [][]byte, tag string) (fileHashes []string) {
+
+	// One chunk per file, with the file's content as the chunk.
+	chunkHashes := make([]string, len(fileNames))
+	chunkLengths := make([]int, len(fileNames))
+	fileHashes = make([]string, len(fileNames))
+
+	for i, content := range contents {
 		chunkHashes[i] = uploadTestChunk(manager, content)
-		chunkLengths[i] = int(fileSize)
+		chunkLengths[i] = len(content)
 
 		hasher := manager.config.NewFileHasher()
 		hasher.Write(content)
@@ -131,12 +146,12 @@ func createTestSnapshotWithFiles(manager *SnapshotManager, snapshotID string, re
 
 	for i, fileName := range fileNames {
 
-		entry := CreateEntry(fileName, fileSizes[i], startTime, 0644)
+		entry := CreateEntry(fileName, int64(len(contents[i])), startTime, 0644)
 		entry.Hash = fileHashes[i]
 		entry.StartChunk = i
 		entry.StartOffset = 0
 		entry.EndChunk = i
-		entry.EndOffset = int(fileSizes[i])
+		entry.EndOffset = len(contents[i])
 
 		// This mirrors the way UploadSnapshot rewrites the chunk indexes: the chunk indexes of an entry are relative
 		// to the previous entry, and each entry only refers to the chunks that weren't referenced before it.
@@ -167,8 +182,8 @@ func createTestSnapshotWithFiles(manager *SnapshotManager, snapshotID string, re
 	}
 
 	var totalFileSize int64
-	for _, fileSize := range fileSizes {
-		totalFileSize += fileSize
+	for _, content := range contents {
+		totalFileSize += int64(len(content))
 	}
 
 	snapshot := &Snapshot{

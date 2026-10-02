@@ -1111,13 +1111,22 @@ func diff(context *cli.Context) {
 	}
 
 	compareByHash := context.Bool("hash")
+	// The line diff of a file is quadratic, so a large pair of files is compared by hash instead; 0 disables the limit.
+	// An explicit 0 or anything that AtoSize cannot parse means "no limit", to keep the flag from failing the command.
+	maxDiffBytes := int64(0)
+	maxDiffSize := strings.TrimSpace(context.String("max-diff-size"))
+	if maxDiffSize != "" && maxDiffSize != "0" {
+		if size := int64(duplicacy.AtoSize(maxDiffSize)); size > 0 {
+			maxDiffBytes = size
+		}
+	}
 	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, "", "", false)
 	duplicacy.SavePassword(*preference, "password", password)
 
 	loadRSAPrivateKey(context.String("key"), context.String("key-passphrase"), preference, backupManager, false)
 
 	backupManager.SetupSnapshotCache(preference.Name)
-	backupManager.SnapshotManager.Diff(repository, snapshotID, revisions, path, compareByHash, preference.NobackupFile, preference.FiltersFile, preference.ExcludeByAttribute)
+	backupManager.SnapshotManager.Diff(repository, snapshotID, revisions, path, compareByHash, preference.NobackupFile, preference.FiltersFile, preference.ExcludeByAttribute, maxDiffBytes)
 
 	runScript(context, preference.Name, "post")
 }
@@ -1833,6 +1842,12 @@ func main() {
 				cli.BoolFlag{
 					Name:  "hash",
 					Usage: "compute the hashes of on-disk files",
+				},
+				cli.StringFlag{
+					Name:     "max-diff-size",
+					Value:    "256m",
+					Usage:    "compare revisions by hash instead of by lines when the line diff would use more than this much memory (0 for no limit)",
+					Argument: "<size>",
 				},
 				cli.StringFlag{
 					Name:     "storage",
