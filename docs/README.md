@@ -13,6 +13,7 @@ changed, and how to confirm the result on a given setup. The
 | `check_perf.md` | Where `check` spends its time; the parallel revision loop, the chunk-tree walk, the double file-sequence walk and the snapshot-cache decision all fixed; the chunk cache guard followed from the decision. |
 | `restore_perf.md` | Where `restore` spends its time; five performance fixes applied -- the three per-file syscalls (temporary-file probe, duplicated existence check, per-file parent-directory probe), the one-thread metadata expansion and the in-place `ftruncate` -- plus a latent nil dereference in `downloadFile`, the dead `ChunkDownloader` methods and the sparse-file path the existence check had broken; the two `Seek` calls and the per-file `Lstat` in `RestoreMetadata` are examined and retained. |
 | `backup_perf.md` | Where `backup` spends its time; the one-thread expansion of the previous revision's metadata sequences fixed, so `-threads` reaches it as it already did in `restore`, `check` and `prune`; the serial local file walk, the serial packing loop and the snapshot-cache clean at the end of every run are recorded as not going to be implemented, with the attribute read and several smaller items examined and retained. |
+| `history_perf.md` | Where `history` spends its time; a code review rather than a measurement. The unread chunk-hash sequence expanded per revision is fixed (candidate #1); the serial one-thread revision loop and the existence check paid on an explicit `-r` are recorded and not implemented; `FindFile`'s per-revision file-sequence walk is rejected with the chunk index. |
 | `init_perf.md` | Why `init` is not worth optimising; nothing changed. |
 | `highwayhash_arm64.md` | The `zipperMerge` symbol collision in `github.com/gilbertchen/highwayhash`. |
 | `branch_review.md` | Duplication and refactoring review of the branch, and the state of each item. |
@@ -33,8 +34,10 @@ The skeleton of a per-command investigation, in order:
 
 `snapshot_perf.md` keeps `## Candidate fixes` after the confirmation steps,
 `prune_perf.md` records each fix inside its finding section rather than in a
-candidate list, and `highwayhash_arm64.md` is a build diagnosis that ends at the
-decision on the dependency rather than a per-command investigation.
+candidate list, `history_perf.md` is a code review that cites the measurements
+of the documents it mirrors rather than its own, and `highwayhash_arm64.md` is a
+build diagnosis that ends at the decision on the dependency rather than a
+per-command investigation.
 
 ## Tracing syscalls
 

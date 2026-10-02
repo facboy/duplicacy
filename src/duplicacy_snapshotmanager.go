@@ -2113,7 +2113,9 @@ func (manager *SnapshotManager) ShowHistory(top string, snapshotID string, revis
 	sort.Ints(revisions)
 	for _, revision := range revisions {
 		snapshot := manager.downloadSnapshot(snapshotID, revision, listed, manager.fileChunk, 0)
-		manager.DownloadSnapshotSequences(snapshot)
+		// Only the length sequence is read: FindFile walks the file sequence and Entry.check bounds each entry
+		// against ChunkLengths.  The chunk hash sequence is read only by RetrieveFile, which history never calls.
+		manager.DownloadSnapshotSequence(snapshot, "lengths")
 		file := manager.FindFile(snapshot, filePath, true)
 
 		if file != nil {

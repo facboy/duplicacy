@@ -1620,6 +1620,68 @@ func TestListChunksStillFetchesTheChunkSequence(t *testing.T) {
 	}
 }
 
+// 'history' reads a file's hash and size from the file entries of each revision, and Entry.check validates each entry
+// against the length sequence; it never reads the chunk hash sequence, which only RetrieveFile indexes.  Expanding both
+// sequences fetched one metadata chunk per revision that no printed line depended on.  This pins the fetch count to the
+// file and length sequences, and checks that the revision line still carries the entry's hash and size.
+func TestShowHistoryFetchesOnlyTheLengthSequence(t *testing.T) {
+
+	setTestingT(t)
+
+	defer recovering(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+	counting := &instrumentedStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
+	snapshotManager.storage = counting
+
+	now := time.Now().Unix()
+	fileHashes := createTestSnapshotWithFiles(snapshotManager, "vm1@host1", 1, now-3600, now,
+		[]string{"file1", "file2"}, []int64{9, 1234}, "tag")
+
+	// Capture what history prints instead of letting it go to the test log.
+	savedLogFunction := LogFunction
+	capture := &logCapture{}
+	LogFunction = capture.log
+	defer func() {
+		LogFunction = savedLogFunction
+	}()
+
+	counting.resetDownloadStats()
+
+	if !snapshotManager.ShowHistory(testDir, "vm1@host1", []int{1}, "file1", false) {
+		t.Errorf("Showing the history of the snapshot failed: %v", capture.failures())
+		return
+	}
+
+	// Printing the file and length sequences is what history reads; the chunk sequence is what -chunks would print, so
+	// expanding it here would be one metadata chunk per revision that nothing reads.  A chunk fetched a second time is
+	// served from the snapshot cache, so downloads and cache hits are counted together.
+	if fetches := len(capture.messages("CHUNK_DOWNLOAD")) + len(capture.messages("CHUNK_CACHE")); fetches != 2 {
+		t.Errorf("Expecting the file and length sequences to be fetched once each, got %d fetches", fetches)
+	}
+
+	downloads := counting.chunkDownloadCounts()
+	if len(downloads) != 2 {
+		t.Errorf("Expecting the file and length sequences to be downloaded, got %v", downloads)
+	}
+	for chunkPath, count := range downloads {
+		if count != 1 {
+			t.Errorf("The metadata chunk %s was downloaded %d times instead of once", chunkPath, count)
+		}
+	}
+
+	// The revision line must be the one the entry carries.  The current revision is left out because the file does
+	// not exist under 'testDir', so it is reported as an empty line.
+	modifiedTime := time.Unix(now-3600, 0).Format("2006-01-02 15:04:05")
+	expected := fmt.Sprintf("%7d: %15d %s %64s %s", 1, int64(9), modifiedTime, fileHashes[0], "file1")
+	lines := capture.messages("SNAPSHOT_HISTORY")
+	if len(lines) != 2 || lines[0] != expected || lines[1] != "current:" {
+		t.Errorf("Expecting the revision line %q and an empty current line, got %v", expected, lines)
+	}
+}
+
 // Reading snapshots must never create directories.  The snapshot directory is created by the code that uploads a
 // snapshot, so read-only commands (list, check, cat, ...) leave the storage and the snapshot cache untouched.
 func TestReadSnapshotsDoesNotCreateDirectories(t *testing.T) {
