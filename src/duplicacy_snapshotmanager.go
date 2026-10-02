@@ -2110,14 +2110,41 @@ func (manager *SnapshotManager) ShowHistory(top string, snapshotID string, revis
 			return false
 		}
 		listed = true
+	} else {
+		// The revisions were named by the user, so nothing has enumerated the snapshot directory yet and each one
+		// would pay its own existence check before the download -- a round trip per revision on a cloud storage.
+		// Listing the directory once answers "does this revision exist" for all of them.  When every named revision
+		// is in the listing the per-revision checks are skipped; when one is not, the download below still performs
+		// its own check, which is what reports it as missing rather than as a failed download and what keeps a stale
+		// snapshot cache entry from being believed.
+		existingRevisions, listErr := manager.ListSnapshotRevisions(snapshotID)
+		if listErr != nil {
+			LOG_ERROR("SNAPSHOT_LIST", "Failed to list all revisions for snapshot %s: %v", snapshotID, listErr)
+			return false
+		}
+
+		existing := make(map[int]bool, len(existingRevisions))
+		for _, revision := range existingRevisions {
+			existing[revision] = true
+		}
+
+		listed = true
+		for _, revision := range revisions {
+			if !existing[revision] {
+				listed = false
+				break
+			}
+		}
 	}
 
+	sort.Ints(revisions)
+
 	// The snapshot files are independent, so they are read concurrently; a single-threaded call is the plain loop it
-	// was before, and the sequence expansions below stay in revision order.
+	// was before, and the sequence expansions below stay in revision order.  The sort must precede the download,
+	// because each downloaded snapshot is matched to the revision at the same index.
 	snapshots := manager.downloadSnapshots(snapshotID, revisions, listed, threads)
 
 	var lastVersion *Entry
-	sort.Ints(revisions)
 	for i, revision := range revisions {
 		snapshot := snapshots[i]
 		// Only the length sequence is read: FindFile walks the file sequence and Entry.check bounds each entry

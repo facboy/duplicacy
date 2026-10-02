@@ -5,9 +5,9 @@ Review of `duplicacy history`, in the style of `snapshot_perf.md`, `copy_perf.md
 `init_perf.md`. This one is a code review rather than a measured investigation:
 the command is small, and every finding is the same shape as a defect that has
 already been measured and fixed elsewhere. Candidates #1 (the unread chunk-hash
-sequence) and #2 (the serial revision loop) are implemented; candidate #3 (the
-existence check on an explicit `-r`) is recorded and not implemented; the fourth
-finding is rejected with the chunk index.
+sequence), #2 (the serial revision loop) and #3 (the existence check on an
+explicit `-r`) are implemented; the fourth finding is rejected with the chunk
+index.
 
 ## Summary
 
@@ -28,7 +28,7 @@ the file sequence to find the entry. Four properties cost it work:
    after `list`; `history` was the last revision loop without it. **Implemented**;
 3. an explicit `-r` pays the per-revision existence check (candidate #3) — the
    fix #3 shape, though here it is weaker because the revision list came from the
-   user rather than from a directory listing;
+   user rather than from a directory listing. **Implemented**;
 4. `FindFile` walks the file sequence from the start for every revision
    (candidate #4) — inherent to the format, and the chunk-index item already
    rejected in `snapshot_perf.md`, `copy_perf.md` and `prune_perf.md`.
@@ -38,9 +38,10 @@ grounds on which fix #8 was made for `list -files`; `history` scales with the
 number of revisions, so the doubled metadata read was paid once per revision.
 Candidate #2 was fixed on the same grounds as the parallel `list` and `check`:
 the reads did not overlap however many threads were asked for, and the command
-now takes `-threads` for the same reason they do. Candidate #3 is recorded and
-not implemented, because it is not a pure deletion: skipping the existence check
-turns a missing revision into a parse error.
+now takes `-threads` for the same reason they do. Candidate #3 was fixed because
+the check is provably redundant once the directory has been listed, the same
+grounds as the original; the missing-revision message is preserved by listing
+the directory first and checking an unlisted name individually.
 
 ## The call path
 
@@ -48,7 +49,7 @@ turns a missing revision into a parse error.
 `-threads` count (`:1140`) and calls
 `BackupManager.SnapshotManager.ShowHistory` (`:1163`), passing that count.
 
-`ShowHistory` (`src/duplicacy_snapshotmanager.go:2091`) then does:
+`ShowHistory` (`src/duplicacy_snapshotmanager.go:2094`) then does:
 
 ```go
 manager.CreateChunkOperator(false, false, threads, false)           // :2100  -threads
@@ -57,21 +58,24 @@ defer manager.stopChunkOperator()
 if len(revisions) == 0 {
     revisions, err = manager.ListSnapshotRevisions(snapshotID)      // :2107
     listed = true                                                    // :2112
+} else {
+    ... list once, set listed only if every named revision is present ... // :2120-2137
 }
 
-snapshots := manager.downloadSnapshots(snapshotID, revisions, listed, threads)  // :2117
+sort.Ints(revisions)                                                 // :2140
+
+snapshots := manager.downloadSnapshots(snapshotID, revisions, listed, threads)  // :2145
 
 var lastVersion *Entry
-sort.Ints(revisions)                                                 // :2120
-for i, revision := range revisions {                                 // :2121
+for i, revision := range revisions {                                 // :2148
     snapshot := snapshots[i]
-    manager.DownloadSnapshotSequence(snapshot, "lengths")           // :2125  lengths only
-    file := manager.FindFile(snapshot, filePath, true)              // :2126
+    manager.DownloadSnapshotSequence(snapshot, "lengths")           // :2152  lengths only
+    file := manager.FindFile(snapshot, filePath, true)              // :2153
     ... print file.Hash / file.Size ...
 }
 
-stat, err := os.Stat(joinPath(top, filePath))                        // :2146  local
-... if showLocalHash { manager.config.ComputeFileHash(...) }         // :2154  local
+stat, err := os.Stat(joinPath(top, filePath))                        // :2173  local
+... if showLocalHash { manager.config.ComputeFileHash(...) }         // :2181  local
 ```
 
 `downloadSnapshot` (`:248`) checks the snapshot file exists with `GetFileInfo`
@@ -103,7 +107,7 @@ to 7.4-7.5 s and the cache entries for `-r 1-100` from 227 to 131
 `history` pays it once per revision as well, and without `-r` the loop covers
 every revision. **Implemented**: `ShowHistory` now calls
 `manager.DownloadSnapshotSequence(snapshot, "lengths")` where it called
-`DownloadSnapshotSequences` (`:2118`), so the chunk sequence is no longer
+`DownloadSnapshotSequences` (`:2152`), so the chunk sequence is no longer
 expanded. Unlike fix #8, which only changed the `showFiles` branch, `ShowHistory`
 has no other consumer of the chunk sequence, so the single call is the whole
 change; `cat` and `diff` of a file still read it and are not touched.
@@ -132,13 +136,19 @@ revision loop without it.
 **Implemented**: the command gained a `-threads` flag
 (`duplicacy/duplicacy_main.go:1876`), `showHistory` creates the storage with it
 (`:1140`) and passes it to `ShowHistory`, whose signature now takes it
-(`src/duplicacy_snapshotmanager.go:2095`). The snapshot files are read through
-`downloadSnapshots(snapshotID, revisions, listed, threads)` (`:2117`), which
+(`src/duplicacy_snapshotmanager.go:2094`). The snapshot files are read through
+`downloadSnapshots(snapshotID, revisions, listed, threads)` (`:2145`), which
 already spreads the workers over the thread indexes the storage was created with,
 and the operator is created with the same count (`:2100`) so the length-sequence
 expansions overlap too. The expansions and the printing stay in revision order,
 so the output is unchanged; a single-threaded call is the plain loop it was
-before.
+before.  The sort must precede the download (`:2140`), because each downloaded
+snapshot is matched to the revision at the same index; `ShowHistory` previously
+did the download first and sorted afterwards, which would have mislabelled every
+expected line.  The one output that does change is a revision list mixing a valid
+name with a missing one: the missing name now fails the whole run before
+anything is printed, where the serial loop used to print the valid lines first.
+`list -r 1 -r 999` fails the same way for the same reason.
 
 The value only shows where a metadata read is a round trip or a slow syscall, on
 a repository with many revisions. On a local ext4 fixture `prune_perf.md`
@@ -152,26 +162,44 @@ reads must overlap and stay within the four thread indexes the storage was
 created with, and the printed lines must be identical to the single-threaded run.
 Reverting the `downloadSnapshots` call to one thread fails it with "With 4
 threads: the revisions were not read concurrently, at most 1 was in flight at a
-time".
+time".  `TestShowHistoryMatchesSnapshotsToSortedRevisions` pins the ordering: a
+revision list given as `-r 3 -r 1` must still print each entry under its own
+revision number, and it fails with "Expecting revision 1 to be printed as ... got
+... revision 3's entry" if the sort follows the download.
 
-## Explicit `-r` pays the existence check — candidate #3
+## Explicit `-r` pays the existence check — candidate #3 — **Implemented**
 
-`ShowHistory` passes `listed` through to `downloadSnapshot`, and `listed` is true
-only when `ShowHistory` listed the revisions itself (`:2112`). With `-r`,
-`listed` is false, so `downloadSnapshot` runs `GetFileInfo` (`:253-265`) before
-`downloadFile` (`:267`): an extra round trip per revision that `list -r` and
-`check -r` no longer pay, because their revisions came from a directory listing
-(`snapshot_perf.md` fix #3).
+`ShowHistory` passed `listed` to `downloadSnapshot`, and `listed` was true only
+when `ShowHistory` listed the revisions itself. With `-r`, `listed` was false, so
+`downloadSnapshot` ran `GetFileInfo` before `downloadFile`: an extra round trip
+per revision. `list` and `check` have the same shape and pay the same check, so
+this is not a defect `history` alone had — `snapshot_perf.md` fix #3 removed the
+check only for the revisions those commands listed (which is the no-`-r` case);
+for `-r` they still check each revision.
 
-This candidate is weaker than it is for `list`, and the difference is worth
-recording. For `list`, the revisions came from `ListSnapshotRevisions`, which
-already enumerated the directory and knows they exist, so the check is provably
-redundant. For `history -r 40`, the user supplied `40` and it may not exist; with
-the check skipped, `downloadFile` fails and the error is reported as a parse
-failure of the snapshot rather than "Snapshot ... at revision 40 does not
-exist". So the fix is not a pure deletion: it either accepts a worse message or
-keeps a list-and-check for the explicit case, which is a design change for one
-round trip per revision. Recorded as examined.
+The fix is the one `snapshot_perf.md` fix #3 used: the snapshot directory is
+listed once and the listing answers "does this revision exist" for every named
+revision, so the per-revision checks are skipped. The listing does not change the
+message for a revision that is missing: when a named revision is not in the
+listing, `listed` stays false and the download performs its own existence check,
+which is what reports it as `SNAPSHOT_NOT_EXIST` rather than as a failed
+download, and what keeps a stale snapshot cache entry from being believed.
+
+**Implemented** (`src/duplicacy_snapshotmanager.go:2113-2138`): when revisions
+were named, `ShowHistory` lists the directory once and sets `listed` only if
+every named revision is present. The no-`-r` path already listed the directory
+and is unchanged.
+
+`TestShowHistorySkipsExistenceCheckForNamedRevisions`
+(`src/duplicacy_snapshotmanager_test.go`) pins both halves: `-r` makes no
+per-revision check and lists the directory once, and a name that is not in the
+listing is still checked individually and reported as missing.
+
+This is the smallest of the three and the one most likely to be skipped for the
+wrong reason: on a local repository the check is one `newfstatat`, so it only
+pays on cloud storage, where it is a round trip per named revision. It is fixed
+because the operation is provably redundant once the directory has been
+enumerated, the same grounds as the original, and not for a measured gain.
 
 ## `FindFile` walks the file sequence per revision — candidate #4
 
@@ -187,8 +215,8 @@ format, so it is rejected here as it is in `snapshot_perf.md` (candidate #7),
 
 ### Smaller items
 
-- **The local work is the expected local work.** `os.Stat` (`:2146`) and, under
-  `-hash`, `ComputeFileHash` (`:2154`) are the command's local reads. The stat is
+- **The local work is the expected local work.** `os.Stat` (`:2173`) and, under
+  `-hash`, `ComputeFileHash` (`:2181`) are the command's local reads. The stat is
   one call per run, not per revision.
 - **The chunk-cache `fsync` is already handled.** Each sequence chunk a revision
   expands went through `DownloadSequence` and the snapshot cache, which used to
@@ -222,6 +250,10 @@ format, so it is rejected here as it is in `snapshot_perf.md` (candidate #7),
 - Candidate #2: compare `history -threads 1` with `history -threads 8` on a
   storage where a metadata read is a round trip; the output is independent of the
   thread count, so the two runs can be diffed directly, as with `list -threads`.
+- Candidate #3: `history -r 1 -r 2` should issue one `newfstatat` per unique
+  snapshot directory listing rather than one per named revision; `strace -f -e
+  trace=newfstatat` and count the calls under `snapshots/<id>/`. A name that is
+  not in the listing still shows its own check.
 - Sum the syscalls with the `strace` recipe in `docs/README.md`. On a local
   fixture the storage `openat` count under `chunks/` is the metadata chunks read
   — one unread set per revision is the candidate #1 signature; the

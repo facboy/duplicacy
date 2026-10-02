@@ -1682,6 +1682,138 @@ func TestShowHistoryFetchesOnlyTheLengthSequence(t *testing.T) {
 	}
 }
 
+// 'history' sorts the revisions it was given before it prints them, and with the concurrent read that sort has to
+// happen before the downloads: each downloaded snapshot is matched to the revision at the same index.  A revision list
+// given out of order must therefore still be printed under its own revision number, not the number next to it in the
+// sorted list.
+func TestShowHistoryMatchesSnapshotsToSortedRevisions(t *testing.T) {
+
+	setTestingT(t)
+
+	defer recovering(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+
+	now := time.Now().Unix()
+	// The file grows with the revision, so a mislabelled line shows up as the wrong size.
+	fileHashes := make([]string, 3)
+	for revision := 1; revision <= 3; revision++ {
+		hashes := createTestSnapshotWithFiles(snapshotManager, "vm1@host1", revision, now-int64(revision)*3600, now,
+			[]string{"file1"}, []int64{int64(revision)}, "tag")
+		fileHashes[revision-1] = hashes[0]
+	}
+
+	savedLogFunction := LogFunction
+	capture := &logCapture{}
+	LogFunction = capture.log
+	defer func() {
+		LogFunction = savedLogFunction
+	}()
+
+	// Revision 3 is given before revision 1, so the sort has to reorder both the revisions and the snapshots.
+	if !snapshotManager.ShowHistory(testDir, "vm1@host1", []int{3, 1}, "file1", false, 2) {
+		t.Errorf("Showing the history failed: %v", capture.failures())
+		return
+	}
+
+	lines := capture.messages("SNAPSHOT_HISTORY")
+	if len(lines) != 3 {
+		t.Errorf("Expecting two revision lines and the current line, got %v", lines)
+		return
+	}
+
+	for i, revision := range []int{1, 3} {
+		size := int64(revision)
+		expected := fmt.Sprintf("%7d: %15d", revision, size)
+		if !strings.HasPrefix(lines[i], expected) ||
+			!strings.Contains(lines[i], fileHashes[revision-1]) {
+			t.Errorf("Expecting revision %d to be printed as %q with hash %s, got %q",
+				revision, expected, fileHashes[revision-1], lines[i])
+		}
+	}
+}
+
+// Naming the revisions with -r used to check the existence of each one separately before downloading it, even though
+// the snapshot directory is enumerated anyway to resolve them.  A single listing answers the question for every named
+// revision, so no per-revision check is made.  A revision that is not in the listing must still be reported as missing
+// rather than turning into a failed download.
+func TestShowHistorySkipsExistenceCheckForNamedRevisions(t *testing.T) {
+
+	setTestingT(t)
+
+	defer recovering(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+	counting := &instrumentedStorage{FileStorage: snapshotManager.storage.(*FileStorage)}
+	snapshotManager.storage = counting
+
+	now := time.Now().Unix()
+	for revision := 1; revision <= 3; revision++ {
+		createTestSnapshotWithFiles(snapshotManager, "vm1@host1", revision, now-int64(revision)*3600, now,
+			[]string{"file1"}, []int64{9}, "tag")
+	}
+
+	savedLogFunction := LogFunction
+	capture := &logCapture{}
+	LogFunction = capture.log
+	defer func() {
+		LogFunction = savedLogFunction
+	}()
+
+	// Every named revision exists, so the listing replaces the per-revision checks.
+	counting.resetCounters()
+	if !snapshotManager.ShowHistory(testDir, "vm1@host1", []int{1, 2}, "file1", false, 1) {
+		t.Errorf("Showing the history of the snapshot failed: %v", capture.failures())
+		return
+	}
+
+	if checks := atomic.LoadInt64(&counting.snapshotInfoCalls); checks != 0 {
+		t.Errorf("Naming revisions should not check the existence of each one, but %d checks were made", checks)
+	}
+	if listings := atomic.LoadInt64(&counting.snapshotListings); listings != 1 {
+		t.Errorf("Expecting the snapshot directory to be listed once, got %d listings", listings)
+	}
+
+	// A revision that is not in the listing is still checked individually, which is what reports it as missing.  The
+	// capture is removed first, because it would record the expected LOG_ERROR instead of raising it.
+	LogFunction = savedLogFunction
+
+	counting.resetCounters()
+	if !showHistoryMissingRevision(snapshotManager, testDir, "vm1@host1", 999, "file1") {
+		t.Errorf("A revision that is not in the listing should be reported as missing")
+	}
+	if checks := atomic.LoadInt64(&counting.snapshotInfoCalls); checks == 0 {
+		t.Errorf("A revision that is not in the listing should still be checked individually")
+	}
+}
+
+// showHistoryMissingRevision calls ShowHistory for a revision that does not exist and reports whether it was reported
+// as missing, which is signaled by LOG_ERROR raising a SNAPSHOT_NOT_EXIST Exception.
+func showHistoryMissingRevision(manager *SnapshotManager, top string, snapshotID string, revision int,
+	filePath string) (missing bool) {
+	// A previous test may have left testingT set, which would turn the expected error into a test failure
+	savedTestingT := testingT
+	testingT = nil
+
+	defer func() {
+		testingT = savedTestingT
+		if r := recover(); r != nil {
+			if exception, ok := r.(Exception); ok && exception.LogID == "SNAPSHOT_NOT_EXIST" {
+				missing = true
+				return
+			}
+			panic(r)
+		}
+	}()
+
+	manager.ShowHistory(top, snapshotID, []int{revision}, filePath, false, 1)
+	return false
+}
+
 // 'history' read the snapshot of every requested revision one at a time however many threads were asked for.  The
 // snapshot files and the length sequences are independent per revision, so with more than one thread the reads must
 // overlap; the printed lines must stay in revision order and be identical to the single-threaded run.
