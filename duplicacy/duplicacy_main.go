@@ -1137,7 +1137,11 @@ func showHistory(context *cli.Context) {
 	runScript(context, preference.Name, "pre")
 
 	duplicacy.LOG_INFO("STORAGE_SET", "Storage set to %s", preference.StorageURL)
-	storage := duplicacy.CreateStorage(*preference, false, 1)
+	threads := context.Int("threads")
+	if threads < 1 {
+		threads = 1
+	}
+	storage := duplicacy.CreateStorage(*preference, false, threads)
 	if storage == nil {
 		return
 	}
@@ -1160,7 +1164,7 @@ func showHistory(context *cli.Context) {
 	duplicacy.SavePassword(*preference, "password", password)
 
 	backupManager.SetupSnapshotCache(preference.Name)
-	backupManager.SnapshotManager.ShowHistory(repository, snapshotID, revisions, path, showLocalHash)
+	backupManager.SnapshotManager.ShowHistory(repository, snapshotID, revisions, path, showLocalHash, threads)
 
 	runScript(context, preference.Name, "post")
 }
@@ -1872,6 +1876,11 @@ func main() {
 					Name:     "storage",
 					Usage:    "retrieve files from the specified storage",
 					Argument: "<storage name>",
+				},
+				cli.IntFlag{
+					Name:  "threads",
+					Value: 1,
+					Usage: "number of revisions to read concurrently",
 				},
 			},
 			Usage:     "Show the history of a file",

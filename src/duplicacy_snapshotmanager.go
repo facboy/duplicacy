@@ -2087,14 +2087,17 @@ func (manager *SnapshotManager) Diff(top string, snapshotID string, revisions []
 	return true
 }
 
-// ShowHistory shows how a file changes over different revisions.
+// ShowHistory shows how a file changes over different revisions.  The snapshot files are read with up to 'threads'
+// workers, and the length sequence of each is expanded through the operator that count was given, so a metadata read
+// overlaps when more than one thread was asked for.  Everything that follows is done in revision order, which keeps the
+// output identical to the single-threaded case.
 func (manager *SnapshotManager) ShowHistory(top string, snapshotID string, revisions []int,
-	filePath string, showLocalHash bool) bool {
+	filePath string, showLocalHash bool, threads int) bool {
 
 	LOG_DEBUG("HISTORY_PARAMETERS", "top: %s, id: %s, revisions: %v, path: %s, showLocalHash: %t",
 		top, snapshotID, revisions, filePath, showLocalHash)
 
-	manager.CreateChunkOperator(false, false, 1, false)
+	manager.CreateChunkOperator(false, false, threads, false)
 	defer manager.stopChunkOperator()
 
 	var err error
@@ -2109,10 +2112,14 @@ func (manager *SnapshotManager) ShowHistory(top string, snapshotID string, revis
 		listed = true
 	}
 
+	// The snapshot files are independent, so they are read concurrently; a single-threaded call is the plain loop it
+	// was before, and the sequence expansions below stay in revision order.
+	snapshots := manager.downloadSnapshots(snapshotID, revisions, listed, threads)
+
 	var lastVersion *Entry
 	sort.Ints(revisions)
-	for _, revision := range revisions {
-		snapshot := manager.downloadSnapshot(snapshotID, revision, listed, manager.fileChunk, 0)
+	for i, revision := range revisions {
+		snapshot := snapshots[i]
 		// Only the length sequence is read: FindFile walks the file sequence and Entry.check bounds each entry
 		// against ChunkLengths.  The chunk hash sequence is read only by RetrieveFile, which history never calls.
 		manager.DownloadSnapshotSequence(snapshot, "lengths")

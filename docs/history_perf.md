@@ -4,10 +4,10 @@ Review of `duplicacy history`, in the style of `snapshot_perf.md`, `copy_perf.md
 `prune_perf.md`, `check_perf.md`, `restore_perf.md`, `backup_perf.md` and
 `init_perf.md`. This one is a code review rather than a measured investigation:
 the command is small, and every finding is the same shape as a defect that has
-already been measured and fixed elsewhere. Candidate #1 (the unread chunk-hash
-sequence) is implemented; candidate #2 (the serial revision loop) and candidate
-#3 (the existence check on an explicit `-r`) are recorded and not implemented;
-the fourth finding is rejected with the chunk index.
+already been measured and fixed elsewhere. Candidates #1 (the unread chunk-hash
+sequence) and #2 (the serial revision loop) are implemented; candidate #3 (the
+existence check on an explicit `-r`) is recorded and not implemented; the fourth
+finding is rejected with the chunk index.
 
 ## Summary
 
@@ -25,7 +25,7 @@ the file sequence to find the entry. Four properties cost it work:
    revision. **Implemented**;
 2. the loop is serial and the operator is created with one thread (candidate #2)
    — the fix #4 shape that `check`, `restore`, `prune` and `backup` all adopted
-   after `list`; `history` is the last revision loop without it;
+   after `list`; `history` was the last revision loop without it. **Implemented**;
 3. an explicit `-r` pays the per-revision existence check (candidate #3) — the
    fix #3 shape, though here it is weaker because the revision list came from the
    user rather than from a directory listing;
@@ -36,36 +36,42 @@ the file sequence to find the entry. Four properties cost it work:
 Candidate #1 was worth fixing because the same bytes were read for nothing, the
 grounds on which fix #8 was made for `list -files`; `history` scales with the
 number of revisions, so the doubled metadata read was paid once per revision.
-Candidates #2 and #3 are recorded and not implemented: #2 would have to add a
-`-threads` flag, and #3 is not a pure deletion, as its section sets out.
+Candidate #2 was fixed on the same grounds as the parallel `list` and `check`:
+the reads did not overlap however many threads were asked for, and the command
+now takes `-threads` for the same reason they do. Candidate #3 is recorded and
+not implemented, because it is not a pure deletion: skipping the existence check
+turns a missing revision into a parse error.
 
 ## The call path
 
-`showHistory` (`duplicacy/duplicacy_main.go:1125`) parses the flags, creates the
-storage with one thread (`:1140`; the command has no `-threads` flag), and calls
-`BackupManager.SnapshotManager.ShowHistory` (`:1163`).
+`showHistory` (`duplicacy/duplicacy_main.go:1125`) creates the storage with the
+`-threads` count (`:1140`) and calls
+`BackupManager.SnapshotManager.ShowHistory` (`:1163`), passing that count.
 
 `ShowHistory` (`src/duplicacy_snapshotmanager.go:2091`) then does:
 
 ```go
-manager.CreateChunkOperator(false, false, 1, false)                 // :2097  one thread
+manager.CreateChunkOperator(false, false, threads, false)           // :2100  -threads
 defer manager.stopChunkOperator()
 
 if len(revisions) == 0 {
-    revisions, err = manager.ListSnapshotRevisions(snapshotID)      // :2104
-    listed = true                                                    // :2108
+    revisions, err = manager.ListSnapshotRevisions(snapshotID)      // :2107
+    listed = true                                                    // :2112
 }
-sort.Ints(revisions)                                                 // :2113
 
-for _, revision := range revisions {
-    snapshot := manager.downloadSnapshot(snapshotID, revision, listed, manager.fileChunk, 0) // :2115
-    manager.DownloadSnapshotSequence(snapshot, "lengths")           // :2118  lengths only
-    file := manager.FindFile(snapshot, filePath, true)              // :2119
+snapshots := manager.downloadSnapshots(snapshotID, revisions, listed, threads)  // :2117
+
+var lastVersion *Entry
+sort.Ints(revisions)                                                 // :2120
+for i, revision := range revisions {                                 // :2121
+    snapshot := snapshots[i]
+    manager.DownloadSnapshotSequence(snapshot, "lengths")           // :2125  lengths only
+    file := manager.FindFile(snapshot, filePath, true)              // :2126
     ... print file.Hash / file.Size ...
 }
 
-stat, err := os.Stat(joinPath(top, filePath))                        // :2137  local
-... if showLocalHash { manager.config.ComputeFileHash(...) }         // :2145  local
+stat, err := os.Stat(joinPath(top, filePath))                        // :2146  local
+... if showLocalHash { manager.config.ComputeFileHash(...) }         // :2154  local
 ```
 
 `downloadSnapshot` (`:248`) checks the snapshot file exists with `GetFileInfo`
@@ -108,23 +114,31 @@ are fetched once each and the printed revision line still carries the entry's
 hash and size. Removing the change fails it with "Expecting the file and length
 sequences to be fetched once each, got 3 fetches".
 
-## The revision loop is serial and the operator is one-threaded — candidate #2
+## The revision loop is serial and the operator is one-threaded — candidate #2 — **Implemented**
 
-There is no `-threads` flag on the command (`duplicacy/duplicacy_main.go:1855`),
-so a fix starts with adding one; the storage is created with one thread
-(`:1140`) and the manager's operator is created with one (`:2097`). `ShowHistory`
-calls `downloadSnapshot` itself inside its loop (`:2115`) rather than the
+`history` had no `-threads` flag, the storage was created with one thread, and the
+manager's operator was created with one (`:2097` in the original). `ShowHistory`
+called `downloadSnapshot` itself inside its loop rather than the
 `downloadSnapshots` helper (`:880`) that `ListSnapshots` uses for the same
 revision-list shape.
 
-Each iteration is therefore: the snapshot file download, then the length sequence
-chunk set, then the file-sequence walk, all on one thread. Against cloud storage
-each metadata chunk is a round trip; on a slow mount each is syscalls. The
-parallel-`list` fix (#4) exists for exactly this loop shape, and `check`,
-`restore`, `prune` and `backup` have since adopted it. `downloadSnapshots`
-already takes the `threads` argument, so overlapping the snapshot files is
-reusing the helper; the sequence expansion would follow the same move `restore`
-made, creating the operator with the thread count before expanding.
+Each iteration was therefore: the snapshot file download, then the length
+sequence chunk set, then the file-sequence walk, all on one thread. Against cloud
+storage each metadata chunk is a round trip; on a slow mount each is syscalls.
+The parallel-`list` fix (#4) exists for exactly this loop shape, and `check`,
+`restore`, `prune` and `backup` have since adopted it — `history` was the last
+revision loop without it.
+
+**Implemented**: the command gained a `-threads` flag
+(`duplicacy/duplicacy_main.go:1876`), `showHistory` creates the storage with it
+(`:1140`) and passes it to `ShowHistory`, whose signature now takes it
+(`src/duplicacy_snapshotmanager.go:2095`). The snapshot files are read through
+`downloadSnapshots(snapshotID, revisions, listed, threads)` (`:2117`), which
+already spreads the workers over the thread indexes the storage was created with,
+and the operator is created with the same count (`:2100`) so the length-sequence
+expansions overlap too. The expansions and the printing stay in revision order,
+so the output is unchanged; a single-threaded call is the plain loop it was
+before.
 
 The value only shows where a metadata read is a round trip or a slow syscall, on
 a repository with many revisions. On a local ext4 fixture `prune_perf.md`
@@ -132,10 +146,18 @@ measured `history` at 0.01-0.03 s and flat between builds because the whole
 repository's sequences are a handful of chunks; that is the fixture, not the
 shape.
 
+`TestShowHistoryReadsRevisionsConcurrently`
+(`src/duplicacy_snapshotmanager_test.go`) pins it: with four threads the snapshot
+reads must overlap and stay within the four thread indexes the storage was
+created with, and the printed lines must be identical to the single-threaded run.
+Reverting the `downloadSnapshots` call to one thread fails it with "With 4
+threads: the revisions were not read concurrently, at most 1 was in flight at a
+time".
+
 ## Explicit `-r` pays the existence check — candidate #3
 
-`ShowHistory` passes `listed` to `downloadSnapshot` (`:2115`), and `listed` is
-true only when `ShowHistory` listed the revisions itself (`:2108`). With `-r`,
+`ShowHistory` passes `listed` through to `downloadSnapshot`, and `listed` is true
+only when `ShowHistory` listed the revisions itself (`:2112`). With `-r`,
 `listed` is false, so `downloadSnapshot` runs `GetFileInfo` (`:253-265`) before
 `downloadFile` (`:267`): an extra round trip per revision that `list -r` and
 `check -r` no longer pay, because their revisions came from a directory listing
@@ -165,8 +187,8 @@ format, so it is rejected here as it is in `snapshot_perf.md` (candidate #7),
 
 ### Smaller items
 
-- **The local work is the expected local work.** `os.Stat` (`:2137`) and, under
-  `-hash`, `ComputeFileHash` (`:2145`) are the command's local reads. The stat is
+- **The local work is the expected local work.** `os.Stat` (`:2146`) and, under
+  `-hash`, `ComputeFileHash` (`:2154`) are the command's local reads. The stat is
   one call per run, not per revision.
 - **The chunk-cache `fsync` is already handled.** Each sequence chunk a revision
   expands went through `DownloadSequence` and the snapshot cache, which used to
@@ -175,7 +197,7 @@ format, so it is rejected here as it is in `snapshot_perf.md` (candidate #7),
   `history` already benefits without a change of its own.
 - **The one-thread `CreateChunkOperator` is load-bearing.** It must exist for
   `FindFile`'s `ListRemoteFiles` to have a non-nil operator, the same reason
-  recorded in `backup_perf.md`. Candidate #2 is about the count, not the call.
+  recorded in `backup_perf.md`. Candidate #2 was about the count, not the call.
 - **`-hash` hashes the current file, not the revisions.** The per-revision loop
   reads only snapshot metadata, so the flag's cost is one local file hash at the
   end and is what the flag promises.
@@ -191,15 +213,15 @@ format, so it is rejected here as it is in `snapshot_perf.md` (candidate #7),
 - `duplicacy -d history <file>` sets DEBUG logging (`duplicacy/duplicacy_main.go:142-148`);
   `-v` sets TRACE. `SNAPSHOT_LIST_REVISIONS` and `DOWNLOAD_FILE` mark the
   per-revision downloads; timing the gap between consecutive `SNAPSHOT_HISTORY`
-  lines gives the per-revision cost, and the two sequences vs one shows up as
-  `DOWNLOAD_FILE` count.
+  lines gives the per-revision cost, and the `DOWNLOAD_FILE` count per revision
+  shows how many sequences it reads.
 - Candidate #1: count the metadata chunks fetched under `chunks/` for
   `history -r 1-50` before and after replacing the sequence call; the expected
   drop is one chunk set per revision, the same 2-to-1 change `snapshot_perf.md`
   records for `list -files`.
-- Candidate #2: compare `history` on a storage where a metadata read is a round
-  trip. It has no `-threads` flag to vary, so the check is the elapsed time
-  against a build that overlaps the loop.
+- Candidate #2: compare `history -threads 1` with `history -threads 8` on a
+  storage where a metadata read is a round trip; the output is independent of the
+  thread count, so the two runs can be diffed directly, as with `list -threads`.
 - Sum the syscalls with the `strace` recipe in `docs/README.md`. On a local
   fixture the storage `openat` count under `chunks/` is the metadata chunks read
   — one unread set per revision is the candidate #1 signature; the

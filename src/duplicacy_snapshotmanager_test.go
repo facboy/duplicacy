@@ -1650,7 +1650,7 @@ func TestShowHistoryFetchesOnlyTheLengthSequence(t *testing.T) {
 
 	counting.resetDownloadStats()
 
-	if !snapshotManager.ShowHistory(testDir, "vm1@host1", []int{1}, "file1", false) {
+	if !snapshotManager.ShowHistory(testDir, "vm1@host1", []int{1}, "file1", false, 1) {
 		t.Errorf("Showing the history of the snapshot failed: %v", capture.failures())
 		return
 	}
@@ -1679,6 +1679,84 @@ func TestShowHistoryFetchesOnlyTheLengthSequence(t *testing.T) {
 	lines := capture.messages("SNAPSHOT_HISTORY")
 	if len(lines) != 2 || lines[0] != expected || lines[1] != "current:" {
 		t.Errorf("Expecting the revision line %q and an empty current line, got %v", expected, lines)
+	}
+}
+
+// 'history' read the snapshot of every requested revision one at a time however many threads were asked for.  The
+// snapshot files and the length sequences are independent per revision, so with more than one thread the reads must
+// overlap; the printed lines must stay in revision order and be identical to the single-threaded run.
+func TestShowHistoryReadsRevisionsConcurrently(t *testing.T) {
+
+	setTestingT(t)
+
+	defer recovering(t)
+
+	testDir := path.Join(os.TempDir(), "duplicacy_test", "snapshot_test")
+
+	snapshotManager := createTestSnapshotManager(testDir)
+
+	// History creates its storage with the number of threads it was given, so the storage under test is created the
+	// same way, with four threads.
+	threadedStorage, err := CreateFileStorage(testDir, false, 4)
+	if err != nil {
+		t.Errorf("Failed to create the storage: %v", err)
+		return
+	}
+	counting := &instrumentedStorage{FileStorage: threadedStorage, downloadDelay: time.Millisecond}
+	snapshotManager.storage = counting
+
+	now := time.Now().Unix()
+	for revision := 1; revision <= 8; revision++ {
+		createTestSnapshotWithFiles(snapshotManager, "vm1@host1", revision, now-int64(revision)*3600, now,
+			[]string{"file1"}, []int64{9}, "tag")
+	}
+
+	savedLogFunction := LogFunction
+	defer func() {
+		LogFunction = savedLogFunction
+	}()
+
+	var singleThreadedLines []string
+
+	for _, threads := range []int{1, 4} {
+		capture := &logCapture{}
+		LogFunction = capture.log
+		counting.resetDownloadStats()
+
+		if !snapshotManager.ShowHistory(testDir, "vm1@host1", nil, "file1", false, threads) {
+			t.Errorf("With %d threads: showing the history failed: %v", threads, capture.failures())
+			continue
+		}
+
+		lines := capture.messages("SNAPSHOT_HISTORY")
+		if len(lines) != 9 {
+			t.Errorf("With %d threads: expecting 8 revision lines and the current line, got %d", threads, len(lines))
+		}
+
+		if threads == 1 {
+			singleThreadedLines = lines
+			// A serial loop never has two downloads in flight at the same time.
+			if peak := counting.peakConcurrentDownloads(); peak != 1 {
+				t.Errorf("With 1 thread: expecting at most one download at a time, got %d", peak)
+			}
+		} else {
+			// A serial loop never has two revisions in flight at the same time.
+			if peak := counting.peakConcurrentDownloads(); peak < 2 {
+				t.Errorf("With %d threads: the revisions were not read concurrently, at most %d was in flight at a time",
+					threads, peak)
+			}
+
+			// The workers must stay within the thread indexes the storage was told to expect, since some backends
+			// index a per-thread client or nested directory with the thread index.
+			if usedThreads := counting.numberOfDownloadThreads(); usedThreads > threads {
+				t.Errorf("With %d threads: the storage saw %d different thread indexes, more than it was created with",
+					threads, usedThreads)
+			}
+
+			if fmt.Sprintf("%v", lines) != fmt.Sprintf("%v", singleThreadedLines) {
+				t.Errorf("The printed history depends on the thread count: %v vs %v", lines, singleThreadedLines)
+			}
+		}
 	}
 }
 
