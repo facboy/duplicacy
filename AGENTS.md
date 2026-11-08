@@ -86,23 +86,21 @@ everything under `$HOME/DUPLICACY_TEST_ZONE` (deleted/recreated by the
 There is no CI (`.github/` only contains the issue template), so tests have to
 be run manually before submitting changes.
 
-`src/duplicacy_chunkmaker_test.go:65` used to expect `ChunkMaker.AddData` to
-return 2 values while the function now returns 3 (changed in the OneDrive
-cloud-file workaround commit), which made `go test ./src/` fail to compile. The
-call site has since been updated to discard the extra value; keep it that way
-rather than weakening the test.
+`ChunkMaker.AddData` returns three values; the third came in with the OneDrive
+cloud-file workaround. `src/duplicacy_chunkmaker_test.go:65` discards the extra
+one with `fileSize, _, _ := maker.AddData(...)` — keep that rather than weakening
+the test.
 
-Two unit tests also fail on an unmodified checkout, for reasons unrelated to the
-library code: `TestEntryExcludeByAttribute` expects macOS `com.apple.metadata`
-extended attributes, and `TestPersistRestore` aborts because the hard-coded
-chunk path it wants to corrupt (`unenc_storage/chunks/4d/538e...`) does not
-exist in the repository it builds. Confirm they fail the same way on a pristine
-checkout before blaming your own change.
+`TestEntryExcludeByAttribute` fails on a Linux checkout because it asserts on
+macOS `com.apple.metadata` extended attributes; that failure predates the branch
+and is not a regression. It is the only test that fails here — `TestPersistRestore`
+passes, both on a pristine `upstream/master` checkout and on the branch.
 
-Note also that `go vet` (which `go test` runs by default) reports pre-existing
-problems in `src/` — for example a non-constant format string in
-`duplicacy_backupmanager.go` and `duplicacy_snapshotmanager.go` — so
-`go test ./src/` needs `-vet=off` to reach the test binaries.
+`go vet ./src/` exits 1 on four pre-existing findings (the IPv6 address format in
+`sambastorage.go`, the discarded `context.WithTimeout` cancel in `swiftstorage.go`,
+and the two malformed `json:` struct tags in `config.go`). `go test ./src/` needs
+no `-vet=off`: its default vet subset covers those files without tripping on them,
+and the full suite passes with vet enabled.
 
 ## Code Conventions
 
@@ -127,9 +125,11 @@ problems in `src/` — for example a non-constant format string in
   `Exception` value, which is recovered at the top level (and converted into
   `t.Errorf` in tests). Return `err` values are used for recoverable cases;
   follow the surrounding style rather than introducing a new error strategy.
-- Tests call `setTestingT(t)` so log output is attached to the test, and use
-  `rand.Seed(time.Now().UnixNano())` plus `defer recover()` blocks that report
-  `Exception`s via `t.Errorf(fmt.Errorf)`.
+- Tests call `setTestingT(t)` so log output is attached to the test, seed with
+  `rand.Seed(time.Now().UnixNano())`, and register `defer recovering(t)` (or
+  `defer recoveringWithStack(t)`) from `src/duplicacy_testutils_test.go`, which
+  reports an `Exception` via `t.Errorf`. A test that asserts on the panic value
+  keeps its own `defer recover()`.
 - Version bumps are a one-line change to `app.Version` in
   `duplicacy/duplicacy_main.go`, committed as `Bump version to X.Y.Z`.
 - Do not commit build outputs (`duplicacy_main`) or the `DUPLICACY_TEST_ZONE`.
