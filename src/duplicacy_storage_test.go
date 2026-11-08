@@ -35,6 +35,7 @@ var testThreads = flag.Int("threads", 1, "number of downloading/uploading thread
 var testFixedChunkSize = flag.Bool("fixed-chunk-size", false, "fixed chunk size")
 var testRSAEncryption = flag.Bool("rsa", false, "enable RSA encryption")
 var testErasureCoding = flag.Bool("erasure-coding", false, "enable Erasure Coding")
+var testSeparateMetadata = flag.Bool("separate-metadata", false, "store metadata chunks under their own directory")
 
 func loadStorage(localStoragePath string, threads int) (Storage, error) {
 
@@ -236,7 +237,7 @@ func cleanStorage(storage Storage) {
 	}
 
 	for _, chunk := range listChunks(storage) {
-		storage.DeleteFile(0, "chunks/"+chunk)
+		storage.DeleteFile(0, chunk)
 	}
 
 	storage.DeleteFile(0, "config")
@@ -244,11 +245,13 @@ func cleanStorage(storage Storage) {
 	return
 }
 
+// listChunks returns the paths of all chunk files in the storage, including the top-level directory each of
+// them is stored under.
 func listChunks(storage Storage) (chunks []string) {
 
 	directories := make([]string, 0, 1024)
 
-	directories = append(directories, "chunks/")
+	directories = append(directories, storage.GetChunkDirectories()...)
 
 	for len(directories) > 0 {
 
@@ -265,9 +268,7 @@ func listChunks(storage Storage) (chunks []string) {
 			if len(file) > 0 && file[len(file)-1] == '/' {
 				directories = append(directories, dir+file)
 			} else {
-				chunk := dir + file
-				chunk = chunk[len("chunks/"):]
-				chunks = append(chunks, chunk)
+				chunks = append(chunks, dir+file)
 			}
 		}
 	}
@@ -277,7 +278,7 @@ func listChunks(storage Storage) (chunks []string) {
 
 func moveChunk(t *testing.T, storage Storage, chunkID string, isFossil bool, delay int) {
 
-	filePath, exist, _, err := storage.FindChunk(0, chunkID, isFossil)
+	filePath, exist, _, err := storage.FindChunk(0, chunkID, isFossil, false)
 
 	if err != nil {
 		t.Errorf("Error find chunk %s: %v", chunkID, err)
@@ -296,7 +297,7 @@ func moveChunk(t *testing.T, storage Storage, chunkID string, isFossil bool, del
 
 	time.Sleep(time.Duration(delay) * time.Second)
 
-	_, exist, _, err = storage.FindChunk(0, chunkID, isFossil)
+	_, exist, _, err = storage.FindChunk(0, chunkID, isFossil, false)
 	if err != nil {
 		t.Errorf("Error get file info for chunk %s: %v", chunkID, err)
 	}
@@ -305,7 +306,7 @@ func moveChunk(t *testing.T, storage Storage, chunkID string, isFossil bool, del
 		t.Errorf("File %s still exists after renaming", filePath)
 	}
 
-	_, exist, _, err = storage.FindChunk(0, chunkID, !isFossil)
+	_, exist, _, err = storage.FindChunk(0, chunkID, !isFossil, false)
 	if err != nil {
 		t.Errorf("Error get file info for %s: %v", to, err)
 	}
@@ -478,7 +479,7 @@ func TestStorage(t *testing.T) {
 		chunkID := hex.EncodeToString(hasher.Sum(nil))
 		chunks = append(chunks, chunkID)
 
-		filePath, exist, _, err := storage.FindChunk(0, chunkID, false)
+		filePath, exist, _, err := storage.FindChunk(0, chunkID, false, false)
 		if err != nil {
 			t.Errorf("Failed to list the chunk %s: %v", chunkID, err)
 			return
@@ -509,7 +510,7 @@ func TestStorage(t *testing.T) {
 	for _, chunkID := range chunks {
 
 		chunk.Reset(false)
-		filePath, exist, _, err := storage.FindChunk(0, chunkID, false)
+		filePath, exist, _, err := storage.FindChunk(0, chunkID, false, false)
 		if err != nil {
 			t.Errorf("Error getting file info for chunk %s: %v", chunkID, err)
 			continue
@@ -537,7 +538,7 @@ func TestStorage(t *testing.T) {
 	LOG_INFO("STORAGE_FOSSIL", "Making %s a fossil", chunks[1])
 	moveChunk(t, storage, chunks[1], false, delay)
 
-	filePath, exist, _, err := storage.FindChunk(0, chunks[1], true)
+	filePath, exist, _, err := storage.FindChunk(0, chunks[1], true, false)
 	if err != nil {
 		t.Errorf("Error getting file info for fossil %s: %v", chunks[1], err)
 	} else if !exist {
@@ -548,7 +549,7 @@ func TestStorage(t *testing.T) {
 			t.Errorf("Failed to delete file %s: %v", filePath, err)
 		} else {
 			time.Sleep(time.Duration(delay) * time.Second)
-			filePath, exist, _, err = storage.FindChunk(0, chunks[1], true)
+			filePath, exist, _, err = storage.FindChunk(0, chunks[1], true, false)
 			if err != nil {
 				t.Errorf("Error get file info for deleted fossil %s: %v", chunks[1], err)
 			} else if exist {
@@ -564,7 +565,7 @@ func TestStorage(t *testing.T) {
 
 	for _, file := range allChunks {
 
-		err = storage.DeleteFile(0, "chunks/"+file)
+		err = storage.DeleteFile(0, file)
 		if err != nil {
 			t.Errorf("Failed to delete the file %s: %v", file, err)
 			return
@@ -684,7 +685,7 @@ func newB2TestServer(files []string) *b2TestServer {
 
 	server.Server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 
-		if request.URL.Path != "/b2api/v1/b2_list_file_names" {
+		if request.URL.Path != "/b2api/v4/b2_list_file_names" {
 			http.Error(writer, "unexpected request "+request.URL.Path, http.StatusNotFound)
 			return
 		}
@@ -914,5 +915,56 @@ func TestAzureListSnapshotsListsOnlyDirectChildren(t *testing.T) {
 	sort.Strings(files)
 	if len(files) != 2 || files[0] != "1" || files[1] != "2" {
 		t.Errorf("Listing the revisions of vm1@host1 returned %v instead of revisions 1 and 2", files)
+	}
+}
+
+func TestMetadataChunkNesting(t *testing.T) {
+
+	storageDir, err := ioutil.TempDir("", "duplicacy_metadata_nesting")
+	if err != nil {
+		t.Fatalf("Failed to create a temporary directory: %v", err)
+	}
+	defer os.RemoveAll(storageDir)
+
+	storage, err := CreateFileStorage(storageDir, false, 1)
+	if err != nil {
+		t.Fatalf("Failed to create the file storage: %v", err)
+	}
+	storage.SetDefaultNestingLevels([]int{2, 3}, 2)
+	storage.separateMetadata = true
+
+	metadataID := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	legacyID := "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+	// Metadata chunks are always at level 1, regardless of the configured levels
+	filePath, exist, _, err := storage.FindChunk(0, metadataID, false, true)
+	if err != nil || exist || filePath != "metadata/01/"+metadataID[2:] {
+		t.Fatalf("Unexpected metadata chunk path %s (exist: %t, err: %v)", filePath, exist, err)
+	}
+	if err = storage.UploadFile(0, filePath, []byte("metadata")); err != nil {
+		t.Fatalf("Failed to upload the metadata chunk: %v", err)
+	}
+	if foundPath, exist, _, err := storage.FindChunk(0, metadataID, false, true); err != nil || !exist || foundPath != filePath {
+		t.Errorf("Metadata chunk not found at %s (found: %s, exist: %t, err: %v)", filePath, foundPath, exist, err)
+	}
+
+	// The fossil of a metadata chunk is at level 1 too
+	if fossilPath, _, _, err := storage.FindChunk(0, metadataID, true, true); err != nil || fossilPath != filePath+".fsl" {
+		t.Errorf("Unexpected metadata fossil path %s (err: %v)", fossilPath, err)
+	}
+
+	// File chunks still follow the configured levels
+	if chunkPath, _, _, err := storage.FindChunk(0, metadataID, false, false); err != nil || chunkPath != "chunks/01/23/"+metadataID[4:] {
+		t.Errorf("Unexpected file chunk path %s (err: %v)", chunkPath, err)
+	}
+
+	// A metadata chunk uploaded before metadata chunks were stored separately is found under 'chunks/' at
+	// the configured levels
+	legacyPath := "chunks/fe/dc/" + legacyID[4:]
+	if err = storage.UploadFile(0, legacyPath, []byte("legacy")); err != nil {
+		t.Fatalf("Failed to upload the legacy metadata chunk: %v", err)
+	}
+	if foundPath, exist, _, err := storage.FindChunk(0, legacyID, false, true); err != nil || !exist || foundPath != legacyPath {
+		t.Errorf("Legacy metadata chunk not found at %s (found: %s, exist: %t, err: %v)", legacyPath, foundPath, exist, err)
 	}
 }

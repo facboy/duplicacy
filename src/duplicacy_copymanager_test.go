@@ -151,7 +151,7 @@ func TestChunkPath(t *testing.T) {
 		}
 		storage.SetDefaultNestingLevels(c.readLevels, c.writeLevel)
 
-		chunkPath, err := storage.ChunkPath(chunkID)
+		chunkPath, err := storage.ChunkPath(chunkID, false)
 		if err != nil {
 			t.Errorf("ChunkPath failed for %s: %v", c.name, err)
 			continue
@@ -161,7 +161,7 @@ func TestChunkPath(t *testing.T) {
 		}
 
 		// The uploader relies on this path when it is told not to look the chunk up.
-		foundPath, exist, _, err := storage.FindChunk(0, chunkID, false)
+		foundPath, exist, _, err := storage.FindChunk(0, chunkID, false, false)
 		if err != nil {
 			t.Errorf("FindChunk failed for %s: %v", c.name, err)
 			continue
@@ -178,7 +178,7 @@ func TestChunkPath(t *testing.T) {
 		return
 	}
 	invalidStorage.SetDefaultNestingLevels([]int{1}, 2)
-	if _, err := invalidStorage.ChunkPath(chunkID); err == nil {
+	if _, err := invalidStorage.ChunkPath(chunkID, false); err == nil {
 		t.Errorf("ChunkPath should have rejected a write level that isn't in the read levels")
 	}
 }

@@ -241,6 +241,15 @@ func TestBackupManager(t *testing.T) {
 		}
 	}
 
+	if *testSeparateMetadata {
+		// The 'nesting' file must exist before the storage is loaded by CreateBackupManager below
+		err = storage.UploadFile(0, "nesting", []byte(`{"read-levels":[1],"write-level":1,"separate-metadata":true}`))
+		if err != nil {
+			t.Errorf("Failed to upload the nesting file: %v", err)
+			return
+		}
+	}
+
 	time.Sleep(time.Duration(delay) * time.Second)
 
 	SetDuplicacyPreferencePath(testDir + "/repository1/.duplicacy")
@@ -824,7 +833,7 @@ func TestCorruptCachedChunkIsRefetched(t *testing.T) {
 		return
 	}
 
-	cachedPath, exist, _, err := cache.FindChunk(0, chunkID, false)
+	cachedPath, exist, _, err := cache.FindChunk(0, chunkID, false, true)
 	if err != nil || !exist {
 		t.Errorf("The metadata chunk %s was not written to the cache (exist=%t, err=%v)", chunkID, exist, err)
 		return
@@ -871,7 +880,7 @@ func TestCorruptCachedChunkIsRefetched(t *testing.T) {
 		t.Errorf("The chunk %s was not recovered after its cache entry was removed", chunkID)
 		return
 	}
-	if _, exist, _, err := cache.FindChunk(0, chunkID, false); err != nil || !exist {
+	if _, exist, _, err := cache.FindChunk(0, chunkID, false, true); err != nil || !exist {
 		t.Errorf("The cache entry for the chunk %s was not rebuilt after it was removed (exist=%t, err=%v)",
 			chunkID, exist, err)
 	}

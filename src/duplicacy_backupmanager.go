@@ -196,7 +196,7 @@ func (manager *BackupManager) Backup(top string, quickMode bool, threads int, ta
 	// put them in the cache.
 	if (manager.storage.IsFastListing() && remoteSnapshot.Revision == 0) {
 		LOG_INFO("BACKUP_LIST", "Listing all chunks")
-		allChunks, _ := manager.SnapshotManager.ListAllFiles(manager.storage, "chunks/")
+		allChunks, _ := manager.SnapshotManager.ListAllFiles(manager.storage, chunkDir)
 
 		for _, chunk := range allChunks {
 			if len(chunk) == 0 || chunk[len(chunk)-1] == '/' {
@@ -627,7 +627,7 @@ func (manager *BackupManager) Backup(top string, quickMode bool, threads int, ta
 		}
 
 		skipped += " not included due to access errors"
-		LOG_WARN("BACKUP_SKIPPED", skipped)
+		LOG_WARN("BACKUP_SKIPPED", "%s", skipped)
 	}
 
 	chunkOperator.Stop()
@@ -1734,8 +1734,8 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 	}
 
 	// These two maps store hashes of chunks in the source and destination storages, respectively.  Note that
-	// the value of 'chunks' is used to indicate if the chunk is a snapshot chunk, while the value of 'otherChunks'
-	// is not used.
+	// the value of 'chunks' is used to indicate if the chunk is a snapshot chunk, while 'otherChunks' is keyed
+	// by the chunk directory followed by the chunk id and its value is not used.
 	chunks := make(map[string]bool)
 	otherChunks := make(map[string]bool)
 
@@ -1776,16 +1776,19 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 	listChunks := otherManager.storage.IsFastListing()
 
 	if !listChunks {
-		entries, _, err := otherManager.storage.ListFiles(0, "chunks/")
-		if err != nil {
-			LOG_ERROR("SNAPSHOT_COPY", "Failed to list the chunks directory of the destination storage: %v", err)
-			return false
-		}
-
 		chunkDirs := 0
-		for _, entry := range entries {
-			if strings.HasSuffix(entry, "/") {
-				chunkDirs++
+		for _, dir := range otherManager.storage.GetChunkDirectories() {
+			entries, _, err := otherManager.storage.ListFiles(0, dir)
+			if err != nil {
+				LOG_ERROR("SNAPSHOT_COPY", "Failed to list the %s directory of the destination storage: %v",
+					dir, err)
+				return false
+			}
+
+			for _, entry := range entries {
+				if strings.HasSuffix(entry, "/") {
+					chunkDirs++
+				}
 			}
 		}
 
@@ -1801,25 +1804,29 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 
 	if listChunks {
 
-		otherChunkFiles, otherChunkSizes := otherManager.SnapshotManager.ListAllFiles(otherManager.storage, "chunks/")
+		for _, dir := range otherManager.storage.GetChunkDirectories() {
+			otherChunkFiles, otherChunkSizes := otherManager.SnapshotManager.ListAllFiles(otherManager.storage, dir)
 
-		for i, otherChunkID := range otherChunkFiles {
-			otherChunkID = chunkIDFromListedPath(otherChunkID)
-			if len(otherChunkID) != 64 {
-				continue
+			for i, otherChunkID := range otherChunkFiles {
+				otherChunkID = chunkIDFromListedPath(otherChunkID)
+				if len(otherChunkID) != 64 {
+					continue
+				}
+				if otherChunkSizes[i] == 0 {
+					LOG_DEBUG("SNAPSHOT_COPY", "Chunk %s has length = 0", otherChunkID)
+					continue
+				}
+				// A chunk already stored as a file chunk at the destination can't be reused as a metadata chunk (and
+				// vice versa) when metadata chunks are stored separately, so the directory is part of the key
+				otherChunks[dir+otherChunkID] = false
 			}
-			if otherChunkSizes[i] == 0 {
-				LOG_DEBUG("SNAPSHOT_COPY", "Chunk %s has length = 0", otherChunkID)
-				continue
-			}
-			otherChunks[otherChunkID] = false
 		}
 
 		LOG_DEBUG("SNAPSHOT_COPY", "Found %d chunks on destination storage", len(otherChunks))
 
-		for chunkHash := range chunks {
+		for chunkHash, isMetadata := range chunks {
 			otherChunkID := otherManager.config.GetChunkIDFromHash(chunkHash)
-			if _, found := otherChunks[otherChunkID]; !found {
+			if _, found := otherChunks[otherManager.storage.GetChunkDirectory(isMetadata)+otherChunkID]; !found {
 				chunksToCopy = append(chunksToCopy, chunkHash)
 			}
 		}
@@ -1832,11 +1839,11 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 		// Look each chunk up here rather than in the uploader, so that a chunk the destination already holds costs
 		// one lookup instead of a lookup plus a download of bytes that are already there.  A zero-length file counts
 		// as absent, as the listing treats it.
-		for chunkHash := range chunks {
+		for chunkHash, isMetadata := range chunks {
 
 			chunkID := otherManager.config.GetChunkIDFromHash(chunkHash)
 
-			_, exist, size, err := otherManager.storage.FindChunk(0, chunkID, false)
+			_, exist, size, err := otherManager.storage.FindChunk(0, chunkID, false, isMetadata)
 			if err != nil {
 				LOG_ERROR("SNAPSHOT_COPY", "Failed to find the chunk %s at the destination storage: %v", chunkID, err)
 				return false

@@ -297,9 +297,9 @@ func (storage *instrumentedStorage) CreateDirectory(threadIndex int, dir string)
 	return storage.FileStorage.CreateDirectory(threadIndex, dir)
 }
 
-func (storage *instrumentedStorage) FindChunk(threadIndex int, chunkID string, isFossil bool) (filePath string, exist bool, size int64, err error) {
+func (storage *instrumentedStorage) FindChunk(threadIndex int, chunkID string, isFossil bool, isMetadata bool) (filePath string, exist bool, size int64, err error) {
 	atomic.AddInt64(&storage.findChunkCalls, 1)
-	return storage.FileStorage.FindChunk(threadIndex, chunkID, isFossil)
+	return storage.FileStorage.FindChunk(threadIndex, chunkID, isFossil, isMetadata)
 }
 
 func (storage *instrumentedStorage) ListFiles(threadIndex int, dir string) (files []string, sizes []int64, err error) {

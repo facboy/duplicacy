@@ -29,7 +29,6 @@ import (
 
 const (
 	secondsInDay = 86400
-	chunkDir     = "chunks/"
 )
 
 // snapshotDir returns the storage directory holding every revision of one snapshot id, with the trailing slash the
@@ -591,8 +590,8 @@ func (manager *SnapshotManager) CleanSnapshotCache(latestSnapshot *Snapshot, all
 		for _, chunkHash := range cachedSnapshot.ChunkSequence {
 			chunkID := manager.config.GetChunkIDFromHash(chunkHash)
 
-			if _, exist, _, _ := manager.snapshotCache.FindChunk(0, chunkID, false); !exist {
-				if _, exist, _, _ = manager.storage.FindChunk(0, chunkID, false); !exist {
+			if _, exist, _, _ := manager.snapshotCache.FindChunk(0, chunkID, false, true); !exist {
+				if _, exist, _, _ = manager.storage.FindChunk(0, chunkID, false, true); !exist {
 					isComplete = false
 					break
 				}
@@ -738,19 +737,21 @@ func (manager *SnapshotManager) ListAllFiles(storage Storage, top string) (allFi
 	return allFiles, allSizes
 }
 
-// countChunkDirectories returns the number of directories directly under 'chunks/', which is the number of listing
-// calls the whole-tree walk in ListAllFiles costs.  A failure counts as zero, which sends the caller to the walk, the
-// choice that also holds the size-of-0 check over the whole tree.
+// countChunkDirectories returns the number of directories directly under the chunk directories, which is the number
+// of listing calls the whole-tree walk in ListAllFiles costs.  A failure counts as zero, which sends the caller to the
+// walk, the choice that also holds the size-of-0 check over the whole tree.
 func (manager *SnapshotManager) countChunkDirectories() int {
-	entries, _, err := manager.storage.ListFiles(0, chunkDir)
-	if err != nil {
-		LOG_DEBUG("SNAPSHOT_CHECK", "Failed to list the chunk directory: %v", err)
-		return 0
-	}
 	directories := 0
-	for _, entry := range entries {
-		if strings.HasSuffix(entry, "/") {
-			directories++
+	for _, dir := range manager.storage.GetChunkDirectories() {
+		entries, _, err := manager.storage.ListFiles(0, dir)
+		if err != nil {
+			LOG_DEBUG("SNAPSHOT_CHECK", "Failed to list the chunk directory: %v", err)
+			return 0
+		}
+		for _, entry := range entries {
+			if strings.HasSuffix(entry, "/") {
+				directories++
+			}
 		}
 	}
 	return directories
@@ -771,7 +772,7 @@ func (manager *SnapshotManager) probeChunks(chunkIDs map[string]bool, chunkSizeM
 	exists := make([]bool, len(ids))
 
 	runConcurrently(threads, len(ids), func(threadIndex, index int) {
-		_, exist, size, err := manager.storage.FindChunk(threadIndex, ids[index], false)
+		_, exist, size, err := manager.storage.FindChunk(threadIndex, ids[index], false, chunkIDs[ids[index]])
 		if err != nil {
 			LOG_WARN("SNAPSHOT_VALIDATE", "Failed to check the existence of chunk %s: %v", ids[index], err)
 			return
@@ -794,28 +795,35 @@ func (manager *SnapshotManager) probeChunks(chunkIDs map[string]bool, chunkSizeM
 	return emptyChunks
 }
 
-// referencedChunkIDs returns every chunk id the given snapshots refer to, expanding the chunk sequences as needed.  The
-// expansions are kept in the snapshots (GetSnapshotChunks is called with keepChunkHashes set), so the verification
-// phase that follows reads the hashes the expansion already produced instead of fetching the sequences again.
+// referencedChunkIDs returns every chunk id the given snapshots refer to, mapped to whether it is a metadata chunk,
+// expanding the chunk sequences as needed.  The expansions are kept in the snapshots (GetSnapshotChunks is called
+// with keepChunkHashes set), so the verification phase that follows reads the hashes the expansion already produced
+// instead of fetching the sequences again.
 func (manager *SnapshotManager) referencedChunkIDs(snapshotMap map[string][]*Snapshot) map[string]bool {
 	ids := make(map[string]bool)
 	for _, snapshots := range snapshotMap {
 		for _, snapshot := range snapshots {
-			for _, chunkID := range manager.GetSnapshotChunks(snapshot, true) {
-				ids[chunkID] = true
-			}
+			manager.VisitSnapshotChunks(snapshot, true, func(chunkHash string, isMetadata bool) {
+				chunkID := manager.config.GetChunkIDFromHash(chunkHash)
+				// Metadata chunks are visited first, so a chunk that is referenced as both is a metadata chunk
+				if _, found := ids[chunkID]; !found {
+					ids[chunkID] = isMetadata
+				}
+			})
 		}
 	}
 	return ids
 }
 
-// GetSnapshotChunks returns all chunks referenced by a given snapshot. If
-// keepChunkHashes is true, snapshot.ChunkHashes will be populated.
-func (manager *SnapshotManager) GetSnapshotChunks(snapshot *Snapshot, keepChunkHashes bool) (chunks []string) {
+// VisitSnapshotChunks calls 'visit' for every chunk referenced by the given snapshot, passing the chunk hash
+// and a flag indicating whether the chunk is a metadata chunk.  The chunks storing the file list, the chunk
+// sequence, and the length sequence are metadata chunks, while the chunks referenced by the chunk sequence
+// are file chunks.  If 'keepChunkHashes' is true, snapshot.ChunkHashes will be populated on return.
+func (manager *SnapshotManager) VisitSnapshotChunks(snapshot *Snapshot, keepChunkHashes bool, visit func(chunkHash string, isMetadata bool)) bool {
 
 	for _, sequence := range snapshot.MetadataSequences() {
 		for _, chunkHash := range sequence {
-			chunks = append(chunks, manager.config.GetChunkIDFromHash(chunkHash))
+			visit(chunkHash, true)
 		}
 	}
 
@@ -826,52 +834,70 @@ func (manager *SnapshotManager) GetSnapshotChunks(snapshot *Snapshot, keepChunkH
 		if err != nil {
 			LOG_ERROR("SNAPSHOT_CHUNK", "Failed to load chunks for snapshot %s at revision %d: %v",
 				snapshot.ID, snapshot.Revision, err)
-			return nil
+			return false
 		}
 	}
 
 	for _, chunkHash := range snapshot.ChunkHashes {
-		chunks = append(chunks, manager.config.GetChunkIDFromHash(chunkHash))
+		visit(chunkHash, false)
 	}
 
 	if !keepChunkHashes {
 		snapshot.ClearChunks()
 	}
 
+	return true
+}
+
+// GetSnapshotChunks returns all chunks referenced by a given snapshot. If
+// keepChunkHashes is true, snapshot.ChunkHashes will be populated.
+func (manager *SnapshotManager) GetSnapshotChunks(snapshot *Snapshot, keepChunkHashes bool) (chunks []string) {
+
+	completed := manager.VisitSnapshotChunks(snapshot, keepChunkHashes, func(chunkHash string, isMetadata bool) {
+		chunks = append(chunks, manager.config.GetChunkIDFromHash(chunkHash))
+	})
+
+	if !completed {
+		return nil
+	}
+
 	return chunks
 }
 
-// GetSnapshotChunkHashes has an option to retrieve chunk hashes in addition to chunk ids.
+// GetSnapshotChunkMap returns all chunks referenced by a given snapshot as a map from the chunk id to a flag
+// indicating whether the chunk is a metadata chunk.  If keepChunkHashes is true, snapshot.ChunkHashes will be
+// populated.
+func (manager *SnapshotManager) GetSnapshotChunkMap(snapshot *Snapshot, keepChunkHashes bool) (chunks map[string]bool) {
+
+	chunks = make(map[string]bool)
+
+	manager.VisitSnapshotChunks(snapshot, keepChunkHashes, func(chunkHash string, isMetadata bool) {
+		chunkID := manager.config.GetChunkIDFromHash(chunkHash)
+		// Metadata chunks are visited first, so a chunk that is referenced as both is treated as a metadata chunk
+		if _, found := chunks[chunkID]; !found {
+			chunks[chunkID] = isMetadata
+		}
+	})
+
+	return chunks
+}
+
+// GetSnapshotChunkHashes has an option to retrieve chunk hashes in addition to chunk ids.  The values stored
+// in 'chunkHashes' and 'chunkIDs' indicate whether the chunk is a metadata chunk.
 func (manager *SnapshotManager) GetSnapshotChunkHashes(snapshot *Snapshot, chunkHashes *map[string]bool, chunkIDs map[string]bool) {
 
-	for _, sequence := range snapshot.MetadataSequences() {
-		for _, chunkHash := range sequence {
-			if chunkHashes != nil {
-				(*chunkHashes)[chunkHash] = true
-			}
-			chunkIDs[manager.config.GetChunkIDFromHash(chunkHash)] = true
-		}
-	}
-
-	if len(snapshot.ChunkHashes) == 0 {
-
-		description := manager.DownloadSequence(snapshot.ChunkSequence)
-		err := snapshot.LoadChunks(description)
-		if err != nil {
-			LOG_ERROR("SNAPSHOT_CHUNK", "Failed to load chunks for snapshot %s at revision %d: %v",
-				snapshot.ID, snapshot.Revision, err)
-			return
-		}
-	}
-
-	for _, chunkHash := range snapshot.ChunkHashes {
+	manager.VisitSnapshotChunks(snapshot, false, func(chunkHash string, isMetadata bool) {
 		if chunkHashes != nil {
-			(*chunkHashes)[chunkHash] = true
+			if _, found := (*chunkHashes)[chunkHash]; !found {
+				(*chunkHashes)[chunkHash] = isMetadata
+			}
 		}
-		chunkIDs[manager.config.GetChunkIDFromHash(chunkHash)] = true
-	}
-
-	snapshot.ClearChunks()
+		chunkID := manager.config.GetChunkIDFromHash(chunkHash)
+		// Metadata chunks are visited first, so a chunk that is referenced as both is treated as a metadata chunk
+		if _, found := chunkIDs[chunkID]; !found {
+			chunkIDs[chunkID] = isMetadata
+		}
+	})
 }
 
 // downloadSnapshots downloads the snapshot files for 'revisions' using up to 'threads' concurrent workers and returns
@@ -1112,23 +1138,25 @@ func (manager *SnapshotManager) CheckSnapshots(snapshotID string, revisionsToChe
 
 	if listChunks {
 		LOG_INFO("SNAPSHOT_CHECK", "Listing all chunks")
-		allChunks, allSizes := manager.ListAllFiles(manager.storage, chunkDir)
+		for _, dir := range manager.storage.GetChunkDirectories() {
+			allChunks, allSizes := manager.ListAllFiles(manager.storage, dir)
 
-		for i, chunk := range allChunks {
-			if len(chunk) == 0 || chunk[len(chunk)-1] == '/' {
-				continue
-			}
+			for i, chunk := range allChunks {
+				if len(chunk) == 0 || chunk[len(chunk)-1] == '/' {
+					continue
+				}
 
-			if strings.HasSuffix(chunk, ".fsl") {
-				continue
-			}
+				if strings.HasSuffix(chunk, ".fsl") {
+					continue
+				}
 
-			chunk = chunkIDFromListedPath(chunk)
-			chunkSizeMap[chunk] = allSizes[i]
+				chunk = chunkIDFromListedPath(chunk)
+				chunkSizeMap[chunk] = allSizes[i]
 
-			if allSizes[i] == 0 && !strings.HasSuffix(chunk, ".tmp") {
-				LOG_WARN("SNAPSHOT_CHECK", "Chunk %s has a size of 0", chunk)
-				emptyChunks++
+				if allSizes[i] == 0 && !strings.HasSuffix(chunk, ".tmp") {
+					LOG_WARN("SNAPSHOT_CHECK", "Chunk %s has a size of 0", chunk)
+					emptyChunks++
+				}
 			}
 		}
 	} else {
@@ -1174,7 +1202,7 @@ func (manager *SnapshotManager) CheckSnapshots(snapshotID string, revisionsToChe
 			manager.GetSnapshotChunkHashes(snapshot, allChunkHashes, chunks)
 
 			missingChunks := 0
-			for chunkID := range chunks {
+			for chunkID, isMetadata := range chunks {
 
 				_, found := chunkSizeMap[chunkID]
 
@@ -1184,7 +1212,7 @@ func (manager *SnapshotManager) CheckSnapshots(snapshotID string, revisionsToChe
 					// there aren't too many missing chunks.  When the tree was not listed the lookups in
 					// probeChunks already asked for exactly this chunk, so there is nothing to confirm.
 					if listChunks && missingChunks < 100 {
-						_, exist, _, err := manager.storage.FindChunk(0, chunkID, false)
+						_, exist, _, err := manager.storage.FindChunk(0, chunkID, false, isMetadata)
 						if err != nil {
 							LOG_WARN("SNAPSHOT_VALIDATE", "Failed to check the existence of chunk %s: %v",
 								chunkID, err)
@@ -1202,7 +1230,7 @@ func (manager *SnapshotManager) CheckSnapshots(snapshotID string, revisionsToChe
 						continue
 					}
 
-					chunkPath, exist, size, err := manager.storage.FindChunk(0, chunkID, true)
+					chunkPath, exist, size, err := manager.storage.FindChunk(0, chunkID, true, isMetadata)
 					if err != nil {
 						LOG_ERROR("SNAPSHOT_VALIDATE", "Failed to check the existence of fossil %s: %v",
 							chunkID, err)
@@ -1323,9 +1351,11 @@ func (manager *SnapshotManager) CheckSnapshots(snapshotID string, revisionsToChe
 
 	startTime := time.Now()
 	var chunkHashes []string
+	// Whether the chunk at the same index in 'chunkHashes' is a metadata chunk
+	var isMetadataChunks []bool
 
 	skippedChunks := 0
-	for chunkHash := range *allChunkHashes {
+	for chunkHash, isMetadata := range *allChunkHashes {
 		if len(verifiedChunks) > 0 {
 			chunkID := manager.config.GetChunkIDFromHash(chunkHash)
 			if _, found := verifiedChunks[chunkID]; found {
@@ -1334,6 +1364,7 @@ func (manager *SnapshotManager) CheckSnapshots(snapshotID string, revisionsToChe
 			}
 		}
 		chunkHashes = append(chunkHashes, chunkHash)
+		isMetadataChunks = append(isMetadataChunks, isMetadata)
 	}
 
 	if skippedChunks > 0 {
@@ -1360,7 +1391,9 @@ func (manager *SnapshotManager) CheckSnapshots(snapshotID string, revisionsToChe
 					return
 				}
 
-				chunk := manager.chunkOperator.Download(chunkHashes[chunkIndex], chunkIndex, false)
+				// The chunk must be read from the storage rather than the snapshot cache; that is the whole
+				// point of verifying it
+				chunk := manager.chunkOperator.DownloadFromStorage(chunkHashes[chunkIndex], chunkIndex, isMetadataChunks[chunkIndex])
 				if chunk == nil {
 					continue
 				}
@@ -1541,7 +1574,7 @@ func (manager *SnapshotManager) ShowStatisticsTabular(snapshotMap map[string][]*
 			snapshotID, totalChunkCount, PrettyNumber(totalChunkSize), uniqueChunkCount, PrettyNumber(uniqueChunkSize)))
 	}
 	tableWriter.Flush()
-	LOG_INFO("SNAPSHOT_CHECK", tableBuffer.String())
+	LOG_INFO("SNAPSHOT_CHECK", "%s", tableBuffer.String())
 }
 
 // ConvertSequence converts a sequence of chunk hashes into a sequence of chunk ids.
@@ -2283,12 +2316,13 @@ func (manager *SnapshotManager) ShowHistory(top string, snapshotID string, revis
 	return true
 }
 
-// fossilizeChunk turns the chunk into a fossil.
-func (manager *SnapshotManager) fossilizeChunk(chunkID string, filePath string, exclusive bool) bool {
+// fossilizeChunk turns the chunk into a fossil.  If 'filePath' is empty the chunk is located by its id, in
+// which case 'isMetadata' tells whether to look under the metadata directory.
+func (manager *SnapshotManager) fossilizeChunk(chunkID string, filePath string, isMetadata bool, exclusive bool) bool {
 	if exclusive {
-		manager.chunkOperator.Delete(chunkID, filePath)
+		manager.chunkOperator.Delete(chunkID, filePath, isMetadata)
 	} else {
-		manager.chunkOperator.Fossilize(chunkID, filePath)
+		manager.chunkOperator.Fossilize(chunkID, filePath, isMetadata)
 	}
 
 	return true
@@ -2297,7 +2331,7 @@ func (manager *SnapshotManager) fossilizeChunk(chunkID string, filePath string, 
 
 // resurrectChunk turns the fossil back into a chunk
 func (manager *SnapshotManager) resurrectChunk(fossilPath string, chunkID string) bool {
-	chunkPath, exist, _, err := manager.storage.FindChunk(0, chunkID, false)
+	chunkPath, exist, _, err := manager.storage.FindChunk(0, chunkID, false, IsMetadataChunkPath(fossilPath))
 	if err != nil {
 		LOG_ERROR("CHUNK_FIND", "Failed to locate the path for the chunk %s: %v", chunkID, err)
 		return false
@@ -2572,7 +2606,9 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
 
 			for _, fossil := range collection.Fossils {
 
-				chunk := strings.TrimSuffix(chunkIDFromListedPath(fossil[len(chunkDir):]), ".fsl")
+				// The fossil path starts with the top-level chunk directory, which is 'chunks/' or, for a metadata
+				// chunk, 'metadata/'.
+				chunk := strings.TrimSuffix(chunkIDFromListedPath(fossil[strings.Index(fossil, "/")+1:]), ".fsl")
 
 				if _, found := newChunks[chunk]; found {
 					// The fossil is referenced so it can't be deleted.
@@ -2588,7 +2624,7 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
 					if dryRun {
 						LOG_INFO("FOSSIL_DELETE", "The chunk %s would be permanently removed", chunk)
 					} else {
-						manager.chunkOperator.Delete(chunk, fossil)
+						manager.chunkOperator.Delete(chunk, fossil, IsMetadataChunkPath(fossil))
 						fmt.Fprintf(logFile, "Deleted fossil %s (collection %s)\n", chunk, collectionName)
 					}
 				}
@@ -2600,7 +2636,7 @@ func (manager *SnapshotManager) PruneSnapshots(selfID string, snapshotID string,
 					LOG_INFO("TEMPORARY_DELETE", "The temporary file %s would be deleted", temporary)
 				} else {
 					// Fail silently, since temporary files are supposed to be renamed or deleted after upload is done
-					manager.chunkOperator.Delete("", temporary)
+					manager.chunkOperator.Delete("", temporary, false)
 					fmt.Fprintf(logFile, "Deleted temporary %s (collection %s)\n", temporary, collectionName)
 				}
 			}
@@ -2975,6 +3011,18 @@ func (manager *SnapshotManager) pruneSnapshotsNonExhaustive(allSnapshots map[str
 		}
 	}
 
+	// The metadata chunks of the snapshots to be deleted, so that an unreferenced chunk is fossilized in the directory
+	// it is stored in.  This reads only the sequences already in memory: every chunk the expansion below produces is a
+	// file chunk.
+	metadataChunks := make(map[string]bool)
+	for _, snapshot := range deletedSnapshots {
+		for _, sequence := range snapshot.MetadataSequences() {
+			for _, chunkHash := range sequence {
+				metadataChunks[manager.config.GetChunkIDFromHash(chunkHash)] = true
+			}
+		}
+	}
+
 	// Now build all chunks referened by snapshot not deleted.  The sequences of the snapshots are independent, so they
 	// are expanded concurrently; the merge is done here, in the calling goroutine, so that 'targetChunks' is still
 	// written by a single goroutine regardless of the thread count.
@@ -3003,7 +3051,7 @@ func (manager *SnapshotManager) pruneSnapshotsNonExhaustive(allSnapshots map[str
 			continue
 		}
 
-		manager.fossilizeChunk(chunk, "", exclusive)
+		manager.fossilizeChunk(chunk, "", metadataChunks[chunk], exclusive)
 		if exclusive {
 			fmt.Fprintf(logFile, "Deleted chunk %s (exclusive mode)\n", chunk)
 		} else {
@@ -3052,110 +3100,117 @@ func (manager *SnapshotManager) pruneSnapshotsExhaustive(referencedFossils map[s
 	// this goroutine, so 'referencedChunks' is still written by a single goroutine.
 	for _, chunks := range manager.expandSnapshots(keptSnapshots, threads) {
 		for _, chunk := range chunks {
-			// The initial value is 'false'.  When a referenced chunk is found it will change the value to 'true'.
 			referencedChunks[chunk] = false
 		}
 	}
 
-	allFiles, _ := manager.ListAllFiles(manager.storage, chunkDir)
-	uniqueFiles := make(map[string]bool)
-	for _, file := range allFiles {
-		if _, found := uniqueFiles[file]; found {
-			continue
-		}
-		uniqueFiles[file] = true
+	for _, dir := range manager.storage.GetChunkDirectories() {
 
-		if len(file) == 0 || file[len(file)-1] == '/' {
-			continue
-		}
+		isMetadata := dir == metadataDir
 
-		if strings.HasSuffix(file, ".tmp") {
-			// This is a temporary chunk file.  It can be a result of a restore operation still in progress, or
-			// a left-over from a restore operation that was terminated abruptly.
-			if dryRun {
-				LOG_INFO("CHUNK_TEMPORARY", "Found temporary file %s", file)
+		// Chunks that have been found in this directory; a chunk found twice means one copy is redundant.  Note
+		// that a chunk existing in both the chunk and the metadata directory isn't redundant.
+		foundChunks := make(map[string]bool)
+
+		allFiles, _ := manager.ListAllFiles(manager.storage, dir)
+		uniqueFiles := make(map[string]bool)
+		for _, file := range allFiles {
+			if _, found := uniqueFiles[file]; found {
+				continue
+			}
+			uniqueFiles[file] = true
+
+			if len(file) == 0 || file[len(file)-1] == '/' {
 				continue
 			}
 
-			if exclusive {
-				// In exclusive mode, we assume no other restore operation is running concurrently.
-				manager.chunkOperator.Delete("", chunkDir+file)
-				fmt.Fprintf(logFile, "Deleted temporary %s\n", file)
-			} else {
-				collection.AddTemporary(file)
-			}
-			continue
-		} else if strings.HasSuffix(file, ".fsl") {
-			// This is a fossil.  If it is unreferenced, it can be a result of failing to save the fossil
-			// collection file after making it a fossil.
-			if _, found := referencedFossils[file]; !found {
-
-				chunk := strings.TrimSuffix(chunkIDFromListedPath(file), ".fsl")
-
-				if _, found := referencedChunks[chunk]; found {
-
-					if dryRun {
-						LOG_INFO("FOSSIL_REFERENCED", "Found referenced fossil %s", file)
-						continue
-					}
-
-					manager.chunkOperator.Resurrect(chunk, chunkDir+file)
-					fmt.Fprintf(logFile, "Found referenced fossil %s\n", file)
-
-				} else {
-
-					if dryRun {
-						LOG_INFO("FOSSIL_UNREFERENCED", "Found unreferenced fossil %s", file)
-						continue
-					}
-
-					if exclusive {
-						manager.chunkOperator.Delete(chunk, chunkDir+file)
-					} else {
-						collection.AddFossil(chunkDir + file)
-						LOG_DEBUG("FOSSIL_FIND", "Found unreferenced fossil %s", file)
-					}
-					fmt.Fprintf(logFile, "Found unreferenced fossil %s\n", file)
+			if strings.HasSuffix(file, ".tmp") {
+				// This is a temporary chunk file.  It can be a result of a restore operation still in progress, or
+				// a left-over from a restore operation that was terminated abruptly.
+				if dryRun {
+					LOG_INFO("CHUNK_TEMPORARY", "Found temporary file %s", dir+file)
+					continue
 				}
-			}
 
-			continue
-		}
+				if exclusive {
+					// In exclusive mode, we assume no other restore operation is running concurrently.
+					manager.chunkOperator.Delete("", dir+file, isMetadata)
+					fmt.Fprintf(logFile, "Deleted temporary %s\n", dir+file)
+				} else {
+					collection.AddTemporary(dir + file)
+				}
+				continue
+			} else if strings.HasSuffix(file, ".fsl") {
+				// This is a fossil.  If it is unreferenced, it can be a result of failing to save the fossil
+				// collection file after making it a fossil.
+				if _, found := referencedFossils[dir+file]; !found {
 
-		chunk := chunkIDFromListedPath(file)
+					chunk := strings.TrimSuffix(chunkIDFromListedPath(file), ".fsl")
 
-		if !chunkRegex.MatchString(chunk) {
-			LOG_WARN("CHUNK_UNKNOWN_FILE", "File %s is not a chunk", file)
-			continue
-		}
+					if _, found := referencedChunks[chunk]; found {
 
-		if value, found := referencedChunks[chunk]; !found {
-			if dryRun {
-				LOG_INFO("CHUNK_UNREFERENCED", "Found unreferenced chunk %s", chunk)
+						if dryRun {
+							LOG_INFO("FOSSIL_REFERENCED", "Found referenced fossil %s", dir+file)
+							continue
+						}
+
+						manager.chunkOperator.Resurrect(chunk, dir+file)
+						fmt.Fprintf(logFile, "Found referenced fossil %s\n", dir+file)
+
+					} else {
+
+						if dryRun {
+							LOG_INFO("FOSSIL_UNREFERENCED", "Found unreferenced fossil %s", dir+file)
+							continue
+						}
+
+						if exclusive {
+							manager.chunkOperator.Delete(chunk, dir+file, isMetadata)
+						} else {
+							collection.AddFossil(dir + file)
+							LOG_DEBUG("FOSSIL_FIND", "Found unreferenced fossil %s", dir+file)
+						}
+						fmt.Fprintf(logFile, "Found unreferenced fossil %s\n", dir+file)
+					}
+				}
+
 				continue
 			}
 
-			manager.fossilizeChunk(chunk, chunkDir+file, exclusive)
-			if exclusive {
-				fmt.Fprintf(logFile, "Deleted chunk %s (exclusive mode)\n", chunk)
+			chunk := chunkIDFromListedPath(file)
+
+			if !chunkRegex.MatchString(chunk) {
+				LOG_WARN("CHUNK_UNKNOWN_FILE", "File %s is not a chunk", dir+file)
+				continue
+			}
+
+			if _, found := referencedChunks[chunk]; !found {
+				if dryRun {
+					LOG_INFO("CHUNK_UNREFERENCED", "Found unreferenced chunk %s", chunk)
+					continue
+				}
+
+				manager.fossilizeChunk(chunk, dir+file, isMetadata, exclusive)
+				if exclusive {
+					fmt.Fprintf(logFile, "Deleted chunk %s (exclusive mode)\n", chunk)
+				} else {
+					fmt.Fprintf(logFile, "Marked fossil %s\n", chunk)
+				}
+			} else if foundChunks[chunk] {
+				// Another copy of the chunk has already been found in a higher-level directory.
+
+				if dryRun {
+					LOG_INFO("CHUNK_REDUNDANT", "Found redundant chunk %s", chunk)
+					continue
+				}
+
+				// This is a redundant chunk file (for instance D3/495A8D and D3/49/5A8D )
+				manager.chunkOperator.Delete(chunk, dir+file, isMetadata)
+				fmt.Fprintf(logFile, "Deleted redundant chunk %s\n", dir+file)
 			} else {
-				fmt.Fprintf(logFile, "Marked fossil %s\n", chunk)
+				foundChunks[chunk] = true
+				LOG_DEBUG("CHUNK_KEEP", "Chunk %s is referenced", chunk)
 			}
-		} else if value {
-			// Note that the initial value is false.  So if the value is true it means another copy of the chunk
-			// exists in a higher-level directory.
-
-			if dryRun {
-				LOG_INFO("CHUNK_REDUNDANT", "Found redundant chunk %s", chunk)
-				continue
-			}
-
-			// This is a redundant chunk file (for instance D3/495A8D and D3/49/5A8D )
-			manager.chunkOperator.Delete(chunk, chunkDir+file)
-			fmt.Fprintf(logFile, "Deleted redundant chunk %s\n", file)
-		} else {
-			referencedChunks[chunk] = true
-			LOG_DEBUG("CHUNK_KEEP", "Chunk %s is referenced", chunk)
 		}
 	}
 

@@ -129,7 +129,7 @@ func TestDownloadRawChunk(t *testing.T) {
 	uploader.WaitForCompletion()
 	uploader.Stop()
 
-	chunkPath, err := storage.ChunkPath(chunkID)
+	chunkPath, err := storage.ChunkPath(chunkID, false)
 	if err != nil {
 		t.Errorf("Failed to derive the chunk path: %v", err)
 		return
@@ -215,7 +215,7 @@ func TestChunkCacheIsGuardedByIsCacheNeeded(t *testing.T) {
 	chunkHash := uploadMetadataChunk(content)
 	chunkID := config.GetChunkIDFromHash(chunkHash)
 
-	if _, exist, _, err := cache.FindChunk(0, chunkID, false); err != nil || exist {
+	if _, exist, _, err := cache.FindChunk(0, chunkID, false, true); err != nil || exist {
 		t.Errorf("The metadata chunk was written to the cache of a storage that needs none (exist=%t, err=%v)", exist, err)
 	}
 
@@ -256,7 +256,7 @@ func TestChunkCacheIsGuardedByIsCacheNeeded(t *testing.T) {
 	if loads := cacheLoads(); loads != 0 {
 		t.Errorf("The chunk cache of a storage that needs none was read: %d loads", loads)
 	}
-	if _, exist, _, err := cache.FindChunk(0, chunkID, false); err != nil || exist {
+	if _, exist, _, err := cache.FindChunk(0, chunkID, false, true); err != nil || exist {
 		t.Errorf("The metadata chunk was written back to the cache of a storage that needs none (exist=%t, err=%v)",
 			exist, err)
 	}
@@ -276,7 +276,7 @@ func TestChunkCacheIsGuardedByIsCacheNeeded(t *testing.T) {
 	}
 	readOperator.Stop()
 
-	if _, exist, _, err := cache.FindChunk(0, chunkID, false); err != nil || !exist {
+	if _, exist, _, err := cache.FindChunk(0, chunkID, false, true); err != nil || !exist {
 		t.Errorf("The metadata chunk was not written to the cache of a storage that needs one (exist=%t, err=%v)",
 			exist, err)
 	}
@@ -378,7 +378,7 @@ func TestChunkOperator(t *testing.T) {
 	chunkOperator.Stop()
 
 	for _, file := range listChunks(storage) {
-		err = storage.DeleteFile(0, "chunks/"+file)
+		err = storage.DeleteFile(0, file)
 		if err != nil {
 			t.Errorf("Failed to delete the file %s: %v", file, err)
 			return

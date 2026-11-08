@@ -851,7 +851,7 @@ func TestCheckProbesReportTheChunkSizes(t *testing.T) {
 	// Empty one of the referenced chunks: the probe must see the size of 0, which the whole-tree listing would also
 	// have seen, and the check must fail on it.
 	chunkPath, exist, _, err := counting.FileStorage.FindChunk(0,
-		snapshotManager.config.GetChunkIDFromHash(chunkHashes[1]), false)
+		snapshotManager.config.GetChunkIDFromHash(chunkHashes[1]), false, false)
 	if err != nil || !exist {
 		t.Errorf("Failed to find the chunk to empty: %v", err)
 		return
