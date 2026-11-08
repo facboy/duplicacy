@@ -2,7 +2,7 @@ module github.com/gilbertchen/duplicacy
 
 go 1.26.0
 
-toolchain go1.26.9
+toolchain go1.26.10
 
 require (
 	cloud.google.com/go/storage v1.68.0
