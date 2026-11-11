@@ -499,3 +499,8 @@ func (storage *instrumentedStorage) finishedDeletes() []string {
 	defer storage.deleteLock.Unlock()
 	return append([]string{}, storage.deleteOrder...)
 }
+
+// snapshotPathFor returns the storage path of the snapshot file of one revision.
+func snapshotPathFor(revision int) string {
+	return fmt.Sprintf("snapshots/vm1@host1/%d", revision)
+}
